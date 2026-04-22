@@ -88,7 +88,13 @@ name = "pypi"
 url = "https://pypi.org/simple"
 default = true
 
+[tool.uv.sources]
+# sglang-grpc is built from rust/sglang-grpc (maturin); not published on PyPI.
+sglang-grpc = { path = "../rust/sglang-grpc", editable = true }
+
+
 [project.optional-dependencies]
+grpc = ["sglang-grpc>=0.1.0"]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [
