@@ -432,8 +432,8 @@ def compute_dflash_correct_drafts_and_bonus(
             Shape: [bs, block_size]. target_predict[:, t] corresponds to argmax at position t.
 
     Returns:
-        correct_drafts: int32 tensor [bs], number of accepted *draft* tokens (excluding current token and bonus token).
-        bonus: int64 tensor [bs], the target-predicted token at index correct_drafts (the "bonus" token to append).
+        num_correct_drafts: int32 tensor [bs], number of accepted *draft* tokens (excluding current token and bonus token).
+        bonus: int64 tensor [bs], the target-predicted token at index num_correct_drafts (the "bonus" token to append).
 
     Notes:
         Matches the reference implementation rule:
@@ -454,11 +454,11 @@ def compute_dflash_correct_drafts_and_bonus(
         raise ValueError(f"block_size must be positive, got {block_size}.")
 
     matches = candidates[:, 1:] == target_predict[:, :-1]
-    correct_drafts = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
+    num_correct_drafts = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
     bonus = target_predict[
-        torch.arange(bs, device=target_predict.device), correct_drafts
+        torch.arange(bs, device=target_predict.device), num_correct_drafts
     ]
-    return correct_drafts, bonus.to(torch.int64)
+    return num_correct_drafts, bonus.to(torch.int64)
 
 
 def compute_dflash_sampling_correct_drafts_and_bonus(
@@ -633,8 +633,8 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         deterministic=True,
     )
 
-    correct_drafts = accept_token_num
+    num_correct_drafts = accept_token_num
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
-    accept_pos = accept_index[row_ids, correct_drafts.to(torch.long)].to(torch.long)
+    accept_pos = accept_index[row_ids, num_correct_drafts.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
-    return correct_drafts, bonus
+    return num_correct_drafts, bonus

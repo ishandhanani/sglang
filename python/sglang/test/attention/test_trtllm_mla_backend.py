@@ -1408,7 +1408,7 @@ class TestTRTLLMMLA(CustomTestCase):
             unpad_draft_extend_output_kernel[grid](
                 raw_out_ptr=raw_out,
                 output_ptr=output,
-                accept_length_ptr=num_correct_drafts_per_req,
+                num_accepted_tokens_ptr=num_correct_drafts_per_req,
                 cumsum_ptr=cum_accept_lengths,
                 batch_size=batch_size,
                 token_per_batch=token_per_batch,
@@ -1419,11 +1419,11 @@ class TestTRTLLMMLA(CustomTestCase):
 
             # Verify the unpadding worked correctly
             for i in range(batch_size):
-                accept_len = num_correct_drafts_per_req[i].item()
+                num_accepted_tokens = num_correct_drafts_per_req[i].item()
                 output_start = cum_accept_lengths[i].item()
 
                 # Check that valid positions are copied correctly
-                for pos in range(accept_len):
+                for pos in range(num_accepted_tokens):
                     input_data = raw_out[i, pos]
                     output_data = output[output_start + pos]
 

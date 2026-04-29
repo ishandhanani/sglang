@@ -33,7 +33,7 @@ class GSM8KMixin:
     """
 
     gsm8k_accuracy_thres: float = _THRESHOLD_NOT_SET
-    gsm8k_accept_length_thres: Optional[float] = None
+    gsm8k_num_accepted_tokens_threshold: Optional[float] = None
     gsm8k_num_questions: int = 200
     gsm8k_num_threads: int = 128
 
@@ -61,7 +61,9 @@ class GSM8KMixin:
 
         self.assertGreaterEqual(metrics["score"], self.gsm8k_accuracy_thres)
 
-        _check_accept_length(self, self.base_url, self.gsm8k_accept_length_thres)
+        _check_accept_length(
+            self, self.base_url, self.gsm8k_num_accepted_tokens_threshold
+        )
 
 
 class MMLUMixin:
@@ -74,7 +76,7 @@ class MMLUMixin:
     """
 
     mmlu_score_threshold: float = _THRESHOLD_NOT_SET
-    mmlu_accept_length_thres: Optional[float] = None
+    mmlu_num_accepted_tokens_threshold: Optional[float] = None
     mmlu_num_examples: int = 5000
     mmlu_num_threads: int = 1024
 
@@ -98,7 +100,9 @@ class MMLUMixin:
 
         self.assertGreaterEqual(metrics["score"], self.mmlu_score_threshold)
 
-        _check_accept_length(self, self.base_url, self.mmlu_accept_length_thres)
+        _check_accept_length(
+            self, self.base_url, self.mmlu_num_accepted_tokens_threshold
+        )
 
 
 class HumanEvalMixin:

@@ -488,7 +488,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             select_index = (
                 torch.arange(len(batch.seq_lens), device=self.device)
                 * self.speculative_num_draft_tokens
-                + batch_result.accept_lens
+                + batch_result.num_accepted_tokens
                 - 1
             )
 
@@ -753,19 +753,19 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
-            accept_lens,
+            num_accepted_tokens,
             accept_index,
         ) = verify_input.sample(batch, logits_output)
-        new_seq_lens = batch.seq_lens + accept_lens
+        new_seq_lens = batch.seq_lens + num_accepted_tokens
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]
-            verified_id = torch.empty_like(accept_lens, dtype=torch.int32)
+            verified_id = torch.empty_like(num_accepted_tokens, dtype=torch.int32)
             fill_new_verified_id[(bs,)](
                 all_verified_id,
-                accept_lens,
+                num_accepted_tokens,
                 verified_id,
                 self.speculative_num_draft_tokens,
             )
@@ -788,7 +788,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             next_token_ids=predict,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
-            accept_lens=accept_lens,
+            num_accepted_tokens=num_accepted_tokens,
             routed_experts_output=forward_batch_output.routed_experts_output,
         )
 

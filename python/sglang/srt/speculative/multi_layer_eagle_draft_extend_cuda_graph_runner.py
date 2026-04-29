@@ -726,13 +726,13 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         self.cuda_graph_buffers["out_cache_loc"].zero_()
         self.cuda_graph_buffers["swa_out_cache_loc"].zero_()
         self.cuda_graph_buffers["positions"].zero_()
-        # `batch_result.accept_lens` is drafts + bonus.
+        # `batch_result.num_accepted_tokens` is drafts + bonus.
         bs = forward_batch.batch_size
         self.cuda_graph_buffers["num_correct_drafts"][:bs].copy_(
-            batch_result.accept_lens - 1
+            batch_result.num_accepted_tokens - 1
         )
         self.cuda_graph_buffers["num_accepted_tokens"][:bs].copy_(
-            batch_result.accept_lens
+            batch_result.num_accepted_tokens
         )
 
     def get_runner(self, step):

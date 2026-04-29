@@ -560,7 +560,7 @@ class EagleDraftWorker(BaseDraftWorker):
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
             * self.speculative_num_draft_tokens
-            + batch_result.accept_lens
+            + batch_result.num_accepted_tokens
             - 1
         )
 
@@ -580,10 +580,14 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
         if forward_batch.spec_info.num_correct_drafts is None:
-            # `batch_result.accept_lens` already includes the bonus token, so use it
+            # `batch_result.num_accepted_tokens` already includes the bonus token, so use it
             # directly for `num_accepted_tokens` and subtract 1 for `num_correct_drafts`.
-            forward_batch.spec_info.num_correct_drafts = batch_result.accept_lens - 1
-            forward_batch.spec_info.num_accepted_tokens = batch_result.accept_lens
+            forward_batch.spec_info.num_correct_drafts = (
+                batch_result.num_accepted_tokens - 1
+            )
+            forward_batch.spec_info.num_accepted_tokens = (
+                batch_result.num_accepted_tokens
+            )
 
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
@@ -841,10 +845,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
-            accept_lens,
+            num_accepted_tokens,
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
-        new_seq_lens = batch.seq_lens + accept_lens
+        new_seq_lens = batch.seq_lens + num_accepted_tokens
 
         # Update mamba state for hybrid GDN models after verification
         if (
@@ -852,7 +856,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or self.target_worker.model_runner.mamba2_config is not None
         ):
             self._mamba_verify_update(
-                batch, verify_input, accept_lens, accept_index, bs
+                batch, verify_input, num_accepted_tokens, accept_index, bs
             )
 
         verify_done = torch.get_device_module(self.device).Event()
@@ -860,10 +864,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]
-            verified_id = torch.empty_like(accept_lens, dtype=torch.int32)
+            verified_id = torch.empty_like(num_accepted_tokens, dtype=torch.int32)
             fill_new_verified_id[(bs,)](
                 all_verified_id,
-                accept_lens,
+                num_accepted_tokens,
                 verified_id,
                 self.speculative_num_draft_tokens,
             )
@@ -887,7 +891,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             next_token_ids=predict,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
-            accept_lens=accept_lens,
+            num_accepted_tokens=num_accepted_tokens,
             routed_experts_output=forward_batch_output.routed_experts_output,
         )
 
@@ -895,13 +899,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self,
         batch: ModelWorkerBatch,
         verify_input: EagleVerifyInput,
-        accept_lens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
         accept_index: torch.Tensor,
         bs: int,
     ):
         """Update mamba state for hybrid GDN models after verification."""
-        # `accept_lens` already includes the bonus token (drafts + 1 per req).
-        accepted_length_with_bonus = accept_lens
+        # `num_accepted_tokens` already includes the bonus token (drafts + 1 per req).
+        num_accepted_tokens = num_accepted_tokens
         if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
             if verify_input.topk != 1:
                 raise ValueError("Spec v2 currently only supports topk = 1.")
@@ -910,16 +914,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 0,
                 bs * self.speculative_num_draft_tokens,
                 step=self.speculative_num_draft_tokens,
-                dtype=accepted_length_with_bonus.dtype,
-                device=accepted_length_with_bonus.device,
+                dtype=num_accepted_tokens.dtype,
+                device=num_accepted_tokens.device,
             )
-            correct_drafts = accepted_length_with_bonus - 1
+            num_correct_drafts = num_accepted_tokens - 1
 
             if batch.mamba_track_indices is not None:
                 # If after verify, the request's seq_lens has crossed a mamba track interval,
                 # we need to update the mamba state for the request at the crossing point.
                 seq_lens_pre_verify = batch.seq_lens
-                seq_lens_post_verify = batch.seq_lens + accepted_length_with_bonus
+                seq_lens_post_verify = batch.seq_lens + num_accepted_tokens
                 mamba_track_interval = self.server_args.mamba_track_interval
                 to_track_mask = (
                     seq_lens_pre_verify // mamba_track_interval
@@ -934,7 +938,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 req_idx = torch.arange(
                     bs,
                     dtype=torch.int64,
-                    device=accepted_length_with_bonus.device,
+                    device=num_accepted_tokens.device,
                 )
                 candidate_track_steps = (
                     accept_index[req_idx, to_track_ith] - accepted_indices_offset
@@ -948,7 +952,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 mamba_steps_to_track = None
 
             self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-                correct_drafts=correct_drafts,
+                num_correct_drafts=num_correct_drafts,
                 mamba_track_indices=batch.mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=self.target_worker.model_runner.model,

@@ -261,7 +261,7 @@ class NGRAMWorker:
         model_worker_batch = batch.get_model_worker_batch()
         spec_info = model_worker_batch.spec_info
         num_correct_drafts = 0
-        accept_lens = None
+        num_accepted_tokens = None
         num_correct_drafts_per_req_cpu = None
 
         if model_worker_batch.forward_mode.is_target_verify():
@@ -319,8 +319,8 @@ class NGRAMWorker:
                     )
                     req.time_stats.set_spec_verify_end_time(correct_drafts=correct)
 
-            # Store accept_lens for per-request metrics
-            accept_lens = verify_input.num_correct_drafts
+            # Store num_accepted_tokens for per-request metrics
+            num_accepted_tokens = verify_input.num_correct_drafts
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
             self._update_ngram_corpus(batch)
@@ -352,5 +352,5 @@ class NGRAMWorker:
             num_correct_drafts=num_correct_drafts,
             num_correct_drafts_per_req_cpu=num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
-            accept_lens=accept_lens,
+            num_accepted_tokens=num_accepted_tokens,
         )

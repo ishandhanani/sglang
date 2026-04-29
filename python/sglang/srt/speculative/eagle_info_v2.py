@@ -462,17 +462,17 @@ class EagleVerifyInputV2Mixin:
 @triton.jit
 def fill_new_verified_id(
     verified_id,
-    accept_lens,
+    num_accepted_tokens,
     new_verified_id,
     num_draft_tokens: tl.constexpr,
 ):
-    # NOTE: we cannot fuse any in-place operations of `accept_lens` inside this kernel
-    # because this kernel reads accept_lens
+    # NOTE: we cannot fuse any in-place operations of `num_accepted_tokens` inside this kernel
+    # because this kernel reads num_accepted_tokens
     pid = tl.program_id(axis=0)
-    # `accept_lens` includes the bonus token; the last accepted slot is at -1.
-    accept_len = tl.load(accept_lens + pid)
+    # `num_accepted_tokens` includes the bonus token; the last accepted slot is at -1.
+    num_accepted_tokens = tl.load(num_accepted_tokens + pid)
 
-    verified_id_idx = num_draft_tokens * pid + accept_len - 1
+    verified_id_idx = num_draft_tokens * pid + num_accepted_tokens - 1
     verified_id_data = tl.load(verified_id + verified_id_idx)
     tl.store(new_verified_id + pid, verified_id_data)
 
