@@ -950,12 +950,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         - index_select kernel launches
         - nonzero kernel launches
         """
-        request_number = num_correct_drafts.shape[0]
+        num_requests = num_correct_drafts.shape[0]
 
         state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                :request_number
-            ]
+            self.linear_attn_backend.forward_metadata.mamba_cache_indices[:num_requests]
         )
 
         mamba_caches = (
