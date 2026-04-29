@@ -1923,8 +1923,22 @@ class SpeculativeMetrics:
             )
         }
     )
+    correct_rate: float = field(
+        metadata={
+            "metric": (
+                "gauge",
+                "Speculative correct-draft rate (correct drafts / proposed drafts).",
+            )
+        }
+    )
+    # Deprecated alias for `correct_rate`. Will be removed in a future release.
     accept_rate: float = field(
-        metadata={"metric": ("gauge", "Speculative acceptance rate")}
+        metadata={
+            "metric": (
+                "gauge",
+                "Deprecated alias for `correct_rate`; same value, kept for backward compatibility.",
+            )
+        }
     )
 
 
