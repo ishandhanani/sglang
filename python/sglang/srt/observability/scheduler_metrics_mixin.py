@@ -100,8 +100,8 @@ class SchedulerMetricsMixin:
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
 
         # Cumulative spec-decoding counters (reset every decode_log_interval).
-        # Each update adds (num_accepted_drafts + bs, bs).
-        # `*_accepted_tokens` = drafts + bonus; `*_accepted_drafts` = drafts-only.
+        # Each update adds (num_correct_drafts + bs, bs).
+        # `*_accepted_tokens` = drafts + bonus; `*_correct_drafts` = drafts-only.
         self.spec_num_accepted_tokens = 0  # per-log-interval
         self.spec_num_forward_ct = 0
         self.spec_total_num_accepted_tokens = 0  # lifetime
@@ -176,12 +176,12 @@ class SchedulerMetricsMixin:
                 kv_events_config, self.attn_dp_rank
             )
 
-    def update_spec_metrics(self: Scheduler, bs: int, num_accepted_drafts: int):
-        self.spec_num_accepted_tokens += num_accepted_drafts + bs
+    def update_spec_metrics(self: Scheduler, bs: int, num_correct_drafts: int):
+        self.spec_num_accepted_tokens += num_correct_drafts + bs
         self.spec_num_forward_ct += bs
 
         # Bonus tokens updated elsewhere
-        self.num_generated_tokens += num_accepted_drafts
+        self.num_generated_tokens += num_correct_drafts
 
     def _init_estimated_perf_constants(self: Scheduler) -> None:
         model_config = self.model_config
@@ -462,13 +462,13 @@ class SchedulerMetricsMixin:
         self: Scheduler,
         can_run_cuda_graph: bool,
         running_batch: ScheduleBatch = None,
-        num_accepted_drafts: int = 0,
+        num_correct_drafts: int = 0,
     ):
         batch = running_batch or self.running_batch
 
         # Every-iteration work: realtime token counting + status logger
         if self.current_scheduler_metrics_enabled:
-            decode_tokens = batch.batch_size() + num_accepted_drafts
+            decode_tokens = batch.batch_size() + num_correct_drafts
             self.metrics_collector.increment_realtime_tokens(
                 # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
                 decode_tokens=decode_tokens,
@@ -525,7 +525,7 @@ class SchedulerMetricsMixin:
             spec_accept_length = (
                 self.spec_num_accepted_tokens / self.spec_num_forward_ct
             )
-            num_accepted_drafts = (
+            num_correct_drafts = (
                 self.spec_num_accepted_tokens - self.spec_num_forward_ct
             )
             if self.server_args.speculative_num_draft_tokens:
@@ -534,9 +534,7 @@ class SchedulerMetricsMixin:
                 draft_per_round = self.server_args.speculative_num_steps or 0
             total_draft_tokens = self.spec_num_forward_ct * draft_per_round
             spec_accept_rate = (
-                num_accepted_drafts / total_draft_tokens
-                if total_draft_tokens > 0
-                else 0
+                num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
             )
             self.spec_total_num_accepted_tokens += self.spec_num_accepted_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct

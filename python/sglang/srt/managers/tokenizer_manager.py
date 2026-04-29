@@ -2085,25 +2085,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if (
             hasattr(recv_obj, "spec_verify_ct")
             and recv_obj.spec_verify_ct[i] > 0
-            and hasattr(recv_obj, "spec_accepted_drafts")
-            and len(recv_obj.spec_accepted_drafts) > i
+            and hasattr(recv_obj, "spec_correct_drafts")
+            and len(recv_obj.spec_correct_drafts) > i
         ):
             # Total number of proposed draft tokens per request.
             all_drafts = recv_obj.spec_verify_ct[i] * (
                 self.server_args.speculative_num_draft_tokens - 1
             )
-            accepted_drafts = recv_obj.spec_accepted_drafts[i]
+            correct_drafts = recv_obj.spec_correct_drafts[i]
 
             # Calculate per-request acceptance rate and average acceptance length.
             if all_drafts > 0:
-                # accept_rate: accepted_drafts / total_proposed_drafts (strict count, no bonus).
-                meta_info["spec_accept_rate"] = accepted_drafts / all_drafts
+                # accept_rate: correct_drafts / total_proposed_drafts (strict count, no bonus).
+                meta_info["spec_accept_rate"] = correct_drafts / all_drafts
                 # accept_length: completion_tokens / verify_ct (includes bonus token).
                 meta_info["spec_accept_length"] = (
                     recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
                 )
 
-                meta_info["spec_accepted_drafts"] = accepted_drafts
+                meta_info["spec_correct_drafts"] = correct_drafts
                 meta_info["spec_proposed_drafts"] = all_drafts
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 

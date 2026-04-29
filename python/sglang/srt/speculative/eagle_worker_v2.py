@@ -579,10 +579,10 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.plan_stream
             )
 
-        if forward_batch.spec_info.num_accepted_drafts is None:
+        if forward_batch.spec_info.num_correct_drafts is None:
             # `batch_result.accept_lens` already includes the bonus token, so use it
-            # directly for `num_accepted_tokens` and subtract 1 for `num_accepted_drafts`.
-            forward_batch.spec_info.num_accepted_drafts = batch_result.accept_lens - 1
+            # directly for `num_accepted_tokens` and subtract 1 for `num_correct_drafts`.
+            forward_batch.spec_info.num_correct_drafts = batch_result.accept_lens - 1
             forward_batch.spec_info.num_accepted_tokens = batch_result.accept_lens
 
         # Run draft extend batch in the main compute stream
@@ -958,7 +958,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self,
         batch: ModelWorkerBatch,
         accept_index: torch.Tensor,
-        num_accepted_drafts: torch.Tensor,
+        num_correct_drafts: torch.Tensor,
     ):
         """
         Move accepted tokens to the target KV cache.
@@ -966,7 +966,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         Args:
             batch: The batch to run.
             accept_index: The index of the accepted tokens.
-            num_accepted_drafts: The length of the accepted tokens.
+            num_correct_drafts: The length of the accepted tokens.
         """
         bs = len(batch.seq_lens)
         size = bs * self.speculative_num_draft_tokens
@@ -983,7 +983,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
             batch.seq_lens,
-            batch.seq_lens + num_accepted_drafts,
+            batch.seq_lens + num_correct_drafts,
             tgt_cache_loc,
             self.req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),

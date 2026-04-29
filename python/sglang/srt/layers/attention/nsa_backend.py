@@ -504,7 +504,7 @@ class NativeSparseAttnBackend(
                     page_table, repeats=self.speculative_num_draft_tokens, dim=0
                 )
             else:
-                # DRAFT_EXTEND (v1): V1 worker extends by (num_accepted_drafts + 1) per request
+                # DRAFT_EXTEND (v1): V1 worker extends by (num_correct_drafts + 1) per request
                 # after verification. Lengths vary per request based on how many tokens
                 # were accepted.
                 page_table = torch.repeat_interleave(
