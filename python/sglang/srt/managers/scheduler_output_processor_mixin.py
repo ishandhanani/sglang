@@ -373,7 +373,7 @@ class SchedulerOutputProcessorMixin:
 
             correct_draft_tokens = result.num_correct_drafts_per_req_cpu[i]
             req.spec_correct_drafts += correct_draft_tokens
-            req.update_spec_acceptance_histogram(correct_draft_tokens)
+            req.update_spec_correct_drafts_histogram(correct_draft_tokens)
 
         return predict_tokens
 
@@ -963,7 +963,7 @@ class SchedulerOutputProcessorMixin:
         cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
         spec_correct_drafts = []
-        spec_acceptance_histogram = []
+        spec_correct_drafts_histogram = []
         retraction_counts = []
         output_hidden_states = None
         load = self.get_loads(GetLoadsReqInput(include=["core"]))
@@ -1072,7 +1072,9 @@ class SchedulerOutputProcessorMixin:
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_correct_drafts.append(req.spec_correct_drafts)
-                    spec_acceptance_histogram.append(req.spec_acceptance_histogram)
+                    spec_correct_drafts_histogram.append(
+                        req.spec_correct_drafts_histogram
+                    )
 
                 if return_logprob:
                     if (
@@ -1177,7 +1179,7 @@ class SchedulerOutputProcessorMixin:
                     http_worker_ipcs=http_worker_ipcs,
                     spec_verify_ct=spec_verify_ct,
                     spec_correct_drafts=spec_correct_drafts,
-                    spec_acceptance_histogram=spec_acceptance_histogram,
+                    spec_correct_drafts_histogram=spec_correct_drafts_histogram,
                     time_stats=time_stats,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,

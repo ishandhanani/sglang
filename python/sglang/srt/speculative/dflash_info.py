@@ -16,8 +16,8 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dflash_utils import (
-    compute_dflash_accept_len_and_bonus,
-    compute_dflash_sampling_accept_len_and_bonus,
+    compute_dflash_correct_drafts_and_bonus,
+    compute_dflash_sampling_correct_drafts_and_bonus,
     is_dflash_sampling_verify_available,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -367,7 +367,7 @@ class DFlashVerifyInput(SpecInput):
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
-            accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
+            correct_drafts, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -376,14 +376,14 @@ class DFlashVerifyInput(SpecInput):
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, self.draft_token_num
             )
-            accept_len, bonus = compute_dflash_accept_len_and_bonus(
+            correct_drafts, bonus = compute_dflash_correct_drafts_and_bonus(
                 candidates=candidates,
                 target_predict=target_predict,
             )
 
-        # Single D2H transfer: candidates[1:] + accept_len + bonus
+        # Single D2H transfer: candidates[1:] + correct_drafts + bonus
         packed = torch.cat(
-            [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
+            [candidates[:, 1:], correct_drafts.unsqueeze(1), bonus.unsqueeze(1)], dim=1
         ).cpu()
 
         max_acc = self.draft_token_num - 1

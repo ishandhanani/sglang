@@ -128,8 +128,8 @@ def _handle_output_by_index(output, i):
             spec_correct_drafts=_extract_field_by_index(
                 output, "spec_correct_drafts", i
             ),
-            spec_acceptance_histogram=_extract_field_by_index(
-                output, "spec_acceptance_histogram", i
+            spec_correct_drafts_histogram=_extract_field_by_index(
+                output, "spec_correct_drafts_histogram", i
             ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
@@ -216,8 +216,8 @@ def _handle_output_by_index(output, i):
             spec_correct_drafts=_extract_field_by_index(
                 output, "spec_correct_drafts", i
             ),
-            spec_acceptance_histogram=_extract_field_by_index(
-                output, "spec_acceptance_histogram", i
+            spec_correct_drafts_histogram=_extract_field_by_index(
+                output, "spec_correct_drafts_histogram", i
             ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),

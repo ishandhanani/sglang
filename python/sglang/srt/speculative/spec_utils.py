@@ -370,8 +370,8 @@ def get_target_cache_loc(
     bs_offset = tl.arange(0, bs_upper)
 
     # write the first part to tgt_cache_loc
-    accept_len_all = tl.load(num_correct_drafts + bs_offset, mask=bs_offset < bid)
-    tgt_cache_loc_start = tl.sum(accept_len_all) + bid
+    correct_drafts_all = tl.load(num_correct_drafts + bs_offset, mask=bs_offset < bid)
+    tgt_cache_loc_start = tl.sum(correct_drafts_all) + bid
     copy_len = tl.load(num_correct_drafts + bid) + 1
     out_cache_loc_row = tl.load(
         out_cache_loc + bid * num_verify_tokens + offset, mask=offset < copy_len

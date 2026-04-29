@@ -312,12 +312,12 @@ class NGRAMWorker:
 
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
-                    accepted = (
+                    correct = (
                         verify_input.num_correct_drafts[idx].item()
                         if verify_input.num_correct_drafts is not None
                         else 0
                     )
-                    req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+                    req.time_stats.set_spec_verify_end_time(correct_drafts=correct)
 
             # Store accept_lens for per-request metrics
             accept_lens = verify_input.num_correct_drafts

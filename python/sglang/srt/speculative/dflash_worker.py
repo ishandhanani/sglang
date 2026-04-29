@@ -1080,7 +1080,7 @@ class DFlashWorker:
         if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             return
 
-        accepted_steps = commit_lens.to(torch.int64) - 1
+        correct_drafts = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
@@ -1103,7 +1103,7 @@ class DFlashWorker:
             )
 
         attn_backend.update_mamba_state_after_mtp_verify(
-            accepted_steps=accepted_steps,
+            correct_drafts=correct_drafts,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             model=self.target_worker.model_runner.model,

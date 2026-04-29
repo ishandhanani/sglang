@@ -622,12 +622,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             ts = time.perf_counter()
         self.spec_verify_start_time = ts
 
-    def set_spec_verify_end_time(self, ts=None, accepted_tokens: int = 0):
+    def set_spec_verify_end_time(self, ts=None, correct_drafts: int = 0):
         if ts is None:
             ts = time.perf_counter()
         stage = RequestStage.SPEC_VERIFY
         self.trace_slice(
-            stage, self.spec_verify_start_time, ts, {"accepted_tokens": accepted_tokens}
+            stage, self.spec_verify_start_time, ts, {"correct_drafts": correct_drafts}
         )
 
     def set_spec_draft_extend_start_time(self, ts=None):

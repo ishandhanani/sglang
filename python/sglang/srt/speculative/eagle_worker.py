@@ -483,8 +483,8 @@ class EAGLEWorker(TpModelWorker):
 
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
-                    accepted = verify_output.num_correct_drafts_per_req_cpu[idx]
-                    req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+                    correct = verify_output.num_correct_drafts_per_req_cpu[idx]
+                    req.time_stats.set_spec_verify_end_time(correct_drafts=correct)
 
             set_time_batch(
                 batch.reqs, "set_spec_draft_extend_start_time", trace_only=True
@@ -1023,12 +1023,12 @@ class EAGLEWorker(TpModelWorker):
             # last_token_indices_per_req=accepted_indices[cumulative_accepted_lengths - 1] = [4, 9, 11] (last token ID of each req)
             # max_relative_indices_per_req = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
             # first_token_indices_per_req = res.accepted_indices[accepted_indices_start]
-            accepted_steps = (
+            correct_drafts = (
                 res.accepted_indices[cumulative_accepted_lengths - 1]
                 - accepted_indices_offset
             )
         else:
-            accepted_steps = accepted_length - 1
+            correct_drafts = accepted_length - 1
 
         if batch.mamba_track_indices is not None:
             # If after verify, the request's seq_lens has crossed a mamba track interval,
@@ -1052,7 +1052,7 @@ class EAGLEWorker(TpModelWorker):
             mamba_steps_to_track = None
 
         self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-            accepted_steps=accepted_steps,
+            correct_drafts=correct_drafts,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             model=self.target_worker.model_runner.model,
