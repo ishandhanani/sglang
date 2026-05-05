@@ -2041,9 +2041,13 @@ class Scheduler(
                         f"bootstrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
-                    recv_req.time_stats.trace_ctx.abort(
-                        abort_info={"reason": error_msg}
-                    )
+                    # gRPC code paths can leave recv_req.time_stats as None
+                    # (servicer doesn't populate it). Trace abort is best-effort
+                    # observability; the request abort itself runs unconditionally.
+                    if recv_req.time_stats is not None:
+                        recv_req.time_stats.trace_ctx.abort(
+                            abort_info={"reason": error_msg}
+                        )
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.stream_output([req], req.return_logprob)
                     return
@@ -2246,7 +2250,8 @@ class Scheduler(
                 },
                 rid=req.rid,
             )
-            req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+            if req.time_stats is not None:
+                req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.send_to_tokenizer.send_output(abort_req, req)
             return False
         return True
@@ -2297,7 +2302,8 @@ class Scheduler(
             ),
             req_to_abort,
         )
-        req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        if req_to_abort.time_stats is not None:
+            req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
