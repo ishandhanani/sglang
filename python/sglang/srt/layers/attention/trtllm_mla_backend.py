@@ -300,7 +300,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if global_zero_init_workspace_buffer is None:
             global_zero_init_workspace_buffer = torch.zeros(
                 self.workspace_size,
-                dtype=torch.uint8,
+                dtype=torch.int8,
                 device=model_runner.device,
             )
         self.workspace_buffer = global_zero_init_workspace_buffer
@@ -868,6 +868,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         bmm1_scale = q_scale * k_scale * layer.scaling
 
         # Call TRT-LLM kernel
+        extra_kwargs = {"backend": self.backend} if self.backend != "trtllm-gen" else {}
         raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
@@ -880,7 +881,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             max_seq_len=metadata.max_seq_len_k,
             bmm1_scale=bmm1_scale,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-            backend=self.backend,
+            **extra_kwargs,
         )
 
         # Reshape output directly without slicing
@@ -1057,6 +1058,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             assert kv_cache.dtype == self.data_type
 
+            extra_kwargs = (
+                {"backend": self.backend} if self.backend != "trtllm-gen" else {}
+            )
             raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
                 query=q,
                 kv_cache=kv_cache,
@@ -1069,7 +1073,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq_len=max_seq_len,
                 bmm1_scale=bmm1_scale,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-                backend=self.backend,
+                **extra_kwargs,
             )
 
             if needs_unpad:
