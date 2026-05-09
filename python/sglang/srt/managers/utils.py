@@ -43,7 +43,7 @@ class GenerationBatchResult:
 
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
-    num_accepted_tokens: Optional[torch.Tensor] = None
+    num_accept_tokens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
@@ -90,10 +90,8 @@ class GenerationBatchResult:
             )
         self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
 
-        if self.num_accepted_tokens is not None:
-            self.num_accepted_tokens = self.num_accepted_tokens.to(
-                "cpu", non_blocking=True
-            )
+        if self.num_accept_tokens is not None:
+            self.num_accept_tokens = self.num_accept_tokens.to("cpu", non_blocking=True)
 
         if self.routed_experts_output is not None:
             self.routed_experts_output.copy_to_cpu()

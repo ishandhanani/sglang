@@ -277,7 +277,7 @@ class NgramVerifyInput(SpecInput):
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
             batch.seq_lens,
-            batch.seq_lens + self.num_accepted_tokens,
+            batch.seq_lens + self.num_accept_tokens,
             batch.out_cache_loc,
             batch.req_to_token_pool.req_to_token.shape[1],
             triton.next_power_of_2(bs),
@@ -454,16 +454,16 @@ class NgramVerifyInput(SpecInput):
 
         # Sync the bonus-included view after the kernel + `_fill_requests`
         # finalize `num_correct_drafts`.
-        self.num_accepted_tokens = self.num_correct_drafts + 1
+        self.num_accept_tokens = self.num_correct_drafts + 1
 
         num_correct_drafts_cpu = self.num_correct_drafts.cpu()
-        num_accepted_tokens_cpu = num_correct_drafts_cpu + 1
+        num_accept_tokens_cpu = num_correct_drafts_cpu + 1
         num_correct_drafts = num_correct_drafts_cpu.sum().item()
 
         self._free_cache(batch, page_size, num_correct_drafts_cpu)
 
-        batch.seq_lens.add_(self.num_accepted_tokens)
-        batch.seq_lens_cpu.add_(num_accepted_tokens_cpu)
+        batch.seq_lens.add_(self.num_accept_tokens)
+        batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
 
         return logits_output, self.accept_tokens, num_correct_drafts
 

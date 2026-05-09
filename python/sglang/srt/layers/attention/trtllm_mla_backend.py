@@ -131,7 +131,7 @@ def pad_draft_extend_query_kernel(
 def unpad_draft_extend_output_kernel(
     raw_out_ptr,  # Input raw output tensor (batch_size, token_per_batch, tp_q_head_num, v_head_dim)
     output_ptr,  # Output tensor (-1, tp_q_head_num, v_head_dim)
-    num_accepted_tokens_ptr,  # Accept lengths for each sequence [batch_size]
+    num_accept_tokens_ptr,  # Accept lengths for each sequence [batch_size]
     cumsum_ptr,  # Cumulative sum of accept lengths [batch_size + 1]
     batch_size,
     token_per_batch,
@@ -151,9 +151,9 @@ def unpad_draft_extend_output_kernel(
         return
 
     # Load accept length for this batch
-    num_accepted_tokens = tl.load(num_accepted_tokens_ptr + batch_id)
+    num_accept_tokens = tl.load(num_accept_tokens_ptr + batch_id)
 
-    if seq_pos >= num_accepted_tokens:
+    if seq_pos >= num_accept_tokens:
         return
 
     # Load cumulative sum to get start position in output tensor
@@ -745,7 +745,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         unpad_draft_extend_output_kernel[grid](
             raw_out_ptr=raw_out,
             output_ptr=output,
-            num_accepted_tokens_ptr=seq_lens_q,
+            num_accept_tokens_ptr=seq_lens_q,
             cumsum_ptr=cu_seqlens_q,
             batch_size=batch_size,
             token_per_batch=token_per_batch,

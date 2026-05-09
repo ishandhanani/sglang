@@ -994,7 +994,7 @@ class EAGLEWorker(TpModelWorker):
         if batch.forward_mode.is_idle():
             return
 
-        num_accepted_tokens = (
+        num_accept_tokens = (
             torch.tensor(
                 res.num_correct_drafts_per_req_cpu,
                 device=logits_output.hidden_states.device,
@@ -1002,16 +1002,16 @@ class EAGLEWorker(TpModelWorker):
             )
             + 1
         )
-        cumulative_num_accepted_tokens = torch.cumsum(num_accepted_tokens, dim=0)
-        # prepend 0 to the cumulative_num_accepted_tokens
+        cumulative_num_accept_tokens = torch.cumsum(num_accept_tokens, dim=0)
+        # prepend 0 to the cumulative_num_accept_tokens
         accepted_indices_start = torch.cat(
             [
                 torch.zeros(
                     1,
-                    dtype=cumulative_num_accepted_tokens.dtype,
-                    device=cumulative_num_accepted_tokens.device,
+                    dtype=cumulative_num_accept_tokens.dtype,
+                    device=cumulative_num_accept_tokens.device,
                 ),
-                cumulative_num_accepted_tokens[:-1],
+                cumulative_num_accept_tokens[:-1],
             ]
         )
         accepted_indices_offset = torch.arange(
@@ -1025,17 +1025,17 @@ class EAGLEWorker(TpModelWorker):
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         # res.accepted_indices.shape[0] > 0 skips DP attn idle batch
         if spec_info.topk > 1 and res.accepted_indices.shape[0] > 0:
-            # accepted_indices=[0,2,3,4,5,7,9,10,11], num_accepted_tokens=[4, 3, 2], cumulative_num_accepted_tokens=[4, 7, 9]
-            # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_num_accepted_tokens[:-1]]) = [0, 5, 10]
-            # last_token_indices_per_req=accepted_indices[cumulative_num_accepted_tokens - 1] = [4, 9, 11] (last token ID of each req)
+            # accepted_indices=[0,2,3,4,5,7,9,10,11], num_accept_tokens=[4, 3, 2], cumulative_num_accept_tokens=[4, 7, 9]
+            # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_num_accept_tokens[:-1]]) = [0, 5, 10]
+            # last_token_indices_per_req=accepted_indices[cumulative_num_accept_tokens - 1] = [4, 9, 11] (last token ID of each req)
             # max_relative_indices_per_req = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
             # first_token_indices_per_req = res.accepted_indices[accepted_indices_start]
             num_correct_drafts = (
-                res.accepted_indices[cumulative_num_accepted_tokens - 1]
+                res.accepted_indices[cumulative_num_accept_tokens - 1]
                 - accepted_indices_offset
             )
         else:
-            num_correct_drafts = num_accepted_tokens - 1
+            num_correct_drafts = num_accept_tokens - 1
 
         if batch.mamba_track_indices is not None:
             # If after verify, the request's seq_lens has crossed a mamba track interval,
@@ -1111,7 +1111,7 @@ class EAGLEWorker(TpModelWorker):
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
         num_correct_drafts_backup = batch.spec_info.num_correct_drafts.clone()
-        num_accepted_tokens_backup = batch.spec_info.num_accepted_tokens.clone()
+        num_accept_tokens_backup = batch.spec_info.num_accept_tokens.clone()
         return_logprob_backup = batch.return_logprob
 
         input_is_idle = batch.forward_mode.is_idle()
@@ -1198,7 +1198,7 @@ class EAGLEWorker(TpModelWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.req_pool_indices = req_pool_indices_backup
         batch.spec_info.num_correct_drafts = num_correct_drafts_backup
-        batch.spec_info.num_accepted_tokens = num_accepted_tokens_backup
+        batch.spec_info.num_accept_tokens = num_accept_tokens_backup
         batch.return_logprob = return_logprob_backup
 
     def capture_for_decode(

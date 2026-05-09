@@ -1003,8 +1003,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.num_correct_drafts = self._pad_tensor_to_size(
                     spec_info.num_correct_drafts, bs
                 )
-                spec_info.num_accepted_tokens = self._pad_tensor_to_size(
-                    spec_info.num_accepted_tokens, bs
+                spec_info.num_accept_tokens = self._pad_tensor_to_size(
+                    spec_info.num_accept_tokens, bs
                 )
             spec_info.hidden_states = self._pad_tensor_to_size(
                 spec_info.hidden_states, num_tokens
@@ -1051,9 +1051,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.spec_info.num_correct_drafts = self.spec_info.num_correct_drafts[
                     :bs
                 ]
-                self.spec_info.num_accepted_tokens = self.spec_info.num_accepted_tokens[
-                    :bs
-                ]
+                self.spec_info.num_accept_tokens = self.spec_info.num_accept_tokens[:bs]
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2

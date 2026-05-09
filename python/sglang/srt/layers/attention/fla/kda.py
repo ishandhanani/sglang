@@ -52,7 +52,7 @@ def fused_recurrent_kda_fwd(
     inplace_final_state: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
     # ssm_state_indices: torch.Tensor | None = None,
-    num_accepted_tokens: torch.Tensor | None = None,
+    num_accept_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
@@ -92,7 +92,7 @@ def fused_recurrent_kda_fwd(
         ht=final_state,
         cu_seqlens=cu_seqlens,
         # ssm_state_indices=ssm_state_indices,
-        # num_accepted_tokens=num_accepted_tokens,
+        # num_accept_tokens=num_accept_tokens,
         scale=scale,
         # N=N,
         T=T,
@@ -155,7 +155,7 @@ def fused_recurrent_kda(
         inplace_final_state=inplace_final_state,
         cu_seqlens=cu_seqlens,
         # ssm_state_indices=ssm_state_indices,
-        num_accepted_tokens=None,
+        num_accept_tokens=None,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
     return o, final_state

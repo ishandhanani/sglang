@@ -1053,7 +1053,7 @@ class NativeSparseAttnBackend(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
 
-            extend_seq_lens = spec_info.num_accepted_tokens[:bs]
+            extend_seq_lens = spec_info.num_accept_tokens[:bs]
             extend_seq_lens_cpu = extend_seq_lens.tolist()
 
             page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]

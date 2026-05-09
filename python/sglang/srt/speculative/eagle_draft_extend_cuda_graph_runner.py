@@ -51,7 +51,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     seq_lens_cpu: torch.Tensor
     extend_seq_lens: torch.Tensor
     num_correct_drafts: torch.Tensor
-    num_accepted_tokens: torch.Tensor
+    num_accept_tokens: torch.Tensor
     next_token_logits_buffer: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
@@ -171,7 +171,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             num_correct_drafts = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
-            num_accepted_tokens = torch.full(
+            num_accept_tokens = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
 
@@ -227,7 +227,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             seq_lens_cpu=seq_lens_cpu,
             extend_seq_lens=extend_seq_lens,
             num_correct_drafts=num_correct_drafts,
-            num_accepted_tokens=num_accepted_tokens,
+            num_accept_tokens=num_accept_tokens,
             next_token_logits_buffer=next_token_logits_buffer,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
@@ -314,7 +314,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         hidden_states = buffers.hidden_states[:num_tokens]
         num_correct_drafts = buffers.num_correct_drafts[:bs]
-        num_accepted_tokens = buffers.num_accepted_tokens[:bs]
+        num_accept_tokens = buffers.num_accept_tokens[:bs]
         next_token_logits_buffer = buffers.next_token_logits_buffer[
             : bs if self.forward_mode == ForwardMode.DRAFT_EXTEND else num_tokens
         ]
@@ -363,7 +363,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             num_correct_drafts=num_correct_drafts,
-            num_accepted_tokens=num_accepted_tokens,
+            num_accept_tokens=num_accept_tokens,
         )
         spec_info.positions = None
 
@@ -470,7 +470,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.out_cache_loc.zero_()
             buffers.positions.zero_()
             buffers.num_correct_drafts.fill_(self.num_tokens_per_bs)
-            buffers.num_accepted_tokens.fill_(self.num_tokens_per_bs)
+            buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
 
         # Common inputs
@@ -493,8 +493,8 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.num_correct_drafts[:raw_bs].copy_(
                 forward_batch.spec_info.num_correct_drafts
             )
-            buffers.num_accepted_tokens[:raw_bs].copy_(
-                forward_batch.spec_info.num_accepted_tokens
+            buffers.num_accept_tokens[:raw_bs].copy_(
+                forward_batch.spec_info.num_accept_tokens
             )
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
@@ -530,9 +530,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         if bs != raw_bs:
             forward_batch.spec_info.positions = buffers.positions[:num_tokens]
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
-            forward_batch.spec_info.num_accepted_tokens = buffers.num_accepted_tokens[
-                :bs
-            ]
+            forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
 
         self.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
@@ -559,7 +557,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[
                 :raw_bs
             ]
-            forward_batch.spec_info.num_accepted_tokens = buffers.num_accepted_tokens[
+            forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[
                 :raw_bs
             ]
             unpadding_bs = raw_bs

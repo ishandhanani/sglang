@@ -107,9 +107,9 @@ class SchedulerMetricsMixin:
         # Cumulative spec-decoding counters (reset every decode_log_interval).
         # Each update adds (num_correct_drafts + bs, bs).
         # `*_accepted_tokens` = drafts + bonus; `*_correct_drafts` = drafts-only.
-        self.spec_num_accepted_tokens = 0  # per-log-interval
+        self.spec_num_accept_tokens = 0  # per-log-interval
         self.spec_num_forward_ct = 0
-        self.spec_total_num_accepted_tokens = 0  # lifetime
+        self.spec_total_num_accept_tokens = 0  # lifetime
         self.spec_total_num_forward_ct = 0
 
         # For PD disaggregation
@@ -203,7 +203,7 @@ class SchedulerMetricsMixin:
             )
 
     def update_spec_metrics(self: Scheduler, bs: int, num_correct_drafts: int):
-        self.spec_num_accepted_tokens += num_correct_drafts + bs
+        self.spec_num_accept_tokens += num_correct_drafts + bs
         self.spec_num_forward_ct += bs
 
         # Bonus tokens updated elsewhere
@@ -345,9 +345,9 @@ class SchedulerMetricsMixin:
     def reset_metrics(self: Scheduler):
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
-        self.spec_num_accepted_tokens = 0
+        self.spec_num_accept_tokens = 0
         self.spec_num_forward_ct = 0
-        self.spec_total_num_accepted_tokens = 0
+        self.spec_total_num_accept_tokens = 0
         self.spec_total_num_forward_ct = 0
 
     def report_prefill_stats(
@@ -551,12 +551,8 @@ class SchedulerMetricsMixin:
             spec_accept_length = 0
             spec_correct_rate = 0
         else:
-            spec_accept_length = (
-                self.spec_num_accepted_tokens / self.spec_num_forward_ct
-            )
-            num_correct_drafts = (
-                self.spec_num_accepted_tokens - self.spec_num_forward_ct
-            )
+            spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
+            num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
             if self.server_args.speculative_num_draft_tokens:
                 draft_per_round = self.server_args.speculative_num_draft_tokens - 1
             else:
@@ -565,9 +561,9 @@ class SchedulerMetricsMixin:
             spec_correct_rate = (
                 num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
             )
-            self.spec_total_num_accepted_tokens += self.spec_num_accepted_tokens
+            self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
-            self.spec_num_accepted_tokens = self.spec_num_forward_ct = 0
+            self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
             msg += f"accept len: {spec_accept_length:.2f}, correct rate: {spec_correct_rate:.2f}, "
         cache_hit_rate = 0.0
 
@@ -868,7 +864,7 @@ class SchedulerMetricsMixin:
             if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
                 speculative = SpeculativeMetrics(
                     accept_length=(
-                        self.spec_total_num_accepted_tokens
+                        self.spec_total_num_accept_tokens
                         / self.spec_total_num_forward_ct
                     ),
                     correct_rate=self.stats.spec_correct_rate,

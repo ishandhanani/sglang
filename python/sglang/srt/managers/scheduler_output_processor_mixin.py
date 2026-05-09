@@ -379,12 +379,12 @@ class SchedulerOutputProcessorMixin:
     ) -> List[List[int]]:
         """Resolve the padding next token ids for speculative decoding with overlap."""
         assert result.next_token_ids.is_cpu
-        assert result.num_accepted_tokens.is_cpu
+        assert result.num_accept_tokens.is_cpu
 
         next_token_ids = result.next_token_ids.tolist()
-        num_accepted_tokens = result.num_accepted_tokens.tolist()
-        result.num_correct_drafts = sum(num_accepted_tokens) - len(batch.reqs)
-        result.num_correct_drafts_per_req_cpu = [x - 1 for x in num_accepted_tokens]
+        num_accept_tokens = result.num_accept_tokens.tolist()
+        result.num_correct_drafts = sum(num_accept_tokens) - len(batch.reqs)
+        result.num_correct_drafts_per_req_cpu = [x - 1 for x in num_accept_tokens]
 
         # Feed the adaptive controller now that num_correct_drafts_per_req is on CPU,
         # instead of doing a synchronous GPU->CPU copy in the worker hot path.
@@ -399,9 +399,9 @@ class SchedulerOutputProcessorMixin:
 
         for i, req in enumerate(batch.reqs):
             # -1 because prepare_for_decode pre-claimed the bonus slot.
-            req.kv_committed_len += num_accepted_tokens[i] - 1
+            req.kv_committed_len += num_accept_tokens[i] - 1
             predict_tokens.append(
-                next_token_ids[i * stride : i * stride + num_accepted_tokens[i]]
+                next_token_ids[i * stride : i * stride + num_accept_tokens[i]]
             )
             req.spec_verify_ct += 1
 
