@@ -1308,15 +1308,17 @@ class TestTRTLLMMLA(CustomTestCase):
             device = torch.device("cuda")
 
             # Create accept lengths (varying lengths for each batch)
-            num_correct_drafts_per_req = torch.randint(
+            num_accept_tokens_per_req = torch.randint(
                 1, token_per_batch + 1, (batch_size,), device=device, dtype=torch.int32
             )
 
             # Create cumulative accept lengths
-            cum_accept_lengths = torch.zeros(
+            cumulative_num_accept_tokens = torch.zeros(
                 batch_size + 1, device=device, dtype=torch.int32
             )
-            cum_accept_lengths[1:] = torch.cumsum(num_correct_drafts_per_req, dim=0)
+            cumulative_num_accept_tokens[1:] = torch.cumsum(
+                num_accept_tokens_per_req, dim=0
+            )
 
             # Create raw output tensor (batch format)
             raw_out = torch.randn(
@@ -1329,12 +1331,17 @@ class TestTRTLLMMLA(CustomTestCase):
             )
 
             # Create output tensor (flattened format)
-            total_tokens = cum_accept_lengths[-1].item()
+            total_tokens = cumulative_num_accept_tokens[-1].item()
             output = torch.empty(
                 total_tokens, tp_q_head_num, v_head_dim, device=device, dtype=dtype
             )
 
-            return raw_out, output, num_correct_drafts_per_req, cum_accept_lengths
+            return (
+                raw_out,
+                output,
+                num_accept_tokens_per_req,
+                cumulative_num_accept_tokens,
+            )
 
         # Test 1: pad_draft_extend_query_kernel basic functionality
         with self.subTest(test="pad_kernel_basic"):
@@ -1395,7 +1402,7 @@ class TestTRTLLMMLA(CustomTestCase):
             tp_q_head_num = 16
             v_head_dim = 64
 
-            raw_out, output, num_correct_drafts_per_req, cum_accept_lengths = (
+            raw_out, output, num_accept_tokens_per_req, cumulative_num_accept_tokens = (
                 _create_test_output_data(
                     self, batch_size, token_per_batch, tp_q_head_num, v_head_dim
                 )
@@ -1408,8 +1415,8 @@ class TestTRTLLMMLA(CustomTestCase):
             unpad_draft_extend_output_kernel[grid](
                 raw_out_ptr=raw_out,
                 output_ptr=output,
-                accept_lens=num_correct_drafts_per_req,
-                cumsum_ptr=cum_accept_lengths,
+                accept_lens=num_accept_tokens_per_req,
+                cumsum_ptr=cumulative_num_accept_tokens,
                 batch_size=batch_size,
                 token_per_batch=token_per_batch,
                 tp_q_head_num=tp_q_head_num,
@@ -1419,8 +1426,8 @@ class TestTRTLLMMLA(CustomTestCase):
 
             # Verify the unpadding worked correctly
             for i in range(batch_size):
-                num_accept_tokens = num_correct_drafts_per_req[i].item()
-                output_start = cum_accept_lengths[i].item()
+                num_accept_tokens = num_accept_tokens_per_req[i].item()
+                output_start = cumulative_num_accept_tokens[i].item()
 
                 # Check that valid positions are copied correctly
                 for pos in range(num_accept_tokens):
