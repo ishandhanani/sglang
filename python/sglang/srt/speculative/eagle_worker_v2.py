@@ -546,8 +546,13 @@ class EagleDraftWorker(BaseDraftWorker):
 
         batch.spec_info = next_draft_input
 
-        # Run forward
-        forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+        # Run forward (LAST mode: only the final hidden state per request,
+        # to feed the next draft step which expects [bs, hidden_dim]).
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.draft_runner,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
