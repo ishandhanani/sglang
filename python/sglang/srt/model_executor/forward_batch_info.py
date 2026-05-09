@@ -473,6 +473,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             else:
                 batch.sampling_info.grammars = None
 
+        # Under overlap, forward mutates sampling_info (penalty accumulation).
+        # Take a copy so the schedule-side ScheduleBatch.sampling_info is
+        # unaffected; the forward-side copy drops penalizer_orchestrator
+        # because penalties are already accumulated into a buffer.
+        sampling_info = batch.sampling_info
+        if sampling_info is not None and batch.enable_overlap:
+            sampling_info = sampling_info.copy_for_forward()
+
         seq_lens_cpu = (
             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else batch.seq_lens_cpu
         )
@@ -504,7 +512,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_prefill_only=batch.is_prefill_only,
             multi_item_delimiter_indices=batch.multi_item_delimiter_indices,
             lora_ids=[req.lora_id for req in batch.reqs],
-            sampling_info=batch.sampling_info,
+            sampling_info=sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
             attn_backend=model_runner.attn_backend,

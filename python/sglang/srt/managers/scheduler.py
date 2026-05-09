@@ -2968,8 +2968,8 @@ class Scheduler(
             if self.enable_overlap:
                 self.record_batch_in_overlap(batch)
 
-                # Sampling info will be modified during forward, so we store a copy.
-                batch.sampling_info = batch.sampling_info.copy_for_forward()
+                # ForwardBatch.init_new takes a copy of sampling_info under
+                # overlap so the ScheduleBatch is left untouched.
                 bs = len(batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
 
