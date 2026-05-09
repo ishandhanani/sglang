@@ -2126,7 +2126,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and len(recv_obj.spec_correct_drafts_histogram) > i
                 and recv_obj.spec_correct_drafts_histogram[i]
             ):
-                meta_info["spec_accept_histogram"] = (
+                meta_info["spec_correct_drafts_histogram"] = (
                     recv_obj.spec_correct_drafts_histogram[i]
                 )
 
