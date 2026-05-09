@@ -386,10 +386,10 @@ class SchedulerOutputProcessorMixin:
         result.num_correct_drafts = sum(num_accepted_tokens) - len(batch.reqs)
         result.num_correct_drafts_per_req_cpu = [x - 1 for x in num_accepted_tokens]
 
-        # Feed the adaptive controller now that accept_lens is on CPU,
-        # instead of doing a synchronous GPU→CPU copy in the worker hot path.
+        # Feed the adaptive controller now that num_correct_drafts_per_req is on CPU,
+        # instead of doing a synchronous GPU->CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
-        self.model_worker.on_verify_complete_cpu(result.num_accepted_drafts_per_req_cpu)
+        self.model_worker.on_verify_complete_cpu(result.num_correct_drafts_per_req_cpu)
 
         predict_tokens = []
         # In adaptive spec-v2, the worker state may already have switched when this

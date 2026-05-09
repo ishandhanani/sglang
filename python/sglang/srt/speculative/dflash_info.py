@@ -67,7 +67,7 @@ class DFlashDraftInput(SpecInput):
     """
 
     # Current token to start the next DFlash block (one per request).
-    verified_id: torch.Tensor
+    bonus_tokens: torch.Tensor
 
     # Flattened context features for tokens that need to be appended into the draft cache.
     # Shape: [sum(ctx_lens), K * hidden_size], where K is the number of target-layer
@@ -92,7 +92,7 @@ class DFlashDraftInput(SpecInput):
         old_ctx_lens = self.ctx_lens
         old_target_hidden = self.target_hidden
 
-        self.verified_id = self.verified_id[new_indices]
+        self.bonus_tokens = self.bonus_tokens[new_indices]
         self.ctx_lens = old_ctx_lens[new_indices]
         self.draft_seq_lens = self.draft_seq_lens[new_indices]
 
@@ -129,7 +129,9 @@ class DFlashDraftInput(SpecInput):
         )
 
     def merge_batch(self, spec_info: "DFlashDraftInput"):
-        self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], dim=0)
+        self.bonus_tokens = torch.cat(
+            [self.bonus_tokens, spec_info.bonus_tokens], dim=0
+        )
         self.ctx_lens = torch.cat([self.ctx_lens, spec_info.ctx_lens], dim=0)
         self.draft_seq_lens = torch.cat(
             [self.draft_seq_lens, spec_info.draft_seq_lens], dim=0
@@ -319,7 +321,7 @@ class DFlashVerifyInput(SpecInput):
         """DFlash verification for greedy and non-greedy sampling.
 
         Returns:
-            new_verified_id: int64 tensor [bs] (the new current token per request)
+            new_bonus_tokens: int64 tensor [bs] (the new current token per request)
             num_committed_tokens: int32 tensor [bs] (how many verify-input tokens are committed)
             next_target_hidden: tensor [sum(num_committed_tokens), feature_dim]
             num_correct_drafts_per_req_cpu: list[int] (accepted draft tokens per request)
@@ -392,7 +394,7 @@ class DFlashVerifyInput(SpecInput):
         max_acc = self.draft_token_num - 1
         num_correct_drafts_per_req_cpu: List[int] = []
         num_committed_tokens_cpu: List[int] = []
-        new_verified_list: List[int] = []
+        new_bonus_tokens_list: List[int] = []
 
         for i, req in enumerate(batch.reqs):
             acc_len = int(packed[i, max_acc].item())
@@ -412,17 +414,17 @@ class DFlashVerifyInput(SpecInput):
                     req.grammar.accept_token(token_id)
 
             if req.output_ids:
-                new_verified_token = int(req.output_ids[-1])
+                new_bonus_token = int(req.output_ids[-1])
             elif req.origin_input_ids:
                 # If no token was appended in this verify step, keep the current token unchanged.
-                new_verified_token = int(req.origin_input_ids[-1])
+                new_bonus_token = int(req.origin_input_ids[-1])
             else:
                 raise RuntimeError(
                     "DFLASH verify cannot determine current token: both output_ids and origin_input_ids are empty."
                 )
 
             num_committed_tokens_cpu.append(appended)
-            new_verified_list.append(new_verified_token)
+            new_bonus_tokens_list.append(new_bonus_token)
             num_correct_drafts_per_req_cpu.append(max(0, appended - 1))
             req.spec_verify_ct += 1
             req.spec_correct_drafts += num_correct_drafts_per_req_cpu[-1]
@@ -430,8 +432,8 @@ class DFlashVerifyInput(SpecInput):
         num_committed_tokens = torch.tensor(
             num_committed_tokens_cpu, dtype=torch.int32, device=device
         )
-        new_verified_id = torch.tensor(
-            new_verified_list, dtype=torch.int64, device=device
+        new_bonus_tokens = torch.tensor(
+            new_bonus_tokens_list, dtype=torch.int64, device=device
         )
 
         # Free uncommitted KV cache slots and compact out_cache_loc.
@@ -499,7 +501,7 @@ class DFlashVerifyInput(SpecInput):
         logits_output.hidden_states = None
 
         return (
-            new_verified_id,
+            new_bonus_tokens,
             num_committed_tokens,
             next_target_hidden,
             num_correct_drafts_per_req_cpu,
