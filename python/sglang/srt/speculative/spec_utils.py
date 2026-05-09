@@ -430,7 +430,7 @@ def filter_finished_cache_loc_kernel(
     out_cache_loc,
     tgt_cache_loc,
     num_correct_drafts,
-    num_correct_drafts_filter,
+    num_accept_tokens_filter,
     bs_upper: tl.constexpr,
     num_verify_tokens_upper: tl.constexpr,
 ):
@@ -442,12 +442,12 @@ def filter_finished_cache_loc_kernel(
     )
     old_start = tl.sum(num_correct_drafts_all) + bid
 
-    num_correct_drafts_filter_all = tl.load(
-        num_correct_drafts_filter + bs_offset, mask=bs_offset < bid
+    num_accept_tokens_filter_all = tl.load(
+        num_accept_tokens_filter + bs_offset, mask=bs_offset < bid
     )
-    new_start = tl.sum(num_correct_drafts_filter_all)
+    new_start = tl.sum(num_accept_tokens_filter_all)
 
-    copy_len = tl.load(num_correct_drafts_filter + bid)
+    copy_len = tl.load(num_accept_tokens_filter + bid)
     copy_offset = tl.arange(0, num_verify_tokens_upper)
     value = tl.load(
         tgt_cache_loc + old_start + copy_offset, mask=copy_offset < copy_len
@@ -458,17 +458,17 @@ def filter_finished_cache_loc_kernel(
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
-def create_num_correct_drafts_filter(
+def create_num_accept_tokens_filter(
     num_correct_drafts: torch.Tensor,
     unfinished_index_device: torch.Tensor,
     seq_lens: torch.Tensor,
 ):
-    num_correct_drafts_filter = torch.zeros_like(num_correct_drafts)
-    num_correct_drafts_filter[unfinished_index_device] = (
+    num_accept_tokens_filter = torch.zeros_like(num_correct_drafts)
+    num_accept_tokens_filter[unfinished_index_device] = (
         num_correct_drafts[unfinished_index_device] + 1
     )
     seq_lens.add_(num_correct_drafts + 1)
-    return num_correct_drafts_filter
+    return num_accept_tokens_filter
 
 
 def _select_top_k_tokens_first(

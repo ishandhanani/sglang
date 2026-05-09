@@ -38,7 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     align_evict_mask_to_page_size,
     assign_req_to_token_pool_func,
     create_extend_after_decode_spec_info,
-    create_num_correct_drafts_filter,
+    create_num_accept_tokens_filter,
     filter_finished_cache_loc_kernel,
     generate_simulated_accept_index,
     get_src_tgt_cache_loc,
@@ -602,7 +602,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         dtype=torch.int64,
                         device=predict.device,
                     )
-                    num_correct_drafts_filter = create_num_correct_drafts_filter(
+                    num_accept_tokens_filter = create_num_accept_tokens_filter(
                         num_correct_drafts,
                         unfinished_index_device,
                         batch.seq_lens,
@@ -612,7 +612,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         batch.out_cache_loc,
                         tgt_cache_loc,
                         num_correct_drafts,
-                        num_correct_drafts_filter,
+                        num_accept_tokens_filter,
                         next_power_of_2(bs),
                         next_power_of_2(self.draft_token_num),
                     )
