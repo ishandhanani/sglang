@@ -16,10 +16,10 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     src_ptr,
     dst_ptr,
     # Raw index arrays (before index_select)
-    dst_indices_raw_ptr,  # [total_requests] - state_indices_tensor
-    step_indices_raw_ptr,  # [total_requests] - num_correct_drafts or mamba_steps_to_track
+    dst_indices_raw_ptr,  # [num_requests] - state_indices_tensor
+    step_indices_raw_ptr,  # [num_requests] - num_correct_drafts or mamba_steps_to_track
     # Total number of requests
-    total_requests,
+    num_requests,
     elem_per_entry: tl.constexpr,
     src_layer_stride,
     src_req_stride,
@@ -35,12 +35,12 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     Fused gather-scatter kernel with built-in masking.
 
     This kernel fuses the index_select operations by:
-    1. Iterating over all requests (pid_req from 0 to total_requests-1)
+    1. Iterating over all requests (pid_req from 0 to num_requests-1)
     2. Checking if step_indices_raw[pid_req] >= 0 (valid mask)
     3. If valid, performing the scatter:
        dst[l, dst_indices_raw[pid_req], :] = src[l, pid_req, step_indices_raw[pid_req], :]
 
-    Grid: (total_requests, num_layers, ceil(elem_per_entry / BLOCK_SIZE))
+    Grid: (num_requests, num_layers, ceil(elem_per_entry / BLOCK_SIZE))
     """
     pid_req = tl.program_id(0)
     pid_layer = tl.program_id(1).to(tl.int64)
@@ -90,8 +90,8 @@ def _fused_mamba_state_scatter_with_mask_kernel(
 def fused_mamba_state_scatter_with_mask(
     dst: torch.Tensor,  # [num_layers, cache_size, *state_shape]
     src: torch.Tensor,  # [num_layers, spec_size, draft_tokens, *state_shape]
-    dst_indices_raw: torch.Tensor,  # [total_requests] - raw indices (e.g., state_indices_tensor)
-    step_indices_raw: torch.Tensor,  # [total_requests] - raw step indices (step >= 0 means valid)
+    dst_indices_raw: torch.Tensor,  # [num_requests] - raw indices (e.g., state_indices_tensor)
+    step_indices_raw: torch.Tensor,  # [num_requests] - raw step indices (step >= 0 means valid)
 ):
     """
     Fully fused gather-scatter with built-in masking for mamba state updates.
@@ -106,11 +106,11 @@ def fused_mamba_state_scatter_with_mask(
     Args:
         dst: Destination tensor [num_layers, cache_size, *state_shape]
         src: Source tensor [num_layers, spec_size, draft_tokens, *state_shape]
-        dst_indices_raw: Raw destination indices for all requests [total_requests]
-        step_indices_raw: Raw step indices; entry >= 0 means valid [total_requests]
+        dst_indices_raw: Raw destination indices for all requests [num_requests]
+        step_indices_raw: Raw step indices; entry >= 0 means valid [num_requests]
     """
-    total_requests = step_indices_raw.shape[0]
-    if total_requests == 0:
+    num_requests = step_indices_raw.shape[0]
+    if num_requests == 0:
         return
 
     if dst.device != src.device:
@@ -169,14 +169,14 @@ def fused_mamba_state_scatter_with_mask(
     BLOCK_SIZE = 1024
 
     # Grid over all requests - invalid ones will early-exit in the kernel
-    grid = (total_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
+    grid = (num_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
 
     _fused_mamba_state_scatter_with_mask_kernel[grid](
         src,
         dst,
         dst_indices_raw,
         step_indices_raw,
-        total_requests,
+        num_requests,
         elem_per_entry,
         src_layer_stride,
         src_req_stride,

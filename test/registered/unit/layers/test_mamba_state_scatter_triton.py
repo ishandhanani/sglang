@@ -50,9 +50,9 @@ def _ref_update_like(
     mamba_steps_to_track=None,
 ):
     """Reference implementation using PyTorch advanced indexing for correctness verification."""
-    total_requests = step_indices_raw.shape[0]
+    num_requests = step_indices_raw.shape[0]
     intermediate_state_indices = torch.arange(
-        total_requests, dtype=torch.int32, device=step_indices_raw.device
+        num_requests, dtype=torch.int32, device=step_indices_raw.device
     )
 
     valid_mask = step_indices_raw >= 0

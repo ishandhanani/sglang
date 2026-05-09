@@ -423,7 +423,7 @@ def compute_dflash_correct_drafts_and_bonus(
     candidates: torch.Tensor,
     target_predict: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute DFlash accept lengths and bonus tokens (greedy verify rule).
+    """Compute DFlash correct drafts and bonus tokens (greedy verify rule).
 
     Args:
         candidates: Token ids proposed by the DFlash draft, including the current token.
@@ -472,7 +472,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
     use_sparse_topk: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
+    """Compute DFlash correct drafts and bonus tokens for non-greedy sampling.
 
     This is a chain-specialized variant of speculative target-only verification:
       - DFlash proposals are linear (topk == 1), so each verify level has at most one candidate.
