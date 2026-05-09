@@ -387,11 +387,8 @@ class FrozenKVMTPWorker(TpModelWorker):
         batch.spec_info = draft_input
 
         try:
-            model_worker_batch = batch.get_model_worker_batch(
-                seq_lens_cpu_cache=seq_lens_cpu
-            )
             forward_batch = ForwardBatch.init_new(
-                model_worker_batch, self.draft_model_runner
+                batch, self.draft_model_runner, seq_lens_cpu_cache=seq_lens_cpu
             )
             forward_batch.return_logprob = False
             if mm_input_embeds is not None:
@@ -447,9 +444,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
         set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
-        logits_output, verify_output, _, can_run_cuda_graph = self.verify(
-            batch, spec_info
-        )
+        logits_output, verify_output, can_run_cuda_graph = self.verify(batch, spec_info)
 
         if get_global_tracing_enabled():
             for idx, req in enumerate(batch.reqs):
@@ -478,13 +473,13 @@ class FrozenKVMTPWorker(TpModelWorker):
     def forward_target_extend(
         self, batch: ScheduleBatch
     ) -> Tuple[LogitsProcessorOutput, torch.Tensor, Optional[torch.Tensor], bool]:
-        model_worker_batch = batch.get_model_worker_batch()
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+        batch_result = self.target_worker.forward_batch_generation(
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+        )
         return (
             batch_result.logits_output,
             batch_result.next_token_ids,
-            model_worker_batch.seq_lens_cpu,
+            batch.seq_lens_cpu,
             batch_result.can_run_cuda_graph,
         )
 
@@ -576,11 +571,8 @@ class FrozenKVMTPWorker(TpModelWorker):
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         batch.return_hidden_states = False
 
-        model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
-        )
+        forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
+        assert forward_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         self._set_positions(forward_batch)
         self._expand_for_topk_draft(forward_batch)
 
@@ -701,11 +693,6 @@ class FrozenKVMTPWorker(TpModelWorker):
         )
         batch.spec_info = spec_info
 
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=spec_info.seq_lens_cpu
-        )
-        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
-
         if batch.has_grammar:
             retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
             retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
@@ -714,7 +701,9 @@ class FrozenKVMTPWorker(TpModelWorker):
             ).cpu()
 
         batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
+            batch,
+            is_verify=True,
+            seq_lens_cpu_cache=spec_info.seq_lens_cpu,
         )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
@@ -771,4 +760,4 @@ class FrozenKVMTPWorker(TpModelWorker):
         batch.spec_info = res.next_draft_input
 
         del seq_lens_pre_verify
-        return logits_output, res, model_worker_batch, can_run_cuda_graph
+        return logits_output, res, can_run_cuda_graph
