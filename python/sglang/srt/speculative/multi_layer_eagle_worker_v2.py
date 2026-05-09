@@ -781,11 +781,16 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
             )
 
-        # Construct the next draft input
+        # Construct the next draft input. The `_keep_alive_for_verify_forward`
+        # field anchors verify_forward_batch (and transitively the verify-time
+        # GPU tensors like draft_token / out_cache_loc) so they survive the
+        # imminent batch.input_ids rebind in prepare_for_extend_to_fill_draft_kvcache
+        # until the next iter's verify_done.synchronize() in filter_batch.
         next_draft_input = EagleDraftInput(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
+            _keep_alive_for_verify_forward=verify_forward_batch,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
