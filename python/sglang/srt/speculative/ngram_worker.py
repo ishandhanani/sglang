@@ -329,7 +329,7 @@ class NGRAMWorker:
                     req.time_stats.set_spec_verify_end_time(correct_drafts=correct)
 
             # Store num_accept_tokens for per-request metrics
-            num_accept_tokens = verify_input.num_correct_drafts
+            num_accept_tokens = verify_input.num_accept_tokens
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
             self._update_ngram_corpus(batch)
