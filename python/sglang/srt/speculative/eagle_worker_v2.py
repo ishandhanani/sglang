@@ -1151,7 +1151,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         Args:
             batch: The batch to run.
             accept_index: The index of the accepted tokens.
-            num_correct_drafts: The length of the accepted tokens.
+            num_correct_drafts: Per-request count of accepted draft tokens (no bonus).
         """
         bs = len(batch.seq_lens)
         size = bs * self.speculative_num_draft_tokens
