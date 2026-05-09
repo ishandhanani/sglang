@@ -2109,11 +2109,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Calculate per-request acceptance rate and average acceptance length.
             if all_drafts > 0:
-                correct_rate = correct_drafts / all_drafts
-                # correct_rate: correct_drafts / total_proposed_drafts (strict count, no bonus).
-                meta_info["spec_correct_rate"] = correct_rate
-                # Deprecated alias for `spec_correct_rate`. Will be removed in a future release.
-                meta_info["spec_accept_rate"] = correct_rate
+                # accept_rate: correct_drafts / total_proposed_drafts (strict count, no bonus).
+                meta_info["spec_accept_rate"] = correct_drafts / all_drafts
                 # accept_length: completion_tokens / verify_ct (includes bonus token).
                 meta_info["spec_accept_length"] = (
                     recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]

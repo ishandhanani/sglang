@@ -107,7 +107,7 @@ class SchedulerStats:
 
     # Speculative decoding
     spec_accept_length: float = 0.0
-    spec_correct_rate: float = 0.0
+    spec_accept_rate: float = 0.0
 
     # Retract
     num_retracted_reqs: int = 0
@@ -343,16 +343,9 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-        self.spec_correct_rate = Gauge(
-            name="sglang:spec_correct_rate",
-            documentation="Speculative correct-draft rate (`correct drafts / proposed drafts` in batch).",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        # Deprecated alias for `sglang:spec_correct_rate`. Will be removed in a future release.
         self.spec_accept_rate = Gauge(
             name="sglang:spec_accept_rate",
-            documentation="Deprecated alias for `sglang:spec_correct_rate`; same value.",
+            documentation="Speculative acceptance rate (`accepted drafts / proposed drafts` in batch).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1139,9 +1132,7 @@ class SchedulerMetricsCollector:
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
-        self._log_gauge(self.spec_correct_rate, stats.spec_correct_rate)
-        # Mirror to the deprecated `spec_accept_rate` gauge for backward compatibility.
-        self._log_gauge(self.spec_accept_rate, stats.spec_correct_rate)
+        self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
 
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)

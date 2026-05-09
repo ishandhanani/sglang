@@ -549,7 +549,7 @@ class SchedulerMetricsMixin:
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
-            spec_correct_rate = 0
+            spec_accept_rate = 0
         else:
             spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
             num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
@@ -558,13 +558,13 @@ class SchedulerMetricsMixin:
             else:
                 draft_per_round = self.server_args.speculative_num_steps or 0
             total_draft_tokens = self.spec_num_forward_ct * draft_per_round
-            spec_correct_rate = (
+            spec_accept_rate = (
                 num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
             )
             self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
-            msg += f"accept len: {spec_accept_length:.2f}, correct rate: {spec_correct_rate:.2f}, "
+            msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
         cache_hit_rate = 0.0
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -625,7 +625,7 @@ class SchedulerMetricsMixin:
             pool_stats.update_scheduler_stats(self.stats)
 
             # Speculative decoding
-            self.stats.spec_correct_rate = spec_correct_rate
+            self.stats.spec_accept_rate = spec_accept_rate
             self.stats.spec_accept_length = spec_accept_length
 
             # Retract
@@ -867,8 +867,7 @@ class SchedulerMetricsMixin:
                         self.spec_total_num_accept_tokens
                         / self.spec_total_num_forward_ct
                     ),
-                    correct_rate=self.stats.spec_correct_rate,
-                    accept_rate=self.stats.spec_correct_rate,
+                    accept_rate=self.stats.spec_accept_rate,
                 )
 
         lora = None
