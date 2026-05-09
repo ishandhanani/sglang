@@ -2977,16 +2977,23 @@ class Scheduler(
             if self.enable_overlap:
                 self.record_batch_in_overlap(batch)
 
-                # Swap sampling_info to a forward-only copy that drops
-                # penalizer_orchestrator (penalties are accumulated into a
-                # buffer once via update_penalties). Restore the original
-                # afterwards so subsequent prepare_for_decode/extend can still
-                # use the orchestrator. Keeping update_penalties on the
-                # outer scheduler step prevents repeated accumulation across
-                # the multiple ForwardBatch.init_new calls inside spec V2.
+                # Save SB attributes that get mutated mid-forward by spec V2
+                # (prepare_for_v2_verify -> TARGET_VERIFY,
+                # prepare_for_extend_to_fill_draft_kvcache -> DRAFT_EXTEND_V2)
+                # and must be restored afterwards because:
+                # - sampling_info: subsequent prepare_for_decode/extend reads
+                #   penalizer_orchestrator (we hand forward a copy with
+                #   penalizer=None to avoid double-accumulation across the
+                #   multiple ForwardBatch.init_new calls inside spec V2).
+                # - forward_mode: process_batch_result dispatches by
+                #   forward_mode (is_decode / is_extend / ...). If the
+                #   spec-V2 mutations leak to SB, no branch matches and
+                #   req.output_ids never grows. Pre-MWB-removal these
+                #   mutations were on MWB, never visible to SB.
                 sched_sampling_info = batch.sampling_info
                 if sched_sampling_info is not None:
                     batch.sampling_info = sched_sampling_info.copy_for_forward()
+                sched_forward_mode = batch.forward_mode
                 bs = len(batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
 
@@ -3009,6 +3016,7 @@ class Scheduler(
                             batch_result.future_indices = future_indices
                 finally:
                     batch.sampling_info = sched_sampling_info
+                    batch.forward_mode = sched_forward_mode
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
