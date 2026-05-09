@@ -2968,25 +2968,38 @@ class Scheduler(
             if self.enable_overlap:
                 self.record_batch_in_overlap(batch)
 
-                # ForwardBatch.init_new takes a copy of sampling_info under
-                # overlap so the ScheduleBatch is left untouched.
+                # Swap sampling_info to a forward-only copy that drops
+                # penalizer_orchestrator (penalties are accumulated into a
+                # buffer once via update_penalties). Restore the original
+                # afterwards so subsequent prepare_for_decode/extend can still
+                # use the orchestrator. Keeping update_penalties on the
+                # outer scheduler step prevents repeated accumulation across
+                # the multiple ForwardBatch.init_new calls inside spec V2.
+                sched_sampling_info = batch.sampling_info
+                if sched_sampling_info is not None:
+                    batch.sampling_info = sched_sampling_info.copy_for_forward()
                 bs = len(batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
 
-                with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
-                    self.future_map.resolve_future(batch)
-                    batch_result = self.model_worker.forward_batch_generation(
-                        batch
-                        # here pp is not compatible with overlap
-                    )
-                    # FIXME(lsyin): maybe move this to forward_batch_generation
-                    batch_result.copy_done = self.device_module.Event()
-                    if batch_result.delay_sample_func is None:
-                        self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
-                    else:
-                        batch_result.future_indices = future_indices
+                try:
+                    with self.forward_stream_ctx:
+                        self.forward_stream.wait_stream(self.schedule_stream)
+                        self.future_map.resolve_future(batch)
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch
+                            # here pp is not compatible with overlap
+                        )
+                        # FIXME(lsyin): maybe move this to forward_batch_generation
+                        batch_result.copy_done = self.device_module.Event()
+                        if batch_result.delay_sample_func is None:
+                            self.future_map.store_to_map(future_indices, batch_result)
+                            batch_result.copy_to_cpu(
+                                return_logprob=batch.return_logprob
+                            )
+                        else:
+                            batch_result.future_indices = future_indices
+                finally:
+                    batch.sampling_info = sched_sampling_info
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
