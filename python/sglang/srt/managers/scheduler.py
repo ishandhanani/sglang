@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import dataclasses
 import faulthandler
 import logging
 import os
@@ -2941,8 +2942,16 @@ class Scheduler(
         # NOTE: - for all future tensors, we shall always read from future map
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
+        # Snapshot SB's current attribute values so that any post-forward
+        # attribute rebinds (e.g. spec V2 reassigns batch.seq_lens to
+        # next_draft_input.new_seq_lens) do not drop the old tensor refs while
+        # forward stream is still using their GPU memory. Pre-MWB-removal this
+        # was provided implicitly by ModelWorkerBatch's per-field copy.
+        attr_snapshot = [
+            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
+        ]
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
-        self.batch_record_buf[self.batch_record_ct] = batch
+        self.batch_record_buf[self.batch_record_ct] = (batch, attr_snapshot)
 
     def run_batch(
         self,
