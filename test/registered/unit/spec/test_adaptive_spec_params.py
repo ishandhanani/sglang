@@ -15,7 +15,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
 
         self.assertEqual(params.candidate_steps, [1, 2, 3, 7])
         self.assertEqual(params.current_steps, 2)
-        self.assertEqual(params.ema_accept_len, 1.0)
+        self.assertEqual(params.ema_accept_length, 1.0)
 
     def test_update_respects_warmup_and_interval(self):
         params = AdaptiveSpeculativeParams(
@@ -50,7 +50,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
 
         self.assertFalse(params.update([]))
         self.assertEqual(params.current_steps, 3)
-        self.assertEqual(params.ema_accept_len, 2.0)
+        self.assertEqual(params.ema_accept_length, 2.0)
 
         self.assertFalse(params.update([0, 0]))
         self.assertEqual(params.current_steps, 3)
@@ -104,7 +104,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
 
         self.assertFalse(params.update([2, 3]))
         self.assertEqual(params.current_steps, 3)
-        self.assertEqual(params.ema_accept_len, 2.5)
+        self.assertEqual(params.ema_accept_length, 2.5)
 
         self.assertTrue(params.update([3, 3]))
         self.assertEqual(params.current_steps, 7)
@@ -124,7 +124,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
 
         self.assertTrue(params.update([0, 1]))
         self.assertEqual(params.current_steps, 1)
-        self.assertEqual(params.ema_accept_len, 0.5)
+        self.assertEqual(params.ema_accept_length, 0.5)
 
     def test_hysteresis_can_prevent_premature_upshift(self):
         params = AdaptiveSpeculativeParams(
@@ -177,19 +177,19 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
 
         self.assertTrue(params.update([4, 4]))
         self.assertEqual(params.current_steps, 7)
-        self.assertEqual(params.ema_accept_len, 3.0)
+        self.assertEqual(params.ema_accept_length, 3.0)
 
         self.assertTrue(params.update([0, 0]))
         self.assertEqual(params.current_steps, 3)
-        self.assertEqual(params.ema_accept_len, 1.5)
+        self.assertEqual(params.ema_accept_length, 1.5)
 
         self.assertFalse(params.update([0, 0]))
         self.assertEqual(params.current_steps, 3)
-        self.assertEqual(params.ema_accept_len, 0.75)
+        self.assertEqual(params.ema_accept_length, 0.75)
 
         self.assertTrue(params.update([0, 0]))
         self.assertEqual(params.current_steps, 1)
-        self.assertEqual(params.ema_accept_len, 0.375)
+        self.assertEqual(params.ema_accept_length, 0.375)
 
 
 if __name__ == "__main__":

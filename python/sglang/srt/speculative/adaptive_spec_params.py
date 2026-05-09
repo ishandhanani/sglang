@@ -79,7 +79,7 @@ class AdaptiveSpeculativeParams:
     The core idea: if drafts are consistently accepted, try more steps;
     if drafts are consistently rejected early, reduce steps to avoid waste.
 
-    Formula: target_steps = clamp(round(ema_accept_len) + 1, min_steps, max_steps)
+    Formula: target_steps = clamp(round(ema_accept_length) + 1, min_steps, max_steps)
     - Probes one step beyond observed acceptance
     - EMA smoothing prevents oscillation
     - Only updates every `update_interval` batches for stability
@@ -123,7 +123,7 @@ class AdaptiveSpeculativeParams:
         self.current_steps = initial_steps
 
         # Initialize EMA at current steps - 1 (neutral starting point)
-        self.ema_accept_len = float(self.current_steps - 1)
+        self.ema_accept_length = float(self.current_steps - 1)
         self._batch_count = 0
 
         log_info_on_rank0(
@@ -142,9 +142,9 @@ class AdaptiveSpeculativeParams:
             return False
 
         batch_avg = sum(num_correct_drafts_per_req) / len(num_correct_drafts_per_req)
-        self.ema_accept_len = (
+        self.ema_accept_length = (
             1 - self.ema_alpha
-        ) * self.ema_accept_len + self.ema_alpha * batch_avg
+        ) * self.ema_accept_length + self.ema_alpha * batch_avg
 
         self._batch_count += 1
         if self._batch_count <= self.warmup_batches:
@@ -164,7 +164,7 @@ class AdaptiveSpeculativeParams:
         while current_idx > 0:
             prev_step = self.candidate_steps[current_idx - 1]
             drop_threshold = prev_step - 0.5 + self.down_hysteresis
-            if self.ema_accept_len <= drop_threshold:
+            if self.ema_accept_length <= drop_threshold:
                 current_idx -= 1
             else:
                 break
@@ -172,7 +172,7 @@ class AdaptiveSpeculativeParams:
         while current_idx < len(self.candidate_steps) - 1:
             current_step = self.candidate_steps[current_idx]
             rise_threshold = current_step - 0.5 + self.up_hysteresis
-            if self.ema_accept_len > rise_threshold:
+            if self.ema_accept_length > rise_threshold:
                 current_idx += 1
             else:
                 break
@@ -184,7 +184,7 @@ class AdaptiveSpeculativeParams:
             log_info_on_rank0(
                 logger,
                 f"Adaptive spec params updated: steps {old_steps} -> {target} "
-                f"(ema_accept_len={self.ema_accept_len:.2f})",
+                f"(ema_accept_length={self.ema_accept_length:.2f})",
             )
             return True
         return False
