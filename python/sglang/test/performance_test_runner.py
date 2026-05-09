@@ -16,7 +16,7 @@ class PerformanceTestParams:
     profile_dir: Optional[str] = None  # None = auto-generate based on is_vlm
     dataset_name: str = "mmmu"  # For VLM perf test
     # MTP/EAGLE speculative decoding: minimum accept length threshold (None = no validation)
-    spec_accept_length_threshold: Optional[float] = None
+    spec_accept_length_thres: Optional[float] = None
 
 
 @dataclass
@@ -48,7 +48,7 @@ def run_performance_test(
     output_lens: Tuple[int, ...] = (512,),
     is_vlm: bool = False,
     dataset_name: str = "mmmu",
-    spec_accept_length_threshold: Optional[float] = None,
+    spec_accept_length_thres: Optional[float] = None,
 ) -> PerformanceTestResult:
 
     # Set default for mutable argument
@@ -61,8 +61,8 @@ def run_performance_test(
     print(f"  Batch sizes: {batch_sizes}")
     print(f"  Input lens: {input_lens}")
     print(f"  Output lens: {output_lens}")
-    if spec_accept_length_threshold is not None:
-        print(f"  Spec accept length threshold: {spec_accept_length_threshold}")
+    if spec_accept_length_thres is not None:
+        print(f"  Spec accept length threshold: {spec_accept_length_thres}")
     print(f"{'='*60}\n")
 
     # Build extra args for benchmarks
@@ -89,22 +89,22 @@ def run_performance_test(
             # Validate speculative decoding accept length if threshold is set
             error_msg = None
             passed = True
-            if spec_accept_length_threshold is not None:
+            if spec_accept_length_thres is not None:
                 if avg_spec_accept_length is None:
                     error_msg = f"Spec accept length threshold set but no accept length reported"
                     passed = False
                     print(f"✗ {error_msg}")
-                elif avg_spec_accept_length < spec_accept_length_threshold:
+                elif avg_spec_accept_length < spec_accept_length_thres:
                     error_msg = (
                         f"Spec accept length {avg_spec_accept_length:.2f} < "
-                        f"threshold {spec_accept_length_threshold}"
+                        f"threshold {spec_accept_length_thres}"
                     )
                     passed = False
                     print(f"✗ {error_msg}")
                 else:
                     print(
                         f"✓ Spec accept length {avg_spec_accept_length:.2f} >= "
-                        f"threshold {spec_accept_length_threshold}"
+                        f"threshold {spec_accept_length_thres}"
                     )
 
             # Extract aggregate metrics from the largest batch size result

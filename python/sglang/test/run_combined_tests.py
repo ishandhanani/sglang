@@ -121,7 +121,7 @@ def run_combined_tests(
                 output_lens=performance_params.output_lens,
                 is_vlm=is_vlm,
                 dataset_name=performance_params.dataset_name,
-                spec_accept_length_threshold=performance_params.spec_accept_length_threshold,
+                spec_accept_length_thres=performance_params.spec_accept_length_thres,
             )
             model_result["perf_result"] = perf_result
             if not perf_result.passed:
