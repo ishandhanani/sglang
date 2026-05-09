@@ -1089,7 +1089,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
     ):
         """Update mamba state for hybrid GDN models after verification."""
         # `num_accepted_tokens` already includes the bonus token (drafts + 1 per req).
-        num_accepted_tokens = num_accepted_tokens
         if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
             if verify_input.topk != 1:
                 raise ValueError("Spec v2 currently only supports topk = 1.")

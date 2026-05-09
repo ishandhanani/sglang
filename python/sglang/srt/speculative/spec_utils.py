@@ -64,7 +64,7 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
 def create_extend_after_decode_spec_info(
     verified_id,
     seq_lens,
-    num_accepted_tokens,
+    accept_lens,
     positions,
     new_verified_id,
     bs_upper: tl.constexpr,
@@ -72,17 +72,17 @@ def create_extend_after_decode_spec_info(
     pid = tl.program_id(axis=0)
     offsets = tl.arange(0, bs_upper)
     seq_length = tl.load(seq_lens + pid)
-    # `num_accepted_tokens` includes the bonus token; load this req's value.
-    num_accepted_tokens = tl.load(num_accepted_tokens + pid)
+    # `accept_lens` includes the bonus token; load this req's value.
+    accept_len = tl.load(accept_lens + pid)
 
     accept_len_cumsum = tl.sum(
-        tl.load(num_accepted_tokens + offsets, mask=offsets < pid, other=0)
+        tl.load(accept_lens + offsets, mask=offsets < pid, other=0)
     )
     positions_ptr = positions + accept_len_cumsum
-    mask = offsets < num_accepted_tokens
-    tl.store(positions_ptr + offsets, seq_length - num_accepted_tokens + offsets, mask)
+    mask = offsets < accept_len
+    tl.store(positions_ptr + offsets, seq_length - accept_len + offsets, mask)
 
-    accept_len_cumsum += num_accepted_tokens - 1
+    accept_len_cumsum += accept_len - 1
     verified_id_data = tl.load(verified_id + accept_len_cumsum)
     tl.store(new_verified_id + pid, verified_id_data)
 
