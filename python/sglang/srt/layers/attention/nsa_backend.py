@@ -408,13 +408,14 @@ class NativeSparseAttnBackend(
     ) -> torch.Tensor:
         # target_verify with next_n>=2 uses DG-native q=[B,next_n,H,D] which
         # needs a [B, next_n] schedule; everything else stays per-token.
-        # SM90 only supports next_n in {1,2} natively (DG asserts), SM100+ any.
+        # TODO: SM90 supports DG-native next_n in {1,2} too — enable once
+        # validated; for now DG-native is SM100+ only.
         next_n = self.speculative_num_draft_tokens
         if (
             forward_mode.is_target_verify()
             and next_n
             and next_n >= 2
-            and (is_sm100_supported() or next_n == 2)
+            and is_sm100_supported()
         ):
             return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend(
@@ -682,6 +683,9 @@ class NativeSparseAttnBackend(
                 seqlens_expanded,
                 forward_batch.batch_size,
             )
+            # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
+            # block_kv * 4 and both DG's and the indexer's compute kernels
+            # require SPLIT_KV = 256; this is independent of the cache page size.
             paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )

@@ -470,8 +470,8 @@ class Indexer(MultiPlatformOp):
         # DG-native q=[B,next_n,H,D] is faster than expanded q=[B*next_n,1,H,D]
         # for target_verify with next_n>=2 (bigger MMA tile, fewer atoms). The
         # precomputed ctx_lens_2d's shape is the single source of truth — if
-        # nsa_backend chose the per-token layout (e.g. SM90 with next_n>=3,
-        # which DG SM90 doesn't support natively), fall through to expanded.
+        # nsa_backend chose the per-token layout (e.g. non-SM100), fall through
+        # to the expanded path.
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
         ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
