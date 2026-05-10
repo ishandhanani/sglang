@@ -36,7 +36,10 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_sm100_supported
+
+if is_cuda():
+    import deep_gemm
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -139,6 +142,9 @@ class NSAMetadata:
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
     # Precomputed once per forward batch and reused across layers.
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    # 2D context_lens used to build the schedule above; the indexer reuses it
+    # as DG's `context_lens` arg so the broadcast doesn't rebuild per layer.
+    paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -191,6 +197,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
     attn_metadata: NSAMetadata
     topk_transform_method: TopkTransformMethod
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
 
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -391,6 +398,30 @@ class NativeSparseAttnBackend(
             self.workspace_buffer = global_workspace_buffer
         else:
             self.workspace_buffer = None
+
+    def _build_paged_mqa_schedule_2d_ctx_lens(
+        self,
+        forward_mode: ForwardMode,
+        cache_seqlens_int32: torch.Tensor,
+        seqlens_expanded: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        # target_verify with next_n>=2 uses DG-native q=[B,next_n,H,D] which
+        # needs a [B, next_n] schedule; everything else stays per-token.
+        # SM90 only supports next_n in {1,2} natively (DG asserts), SM100+ any.
+        next_n = self.speculative_num_draft_tokens
+        if (
+            forward_mode.is_target_verify()
+            and next_n
+            and next_n >= 2
+            and (is_sm100_supported() or next_n == 2)
+        ):
+            return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend(
+            include_v2=True
+        ):
+            return _to_2d_context_lens(seqlens_expanded, batch_size)
+        return _to_2d_context_lens(cache_seqlens_int32, batch_size)
 
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
@@ -639,33 +670,21 @@ class NativeSparseAttnBackend(
         nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
 
         paged_mqa_schedule_metadata = None
-        # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
-        # Compute it once per forward batch and reuse it across layers.
+        paged_mqa_ctx_lens_2d = None
         if is_cuda() and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
-            try:
-                import deep_gemm
-
-                # NOTE: DeepGEMM paged path uses block_size=64.
-                seqlens_32 = (
-                    seqlens_expanded
-                    if (
-                        forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend(include_v2=True)
-                    )
-                    else cache_seqlens_int32
-                )
-                seqlens_32_2d = _to_2d_context_lens(
-                    seqlens_32, forward_batch.batch_size
-                )
-                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
-                )
-            except (ImportError, ModuleNotFoundError):
-                paged_mqa_schedule_metadata = None
+            paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+                forward_batch.forward_mode,
+                cache_seqlens_int32,
+                seqlens_expanded,
+                forward_batch.batch_size,
+            )
+            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+            )
 
         metadata = NSAMetadata(
             page_size=self.real_page_size,
@@ -686,6 +705,7 @@ class NativeSparseAttnBackend(
                 else None
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
+            paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
@@ -930,28 +950,18 @@ class NativeSparseAttnBackend(
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
         paged_mqa_schedule_metadata = None
+        paged_mqa_ctx_lens_2d = None
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend(include_v2=True)
         ):
-            try:
-                import deep_gemm
-
-                seqlens_32 = (
-                    seqlens_expanded
-                    if (
-                        forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend(include_v2=True)
-                    )
-                    else cache_seqlens_int32
-                )
-                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
-                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
-                )
-            except (ImportError, ModuleNotFoundError):
-                paged_mqa_schedule_metadata = None
+            paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+                forward_mode, cache_seqlens_int32, seqlens_expanded, bs
+            )
+            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+            )
 
         metadata = NSAMetadata(
             page_size=self.real_page_size,
@@ -963,6 +973,7 @@ class NativeSparseAttnBackend(
             page_table_1=page_table_1,
             flashmla_metadata=flashmla_metadata,
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
+            paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
@@ -1086,29 +1097,26 @@ class NativeSparseAttnBackend(
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend(include_v2=True)
         ):
-            try:
-                import deep_gemm
-
-                seqlens_32 = (
-                    seqlens_expanded
-                    if (
-                        forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend(include_v2=True)
-                    )
-                    else metadata.cache_seqlens_int32
+            seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+                forward_mode,
+                metadata.cache_seqlens_int32,
+                seqlens_expanded,
+                bs,
+            )
+            new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                seqlens_32_2d, 64, deep_gemm.get_num_sms()
+            )
+            if metadata.paged_mqa_schedule_metadata is None:
+                object.__setattr__(
+                    metadata, "paged_mqa_schedule_metadata", new_schedule
                 )
-                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
-                new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
-                )
-                if metadata.paged_mqa_schedule_metadata is None:
-                    object.__setattr__(
-                        metadata, "paged_mqa_schedule_metadata", new_schedule
-                    )
-                else:
-                    metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
-            except (ImportError, ModuleNotFoundError):
-                object.__setattr__(metadata, "paged_mqa_schedule_metadata", None)
+            else:
+                metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+            # `copy_` preserves the buffer's data_ptr that the captured graph captured.
+            if metadata.paged_mqa_ctx_lens_2d is None:
+                object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
+            else:
+                metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.nsa_cache_seqlens_int32 is not None
@@ -1300,27 +1308,28 @@ class NativeSparseAttnBackend(
         # deadlock the kernel when the runtime work decomposition diverges from
         # the captured one).
         if is_cuda():
-            try:
-                import deep_gemm
-
-                if forward_mode.is_decode_or_idle():
-                    seqlens_32 = metadata.cache_seqlens_int32
-                else:
-                    seqlens_32 = metadata.nsa_seqlens_expanded[
-                        : precomputed.seqlens_expanded_size
-                    ]
-                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
-                new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
+            if forward_mode.is_decode_or_idle():
+                seqlens_32_2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
+            else:
+                seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+                    forward_mode,
+                    metadata.cache_seqlens_int32,
+                    metadata.nsa_seqlens_expanded[: precomputed.seqlens_expanded_size],
+                    bs,
                 )
-                if metadata.paged_mqa_schedule_metadata is None:
-                    object.__setattr__(
-                        metadata, "paged_mqa_schedule_metadata", new_schedule
-                    )
-                else:
-                    metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
-            except (ImportError, ModuleNotFoundError):
-                pass
+            new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                seqlens_32_2d, 64, deep_gemm.get_num_sms()
+            )
+            if metadata.paged_mqa_schedule_metadata is None:
+                object.__setattr__(
+                    metadata, "paged_mqa_schedule_metadata", new_schedule
+                )
+            else:
+                metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+            if metadata.paged_mqa_ctx_lens_2d is None:
+                object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
+            else:
+                metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
 
         self.forward_metadata = metadata
 
@@ -2271,6 +2280,7 @@ class NativeSparseAttnBackend(
                 forward_batch.forward_mode
             ),
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
+            paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
             force_unfused_topk=force_unfused,
         )
 
