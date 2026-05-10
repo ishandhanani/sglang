@@ -2977,31 +2977,43 @@ class Scheduler(
             if self.enable_overlap:
                 self.record_batch_in_overlap(batch)
 
-                # Snapshot every SB dataclass field so any mid-forward
-                # mutation (prepare_for_v2_verify swaps input_ids /
-                # out_cache_loc / mamba_track_* / forward_mode -> TARGET_VERIFY,
+                # For spec V2 only: snapshot every SB dataclass field so any
+                # mid-forward mutation (prepare_for_v2_verify swaps
+                # input_ids / out_cache_loc / mamba_track_* /
+                # forward_mode -> TARGET_VERIFY,
                 # prepare_for_extend_to_fill_draft_kvcache rebinds
                 # spec_info / input_ids / seq_lens / extend_lens /
-                # forward_mode -> DRAFT_EXTEND_V2; sampling_info copy etc.)
-                # is rolled back after forward dispatch. Pre-MWB-removal
-                # these mutations targeted ModelWorkerBatch's per-field
-                # snapshot and never leaked to SB; downstream code relies
-                # on SB staying in its pre-forward state (process_batch_result
-                # dispatches by forward_mode, prepare_for_decode/extend reads
-                # sampling_info.penalizer_orchestrator, etc.). Intentional
-                # post-forward updates (output_ids, spec_info, seq_lens for
-                # next iter under spec V2) are reapplied below.
-                sched_snapshot = {
-                    f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)
-                }
+                # forward_mode -> DRAFT_EXTEND_V2) is rolled back. Pre-MWB-
+                # removal these mutations targeted ModelWorkerBatch's
+                # per-field snapshot and never leaked to SB; downstream
+                # code relies on SB staying in its pre-forward state
+                # (process_batch_result dispatches by forward_mode etc).
+                # Intentional post-forward updates (output_ids, spec_info,
+                # seq_lens for next iter under spec V2) are reapplied below.
+                #
+                # Spec V1 (eagle_worker.py) manages SB state explicitly:
+                # each forward path mutates and restores forward_mode /
+                # seq_lens itself, AND intentionally leaves spec_info as
+                # the next-iter draft input for process_batch_result_decode.
+                # A blanket restore wipes those intentional updates, so
+                # only sampling_info gets restored (it's the one we
+                # ourselves swapped to a forward-only copy below).
+                # Non-spec generation has no mid-forward SB mutations.
+                snapshot_v2_full = batch.is_spec_v2
+                sched_snapshot = (
+                    {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+                    if snapshot_v2_full
+                    else None
+                )
+                sched_sampling_info = batch.sampling_info
 
                 # Forward consumes a copy of sampling_info with
                 # penalizer_orchestrator=None (penalty already accumulated
                 # into a buffer once via update_penalties); avoids
                 # double-accumulation across the multiple
                 # ForwardBatch.init_new calls inside spec V2.
-                if batch.sampling_info is not None:
-                    batch.sampling_info = batch.sampling_info.copy_for_forward()
+                if sched_sampling_info is not None:
+                    batch.sampling_info = sched_sampling_info.copy_for_forward()
 
                 bs = len(batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
@@ -3024,8 +3036,12 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
                 finally:
-                    for name, value in sched_snapshot.items():
-                        setattr(batch, name, value)
+                    if snapshot_v2_full:
+                        for name, value in sched_snapshot.items():
+                            setattr(batch, name, value)
+                    else:
+                        # V1 / non-spec: only undo our own sampling_info swap.
+                        batch.sampling_info = sched_sampling_info
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
