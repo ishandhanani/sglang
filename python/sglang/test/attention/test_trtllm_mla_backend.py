@@ -1415,7 +1415,7 @@ class TestTRTLLMMLA(CustomTestCase):
             unpad_draft_extend_output_kernel[grid](
                 raw_out_ptr=raw_out,
                 output_ptr=output,
-                accept_lens=num_accept_tokens_per_req,
+                num_accept_tokens_ptr=num_accept_tokens_per_req,
                 cumsum_ptr=cumulative_num_accept_tokens,
                 batch_size=batch_size,
                 token_per_batch=token_per_batch,

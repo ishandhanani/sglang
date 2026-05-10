@@ -576,7 +576,7 @@ def _causal_conv1d_update_kernel(
     conv_state_ptr,
     cache_seqlens_ptr,  # circular buffer
     conv_state_indices_ptr,
-    accept_lens,
+    num_accept_tokens_ptr,
     intermediate_conv_window_ptr,
     intermediate_state_indices_ptr,
     retrieve_next_token_ptr,
@@ -667,7 +667,7 @@ def _causal_conv1d_update_kernel(
         # - accept 1 tokens: [history2, ..., historyM, draft1]
         # - accept 2 tokens: [history3, ..., historyM, draft1, draft2]
         # - and so on.
-        conv_state_token_offset = tl.load(accept_lens + idx_seq) - 1
+        conv_state_token_offset = tl.load(num_accept_tokens_ptr + idx_seq) - 1
     else:
         conv_state_token_offset = 0
 
