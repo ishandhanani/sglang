@@ -463,6 +463,8 @@ class Indexer(MultiPlatformOp):
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
 
         assert len(q_fp8.shape) == 3
+        # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
+        # hidden states; q_offset is the real (unpadded) q length.
         q_offset = sum(metadata.get_nsa_extend_len_cpu())
 
         # DG-native q=[B,next_n,H,D] is faster than expanded q=[B*next_n,1,H,D]
