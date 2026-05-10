@@ -2977,23 +2977,32 @@ class Scheduler(
             if self.enable_overlap:
                 self.record_batch_in_overlap(batch)
 
-                # Save SB attributes that get mutated mid-forward by spec V2
-                # (prepare_for_v2_verify -> TARGET_VERIFY,
-                # prepare_for_extend_to_fill_draft_kvcache -> DRAFT_EXTEND_V2)
-                # and must be restored afterwards because:
-                # - sampling_info: subsequent prepare_for_decode/extend reads
-                #   penalizer_orchestrator (we hand forward a copy with
-                #   penalizer=None to avoid double-accumulation across the
-                #   multiple ForwardBatch.init_new calls inside spec V2).
-                # - forward_mode: process_batch_result dispatches by
-                #   forward_mode (is_decode / is_extend / ...). If the
-                #   spec-V2 mutations leak to SB, no branch matches and
-                #   req.output_ids never grows. Pre-MWB-removal these
-                #   mutations were on MWB, never visible to SB.
-                sched_sampling_info = batch.sampling_info
-                if sched_sampling_info is not None:
-                    batch.sampling_info = sched_sampling_info.copy_for_forward()
-                sched_forward_mode = batch.forward_mode
+                # Snapshot every SB dataclass field so any mid-forward
+                # mutation (prepare_for_v2_verify swaps input_ids /
+                # out_cache_loc / mamba_track_* / forward_mode -> TARGET_VERIFY,
+                # prepare_for_extend_to_fill_draft_kvcache rebinds
+                # spec_info / input_ids / seq_lens / extend_lens /
+                # forward_mode -> DRAFT_EXTEND_V2; sampling_info copy etc.)
+                # is rolled back after forward dispatch. Pre-MWB-removal
+                # these mutations targeted ModelWorkerBatch's per-field
+                # snapshot and never leaked to SB; downstream code relies
+                # on SB staying in its pre-forward state (process_batch_result
+                # dispatches by forward_mode, prepare_for_decode/extend reads
+                # sampling_info.penalizer_orchestrator, etc.). Intentional
+                # post-forward updates (output_ids, spec_info, seq_lens for
+                # next iter under spec V2) are reapplied below.
+                sched_snapshot = {
+                    f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)
+                }
+
+                # Forward consumes a copy of sampling_info with
+                # penalizer_orchestrator=None (penalty already accumulated
+                # into a buffer once via update_penalties); avoids
+                # double-accumulation across the multiple
+                # ForwardBatch.init_new calls inside spec V2.
+                if batch.sampling_info is not None:
+                    batch.sampling_info = batch.sampling_info.copy_for_forward()
+
                 bs = len(batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
 
@@ -3015,8 +3024,8 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
                 finally:
-                    batch.sampling_info = sched_sampling_info
-                    batch.forward_mode = sched_forward_mode
+                    for name, value in sched_snapshot.items():
+                        setattr(batch, name, value)
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
