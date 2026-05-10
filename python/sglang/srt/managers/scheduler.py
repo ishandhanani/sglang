@@ -2973,8 +2973,6 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
-                self.record_batch_in_overlap(batch)
-
                 # For spec V2 only: snapshot every SB dataclass field so any
                 # mid-forward mutation (prepare_for_v2_verify swaps
                 # input_ids / out_cache_loc / mamba_track_* /
@@ -3012,6 +3010,17 @@ class Scheduler(
                 # ForwardBatch.init_new calls inside spec V2.
                 if sched_sampling_info is not None:
                     batch.sampling_info = sched_sampling_info.copy_for_forward()
+
+                # Record AFTER the sampling_info swap so attr_snapshot keeps
+                # the forward-only copy alive across the 2-iter buffer window.
+                # The copy holds freshly allocated acc_additive_penalties /
+                # acc_scaling_penalties tensors; if only the original is kept
+                # alive (which `update_penalties` reallocates next iter), the
+                # caching allocator may reuse the underlying memory while the
+                # forward stream is still reading it -> NaN/inf in probability.
+                # Pre-MWB-removal MWB held the copy and lived in this same buf,
+                # giving it a 2-iter lifetime by construction.
+                self.record_batch_in_overlap(batch)
 
                 bs = len(batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
