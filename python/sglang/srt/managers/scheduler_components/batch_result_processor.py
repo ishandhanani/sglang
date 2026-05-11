@@ -2,7 +2,7 @@ from __future__ import annotations  # noqa: F401
 
 import logging  # noqa: F401
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union  # noqa: F401
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union  # noqa: F401
 
 import torch  # noqa: F401
 
@@ -544,31 +544,12 @@ class SchedulerBatchResultProcessor:
             result.can_run_cuda_graph,
         )
 
-        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
-            if batch.is_spec_v2:
-                next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
-            elif isinstance(next_token_ids, list):
-                pass  # MLX path: already a list[int], skip torch round-trip
-            else:
-                next_token_ids = next_token_ids.tolist()
-
-            if batch.return_logprob:
-                next_token_logprobs = logits_output.next_token_logprobs.tolist()
-                if logits_output.next_token_top_logprobs_val:
-                    logits_output.next_token_top_logprobs_val = [
-                        v.tolist() for v in logits_output.next_token_top_logprobs_val
-                    ]
-                    logits_output.next_token_top_logprobs_idx = [
-                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
-                    ]
-
-                if logits_output.next_token_token_ids_logprobs_val:
-                    logits_output.next_token_token_ids_logprobs_val = [
-                        v.tolist()
-                        for v in logits_output.next_token_token_ids_logprobs_val
-                    ]
-        # else: Spec V1 — output_ids, check_finished, grammar, and reasoning tokens
-        # are already handled in the verify phase (eagle_info.py / ngram_info.py).
+        next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
+            batch=batch,
+            result=result,
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+        )
 
         self.increment_generated_tokens(len(batch.reqs))
         if not batch.spec_algorithm.is_none():
@@ -653,6 +634,44 @@ class SchedulerBatchResultProcessor:
             running_batch=batch,
             num_accepted_drafts=result.num_accepted_drafts,
         )
+
+    def _normalize_decode_outputs(
+        self,
+        *,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        logits_output: LogitsProcessorOutput,
+        next_token_ids: Union[torch.Tensor, List[int]],
+    ) -> Tuple[Union[List[int], List[List[int]]], Optional[List[float]]]:
+        # In the spec-v1 path the verify phase already handled output_ids,
+        # check_finished, grammar, and reasoning tokens (eagle_info.py /
+        # ngram_info.py), so this normalizer no-ops and returns
+        # ``next_token_logprobs=None``.
+        next_token_logprobs = None
+        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
+            if batch.is_spec_v2:
+                next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+            elif isinstance(next_token_ids, list):
+                pass  # MLX path: already a list[int], skip torch round-trip
+            else:
+                next_token_ids = next_token_ids.tolist()
+
+            if batch.return_logprob:
+                next_token_logprobs = logits_output.next_token_logprobs.tolist()
+                if logits_output.next_token_top_logprobs_val:
+                    logits_output.next_token_top_logprobs_val = [
+                        v.tolist() for v in logits_output.next_token_top_logprobs_val
+                    ]
+                    logits_output.next_token_top_logprobs_idx = [
+                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                    ]
+
+                if logits_output.next_token_token_ids_logprobs_val:
+                    logits_output.next_token_token_ids_logprobs_val = [
+                        v.tolist()
+                        for v in logits_output.next_token_token_ids_logprobs_val
+                    ]
+        return next_token_ids, next_token_logprobs
 
     def _apply_decode_logprobs(
         self,
