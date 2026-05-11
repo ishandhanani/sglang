@@ -31,7 +31,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -753,7 +753,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ):
             # Target prefill
             model_worker_batch.capture_hidden_mode = spec_capture_hidden_mode(
-                self.server_args, CaptureHiddenMode.FULL
+                self.server_args, "target_prefill"
             )
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
@@ -761,7 +761,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = spec_capture_hidden_mode(
-                self.server_args, CaptureHiddenMode.LAST
+                self.server_args, "draft_prefill"
             )
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
@@ -782,7 +782,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     hidden_size=self.target_worker.model_config.spec_hidden_size,
                     dtype=self.target_worker.model_config.dtype,
                     topk=self.topk,
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                    capture_hidden_mode=spec_capture_hidden_mode(
+                        self.server_args, "draft_decode"
+                    ),
                 )
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group

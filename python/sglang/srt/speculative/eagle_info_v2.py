@@ -23,7 +23,6 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
@@ -34,6 +33,7 @@ from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
+    spec_capture_hidden_mode,
 )
 from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 
@@ -206,10 +206,8 @@ class EagleDraftInputV2Mixin:
         # Get a forward batch
         self.num_tokens_per_req = topk
         self.num_tokens_for_logprob_per_req = topk
-        batch.capture_hidden_mode = (
-            CaptureHiddenMode.LAST
-            if self.hidden_states is not None
-            else CaptureHiddenMode.NULL
+        batch.capture_hidden_mode = spec_capture_hidden_mode(
+            draft_model_runner.server_args, "draft_decode"
         )
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
@@ -235,10 +233,8 @@ class EagleDraftInputV2Mixin:
         batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
         batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
-        batch.capture_hidden_mode = (
-            CaptureHiddenMode.FULL
-            if self.hidden_states is not None
-            else CaptureHiddenMode.NULL
+        batch.capture_hidden_mode = spec_capture_hidden_mode(
+            draft_model_runner.server_args, "draft_extend_v2"
         )
         batch.forward_mode = (
             ForwardMode.IDLE

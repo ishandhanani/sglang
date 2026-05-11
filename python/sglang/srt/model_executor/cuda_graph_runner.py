@@ -1402,7 +1402,7 @@ class CudaGraphRunner:
                     topk=self.model_runner.server_args.speculative_eagle_topk,
                     draft_token_num=self.speculative_num_draft_tokens,
                     capture_hidden_mode=spec_capture_hidden_mode(
-                        self.model_runner.server_args, CaptureHiddenMode.FULL
+                        self.model_runner.server_args, "target_verify"
                     ),
                     seq_lens_sum=None,
                     seq_lens_cpu=None,

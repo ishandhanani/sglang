@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Literal, Optional
 
 import torch
 import triton
@@ -70,18 +70,38 @@ def spec_info_consumes_hidden_states(
     return server_args.speculative_algorithm != "STANDALONE"
 
 
+SpecCapturePhase = Literal[
+    "target_prefill",  # target's prefill forward (FULL: prefill draft KV cache)
+    "target_verify",  # target's verify forward (FULL: accept-index slicing)
+    "draft_prefill",  # draft's forward right after target prefill (LAST)
+    "draft_decode",  # draft's tree decode forward (LAST: chain seed)
+    "draft_extend_v1",  # v1 draft extend after decode (LAST)
+    "draft_extend_v2",  # v2 draft extend (FULL: v2 needs full hidden)
+]
+
+_FULL_CAPTURE_PHASES: frozenset = frozenset(
+    {"target_prefill", "target_verify", "draft_extend_v2"}
+)
+
+
 def spec_capture_hidden_mode(
     server_args: Optional[ServerArgs],
-    base_mode: "CaptureHiddenMode",
+    phase: SpecCapturePhase,
 ) -> "CaptureHiddenMode":
-    """Returns `base_mode` if the draft architecture consumes spec_info
-    hidden_states, else NULL. Drop-in for the inline ternary at every
-    `capture_hidden_mode = FULL/LAST` site in the spec pipeline."""
+    """Single source of truth for `capture_hidden_mode` at every spec phase.
+
+    Returns NULL when the draft architecture doesn't consume
+    `spec_info.hidden_states` (STANDALONE); else the phase's natural mode
+    (FULL for target_prefill / target_verify / draft_extend_v2; LAST for
+    draft_prefill / draft_decode / draft_extend_v1).
+    """
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
-    if spec_info_consumes_hidden_states(server_args):
-        return base_mode
-    return CaptureHiddenMode.NULL
+    if not spec_info_consumes_hidden_states(server_args):
+        return CaptureHiddenMode.NULL
+    if phase in _FULL_CAPTURE_PHASES:
+        return CaptureHiddenMode.FULL
+    return CaptureHiddenMode.LAST
 
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
