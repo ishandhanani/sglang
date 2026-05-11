@@ -68,21 +68,7 @@ class SchedulerRequestReceiver:
 
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
 
-        # Process MM requests under EPD-disaggregation mode
-        if (
-            self.ps.pp_rank == 0
-            and self.server_args.language_only
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
-        ):
-            recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
-            for req, error_msg, error_code in abort_reqs:
-                status_code = (
-                    HTTPStatus.BAD_REQUEST
-                    if error_code == 400
-                    else HTTPStatus.INTERNAL_SERVER_ERROR
-                )
-                prepare_abort(req, error_msg, status_code=status_code)
-                self.stream_output([req], req.return_logprob)
+        recv_reqs = self._apply_mm_receiver(recv_reqs)
 
         # Unwrap shared memory features AFTER all broadcasts complete,
         # so that ShmPointerMMData metadata (not full tensor data) is what
@@ -212,6 +198,24 @@ class SchedulerRequestReceiver:
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
+        return recv_reqs
+
+    def _apply_mm_receiver(self, recv_reqs: List) -> List:
+        # Process MM requests under EPD-disaggregation mode
+        if (
+            self.ps.pp_rank == 0
+            and self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
+            recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            for req, error_msg, error_code in abort_reqs:
+                status_code = (
+                    HTTPStatus.BAD_REQUEST
+                    if error_code == 400
+                    else HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                prepare_abort(req, error_msg, status_code=status_code)
+                self.stream_output([req], req.return_logprob)
         return recv_reqs
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
