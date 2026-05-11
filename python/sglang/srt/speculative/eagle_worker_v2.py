@@ -31,7 +31,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -54,13 +54,14 @@ from sglang.srt.speculative.eagle_info_v2 import (
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    draft_capture_hidden_mode,
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
     maybe_detect_nan,
     maybe_detect_oob,
     select_top_k_tokens,
-    spec_capture_hidden_mode,
+    target_capture_hidden_mode,
 )
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
@@ -741,16 +742,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or model_worker_batch.is_extend_in_batch
         ):
             # Target prefill
-            model_worker_batch.capture_hidden_mode = spec_capture_hidden_mode(
-                self.server_args, "target_prefill"
+            model_worker_batch.capture_hidden_mode = target_capture_hidden_mode(
+                self.server_args, ForwardMode.EXTEND
             )
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
 
             # Draft prefill
-            model_worker_batch.capture_hidden_mode = spec_capture_hidden_mode(
-                self.server_args, "draft_prefill"
+            model_worker_batch.capture_hidden_mode = draft_capture_hidden_mode(
+                self.server_args, ForwardMode.EXTEND
             )
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
@@ -771,8 +772,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     hidden_size=self.target_worker.model_config.spec_hidden_size,
                     dtype=self.target_worker.model_config.dtype,
                     topk=self.topk,
-                    capture_hidden_mode=spec_capture_hidden_mode(
-                        self.server_args, "draft_decode"
+                    capture_hidden_mode=draft_capture_hidden_mode(
+                        self.server_args, ForwardMode.DECODE
                     ),
                 )
             with self.draft_worker.draft_tp_context(

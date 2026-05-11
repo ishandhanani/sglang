@@ -1387,7 +1387,7 @@ class CudaGraphRunner:
                 raise RuntimeError("This should not happen.")
             else:
                 from sglang.srt.speculative.spec_utils import (
-                    spec_capture_hidden_mode,
+                    target_capture_hidden_mode,
                 )
 
                 spec_info = EagleVerifyInput(
@@ -1401,8 +1401,8 @@ class CudaGraphRunner:
                     spec_steps=self.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
                     draft_token_num=self.speculative_num_draft_tokens,
-                    capture_hidden_mode=spec_capture_hidden_mode(
-                        self.model_runner.server_args, "target_verify"
+                    capture_hidden_mode=target_capture_hidden_mode(
+                        self.model_runner.server_args, ForwardMode.TARGET_VERIFY
                     ),
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
