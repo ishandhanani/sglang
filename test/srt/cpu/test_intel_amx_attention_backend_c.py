@@ -51,7 +51,11 @@ class TestIntelAMXAttnBackendQuant(CustomTestCase):
         if omp_bind:
             print(f"[DEBUG] SGLANG_CPU_OMP_THREADS_BIND={omp_bind}")
             os.environ["SGLANG_CPU_OMP_THREADS_BIND"] = omp_bind
-        return DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE
+        try:
+            return DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE
+        finally:
+            os.environ.pop("SGLANG_CPU_OMP_THREADS_BIND", None)
+        
 
 
 if __name__ == "__main__":
