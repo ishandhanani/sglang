@@ -447,9 +447,9 @@ class SchedulerOutputProcessorMixin:
             req.kv_committed_len += num_accept_tokens[i] - 1
             req.spec_verify_ct += 1
 
-            correct_draft_tokens = result.num_correct_drafts_per_req_cpu[i]
-            req.spec_num_correct_drafts += correct_draft_tokens
-            req.update_spec_correct_drafts_histogram(correct_draft_tokens)
+            num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
+            req.spec_num_correct_drafts += num_correct_drafts
+            req.update_spec_correct_drafts_histogram(num_correct_drafts)
 
         return predict_tokens
 

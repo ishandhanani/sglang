@@ -609,7 +609,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         ts = ts or time.perf_counter()
         self.spec_verify_start_time = ts
 
-    def set_spec_verify_end_time(self, ts=None, correct_drafts: int = 0):
+    def set_spec_verify_end_time(self, ts=None, num_correct_drafts: int = 0):
         ts = ts or time.perf_counter()
 
         if self.trace_ctx.tracing_enable:
@@ -618,7 +618,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 stage,
                 self.spec_verify_start_time,
                 ts,
-                {"correct_drafts": correct_drafts},
+                {"num_correct_drafts": num_correct_drafts},
             )
 
     def set_spec_draft_extend_start_time(self, ts=None):

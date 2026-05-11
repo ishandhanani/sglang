@@ -961,18 +961,17 @@ class Req(ReqDllmMixin):
         self.kv_overallocated_freed = True
         return self._cache_commit_len(), self.kv_allocated_len
 
-    def update_spec_correct_drafts_histogram(self, correct_draft_tokens: int):
+    def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
         """Update the speculative decoding acceptance histogram.
 
         Args:
-            correct_draft_tokens: Number of draft tokens accepted in this step.
+            num_correct_drafts: Number of draft tokens accepted in this step.
         """
-        if len(self.spec_correct_drafts_histogram) <= correct_draft_tokens:
+        if len(self.spec_correct_drafts_histogram) <= num_correct_drafts:
             self.spec_correct_drafts_histogram.extend(
-                [0]
-                * (correct_draft_tokens - len(self.spec_correct_drafts_histogram) + 1)
+                [0] * (num_correct_drafts - len(self.spec_correct_drafts_histogram) + 1)
             )
-        self.spec_correct_drafts_histogram[correct_draft_tokens] += 1
+        self.spec_correct_drafts_histogram[num_correct_drafts] += 1
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:

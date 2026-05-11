@@ -326,7 +326,7 @@ class NGRAMWorker:
                         if verify_input.num_correct_drafts is not None
                         else 0
                     )
-                    req.time_stats.set_spec_verify_end_time(correct_drafts=correct)
+                    req.time_stats.set_spec_verify_end_time(num_correct_drafts=correct)
 
             # Store num_accept_tokens for per-request metrics
             num_accept_tokens = verify_input.num_accept_tokens
