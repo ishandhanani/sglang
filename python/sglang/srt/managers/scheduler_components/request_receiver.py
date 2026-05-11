@@ -61,41 +61,7 @@ class SchedulerRequestReceiver:
             if not self.recv_skipper.handle(self.get_last_forward_mode()):
                 return []
 
-        if self.ps.pp_rank == 0:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                recv_reqs = []
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
-            else:
-                recv_reqs = None
-        else:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
-                recv_reqs = point_to_point_pyobj(
-                    [],
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                )
-            else:
-                recv_reqs = None
+        recv_reqs = self._pull_raw_reqs()
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
@@ -204,6 +170,44 @@ class SchedulerRequestReceiver:
             for req in recv_reqs:
                 unwrap_shm_features(req)
 
+        return recv_reqs
+
+    def _pull_raw_reqs(self) -> Optional[List]:
+        if self.ps.pp_rank == 0:
+            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+                recv_reqs = []
+
+                while True:
+                    try:
+                        if self.recv_limit_reached(len(recv_reqs)):
+                            break
+                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    except zmq.ZMQError:
+                        break
+                    recv_reqs.append(recv_req)
+
+                while True:
+                    try:
+                        if self.recv_limit_reached(len(recv_reqs)):
+                            break
+                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                    except zmq.ZMQError:
+                        break
+                    recv_reqs.append(recv_rpc)
+            else:
+                recv_reqs = None
+        else:
+            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+                dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+                recv_reqs = point_to_point_pyobj(
+                    [],
+                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    self.world_group.cpu_group,
+                    (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
+                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                )
+            else:
+                recv_reqs = None
         return recv_reqs
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
