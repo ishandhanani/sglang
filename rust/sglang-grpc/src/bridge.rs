@@ -854,13 +854,49 @@ impl JsonChunkCallback {
 
 fn extract_meta_info(chunk: &Bound<'_, PyDict>) -> HashMap<String, String> {
     let mut meta = HashMap::new();
-    if let Ok(Some(meta_obj)) = chunk.get_item("meta_info") {
-        if let Ok(meta_dict) = meta_obj.downcast::<PyDict>() {
-            for (k, v) in meta_dict.iter() {
-                if let (Ok(key), Ok(val)) = (k.extract::<String>(), v.str()) {
-                    meta.insert(key, val.to_string());
+    let Ok(Some(meta_obj)) = chunk.get_item("meta_info") else {
+        return meta;
+    };
+    let Ok(meta_dict) = meta_obj.downcast::<PyDict>() else {
+        return meta;
+    };
+    let py = meta_dict.py();
+    // Resolve `json.dumps` once for serializing nested dict/list values.
+    // Falls back to `str()` (Python repr-style) only if json isn't importable.
+    let json_dumps = py
+        .import("json")
+        .ok()
+        .and_then(|m| m.getattr("dumps").ok());
+    for (k, v) in meta_dict.iter() {
+        let Ok(key) = k.extract::<String>() else { continue };
+        // `finish_reason` is dict-shaped internally: `{'type': 'length', ...}`.
+        // Downstream consumers (Dynamo bridge, OpenAI clients) want the
+        // canonical string ("stop"/"length"/"abort"). Extract the `type` so
+        // the wire carries a plain OpenAI value, not a Python repr.
+        if key == "finish_reason" {
+            if let Ok(d) = v.downcast::<PyDict>() {
+                if let Ok(Some(t)) = d.get_item("type") {
+                    if let Ok(s) = t.extract::<String>() {
+                        meta.insert(key, s);
+                        continue;
+                    }
                 }
             }
+            if let Ok(s) = v.str() {
+                meta.insert(key, s.to_string());
+            }
+            continue;
+        }
+        // Other values: prefer JSON for non-scalars so consumers can parse
+        // them deterministically. JSON-encoding scalars round-trips cleanly
+        // (quoted strings, unquoted numbers/bools/null).
+        let serialized = json_dumps
+            .as_ref()
+            .and_then(|dumps| dumps.call1((v.clone(),)).ok())
+            .and_then(|s| s.extract::<String>().ok())
+            .or_else(|| v.str().ok().map(|s| s.to_string()));
+        if let Some(val) = serialized {
+            meta.insert(key, val);
         }
     }
     meta
