@@ -56,7 +56,12 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
         server_args = get_global_server_args()
 
-    # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
+    # STANDALONE draft is a vanilla LLM that ignores spec_info.hidden_states;
+    # multi-layer eagle propagates hidden states inside the draft model rather
+    # than via the FutureMap-backed spec_info field.
+    if server_args.speculative_algorithm == "STANDALONE":
+        return False
+    # TODO(lsyin): also skip when step = 1
     return not server_args.enable_multi_layer_eagle
 
 
@@ -494,7 +499,7 @@ def _select_top_k_tokens_later(
     i: int,
     topk_p: torch.Tensor,
     topk_index: torch.Tensor,
-    hidden_states: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
     scores: torch.Tensor,
     topk: int,
 ):
@@ -510,7 +515,7 @@ def _select_top_k_tokens_later(
     topk_index = topk_index.view(-1, topk_sq)
     input_ids = torch.gather(topk_index, 1, topk_cs_index).flatten()
 
-    if hidden_states.shape[0] > 0:
+    if hidden_states is not None and hidden_states.shape[0] > 0:
         flat_cs = topk_cs_index.flatten()
         batch_offsets = torch.arange(
             0, hidden_states.shape[0], step=topk, device=flat_cs.device
@@ -530,7 +535,7 @@ def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
     topk_index: torch.Tensor,
-    hidden_states: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
     scores: torch.Tensor,
     topk: int,
 ):

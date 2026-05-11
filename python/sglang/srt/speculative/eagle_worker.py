@@ -580,7 +580,11 @@ class EAGLEWorker(TpModelWorker):
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        model_worker_batch.capture_hidden_mode = (
+            CaptureHiddenMode.FULL
+            if self.spec_info_consumes_hidden_states
+            else CaptureHiddenMode.NULL
+        )
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
         logits_output, next_token_ids = (
             batch_result.logits_output,
@@ -751,14 +755,18 @@ class EAGLEWorker(TpModelWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
 
-        spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        spec_info.capture_hidden_mode = (
+            CaptureHiddenMode.LAST
+            if self.spec_info_consumes_hidden_states
+            else CaptureHiddenMode.NULL
+        )
         spec_info.num_tokens_per_req = self.topk
         spec_info.num_tokens_for_logprob_per_req = self.topk
         batch.return_hidden_states = False
 
         # Get forward batch
         model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
+        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -819,7 +827,11 @@ class EAGLEWorker(TpModelWorker):
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=(
+                CaptureHiddenMode.FULL
+                if self.spec_info_consumes_hidden_states
+                else CaptureHiddenMode.NULL
+            ),
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
@@ -1105,7 +1117,11 @@ class EAGLEWorker(TpModelWorker):
         )
         batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
-        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        batch.spec_info.capture_hidden_mode = (
+            CaptureHiddenMode.LAST
+            if self.spec_info_consumes_hidden_states
+            else CaptureHiddenMode.NULL
+        )
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=seq_lens_cpu
         )
