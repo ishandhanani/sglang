@@ -618,7 +618,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 stage,
                 self.spec_verify_start_time,
                 ts,
-                {"num_correct_drafts": num_correct_drafts},
+                {
+                    "num_correct_drafts": num_correct_drafts,
+                    # FIXME: backward-compat alias for `num_correct_drafts`, remove in next release.
+                    "accepted_tokens": num_correct_drafts,
+                },
             )
 
     def set_spec_draft_extend_start_time(self, ts=None):
