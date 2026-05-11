@@ -182,29 +182,11 @@ class SchedulerBatchResultProcessor:
                 result.extend_logprob_start_len_per_req,
             )
 
-            # Move next_token_ids and logprobs to cpu
-            next_token_ids = next_token_ids.tolist()
-            if batch.return_logprob:
-                if logits_output.next_token_logprobs is not None:
-                    logits_output.next_token_logprobs = (
-                        logits_output.next_token_logprobs.tolist()
-                    )
-                if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = tuple(
-                        logits_output.input_token_logprobs.tolist()
-                    )
-                if logits_output.next_token_top_logprobs_val:
-                    logits_output.next_token_top_logprobs_val = [
-                        v.tolist() for v in logits_output.next_token_top_logprobs_val
-                    ]
-                    logits_output.next_token_top_logprobs_idx = [
-                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
-                    ]
-                if logits_output.next_token_token_ids_logprobs_val:
-                    logits_output.next_token_token_ids_logprobs_val = [
-                        v.tolist()
-                        for v in logits_output.next_token_token_ids_logprobs_val
-                    ]
+            next_token_ids = self._move_logits_to_cpu(
+                batch=batch,
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+            )
 
             hidden_state_offset = 0
 
@@ -349,6 +331,37 @@ class SchedulerBatchResultProcessor:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _move_logits_to_cpu(
+        self,
+        *,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+        next_token_ids: torch.Tensor,
+    ) -> List[int]:
+        # Move next_token_ids and logprobs to cpu
+        next_token_ids = next_token_ids.tolist()
+        if batch.return_logprob:
+            if logits_output.next_token_logprobs is not None:
+                logits_output.next_token_logprobs = (
+                    logits_output.next_token_logprobs.tolist()
+                )
+            if logits_output.input_token_logprobs is not None:
+                logits_output.input_token_logprobs = tuple(
+                    logits_output.input_token_logprobs.tolist()
+                )
+            if logits_output.next_token_top_logprobs_val:
+                logits_output.next_token_top_logprobs_val = [
+                    v.tolist() for v in logits_output.next_token_top_logprobs_val
+                ]
+                logits_output.next_token_top_logprobs_idx = [
+                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                ]
+            if logits_output.next_token_token_ids_logprobs_val:
+                logits_output.next_token_token_ids_logprobs_val = [
+                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
+                ]
+        return next_token_ids
 
     def _apply_prefill_logprobs(
         self,
