@@ -448,7 +448,7 @@ class SchedulerOutputProcessorMixin:
             req.spec_verify_ct += 1
 
             correct_draft_tokens = result.num_correct_drafts_per_req_cpu[i]
-            req.spec_correct_drafts += correct_draft_tokens
+            req.spec_num_correct_drafts += correct_draft_tokens
             req.update_spec_correct_drafts_histogram(correct_draft_tokens)
 
         return predict_tokens
@@ -1046,7 +1046,7 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
-        spec_correct_drafts = []
+        spec_num_correct_drafts = []
         spec_correct_drafts_histogram = []
         retraction_counts = []
         output_hidden_states = None
@@ -1156,7 +1156,7 @@ class SchedulerOutputProcessorMixin:
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
-                    spec_correct_drafts.append(req.spec_correct_drafts)
+                    spec_num_correct_drafts.append(req.spec_num_correct_drafts)
                     spec_correct_drafts_histogram.append(
                         req.spec_correct_drafts_histogram
                     )
@@ -1267,7 +1267,7 @@ class SchedulerOutputProcessorMixin:
                     rids=rids,
                     http_worker_ipcs=http_worker_ipcs,
                     spec_verify_ct=spec_verify_ct,
-                    spec_correct_drafts=spec_correct_drafts,
+                    spec_num_correct_drafts=spec_num_correct_drafts,
                     spec_correct_drafts_histogram=spec_correct_drafts_histogram,
                     time_stats=time_stats,
                     finished_reasons=finished_reasons,

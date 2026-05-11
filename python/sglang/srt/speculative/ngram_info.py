@@ -191,7 +191,7 @@ class NgramVerifyInput(SpecInput):
                             raise e
             req.spec_verify_ct += 1
             correct_draft_tokens = sum(1 for idx in accept_index_row if idx != -1) - 1
-            req.spec_correct_drafts += correct_draft_tokens
+            req.spec_num_correct_drafts += correct_draft_tokens
             req.update_spec_correct_drafts_histogram(correct_draft_tokens)
 
         if has_finished:

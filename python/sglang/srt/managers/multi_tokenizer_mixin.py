@@ -129,8 +129,8 @@ def _handle_output_by_index(output, i):
         new_output = BatchTokenIDOutput(
             rids=[output.rids[i]],
             spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_correct_drafts=_extract_field_by_index(
-                output, "spec_correct_drafts", i
+            spec_num_correct_drafts=_extract_field_by_index(
+                output, "spec_num_correct_drafts", i
             ),
             spec_correct_drafts_histogram=_extract_field_by_index(
                 output, "spec_correct_drafts_histogram", i
@@ -217,8 +217,8 @@ def _handle_output_by_index(output, i):
         new_output = BatchStrOutput(
             rids=[output.rids[i]],
             spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_correct_drafts=_extract_field_by_index(
-                output, "spec_correct_drafts", i
+            spec_num_correct_drafts=_extract_field_by_index(
+                output, "spec_num_correct_drafts", i
             ),
             spec_correct_drafts_histogram=_extract_field_by_index(
                 output, "spec_correct_drafts_histogram", i

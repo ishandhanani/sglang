@@ -426,7 +426,7 @@ class DFlashVerifyInput(SpecInput):
             new_bonus_tokens_list.append(new_bonus_token)
             num_correct_drafts_per_req_cpu.append(max(0, appended - 1))
             req.spec_verify_ct += 1
-            req.spec_correct_drafts += num_correct_drafts_per_req_cpu[-1]
+            req.spec_num_correct_drafts += num_correct_drafts_per_req_cpu[-1]
 
         num_committed_tokens = torch.tensor(
             num_committed_tokens_cpu, dtype=torch.int32, device=device
