@@ -750,13 +750,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or model_worker_batch.is_extend_in_batch
         ):
             # Target prefill
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            model_worker_batch.capture_hidden_mode = (
+                CaptureHiddenMode.FULL
+                if self.spec_info_consumes_hidden_states
+                else CaptureHiddenMode.NULL
+            )
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
 
             # Draft prefill
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+            model_worker_batch.capture_hidden_mode = (
+                CaptureHiddenMode.LAST
+                if self.spec_info_consumes_hidden_states
+                else CaptureHiddenMode.NULL
+            )
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
