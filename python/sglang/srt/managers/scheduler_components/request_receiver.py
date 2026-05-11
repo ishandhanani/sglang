@@ -70,33 +70,7 @@ class SchedulerRequestReceiver:
 
         recv_reqs = self._apply_mm_receiver(recv_reqs)
 
-        # Unwrap shared memory features AFTER all broadcasts complete,
-        # so that ShmPointerMMData metadata (not full tensor data) is what
-        # gets serialized during broadcast_pyobj.
-        if recv_reqs:
-            # Barrier for the non-DP-attention path only: there is a single
-            # broadcast_pyobj on tp_cpu_group where the source rank returns
-            # the original objects immediately while other ranks are still in
-            # pickle.loads (-> __setstate__ -> shm_open).  Without a barrier
-            # the source can call materialize() / shm_unlink before others
-            # open the segment.  recv_reqs is consistent across all ranks
-            # here (same broadcast), so the guard is deadlock-free.
-            #
-            # Under DP-attention no barrier is needed: the control_reqs
-            # broadcast on tp_cpu_group (step 3) is a collective that forces
-            # every rank to complete the earlier attn_tp / attn_cp work_reqs
-            # deserializations (steps 1-2, which call shm_open) before any
-            # rank returns from step 3.  POSIX guarantees shm_unlink only
-            # removes the name; already-open handles stay valid.
-            if (
-                not self.server_args.enable_dp_attention
-                and self.ps.tp_size > 1
-                and self.model_config.is_multimodal
-                and has_shm_features(recv_reqs)
-            ):
-                barrier(group=self.tp_cpu_group)
-            for req in recv_reqs:
-                unwrap_shm_features(req)
+        self._finalize_shm_features(recv_reqs)
 
         return recv_reqs
 
@@ -217,6 +191,35 @@ class SchedulerRequestReceiver:
                 prepare_abort(req, error_msg, status_code=status_code)
                 self.stream_output([req], req.return_logprob)
         return recv_reqs
+
+    def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:
+        # Unwrap shared memory features AFTER all broadcasts complete,
+        # so that ShmPointerMMData metadata (not full tensor data) is what
+        # gets serialized during broadcast_pyobj.
+        if recv_reqs:
+            # Barrier for the non-DP-attention path only: there is a single
+            # broadcast_pyobj on tp_cpu_group where the source rank returns
+            # the original objects immediately while other ranks are still in
+            # pickle.loads (-> __setstate__ -> shm_open).  Without a barrier
+            # the source can call materialize() / shm_unlink before others
+            # open the segment.  recv_reqs is consistent across all ranks
+            # here (same broadcast), so the guard is deadlock-free.
+            #
+            # Under DP-attention no barrier is needed: the control_reqs
+            # broadcast on tp_cpu_group (step 3) is a collective that forces
+            # every rank to complete the earlier attn_tp / attn_cp work_reqs
+            # deserializations (steps 1-2, which call shm_open) before any
+            # rank returns from step 3.  POSIX guarantees shm_unlink only
+            # removes the name; already-open handles stay valid.
+            if (
+                not self.server_args.enable_dp_attention
+                and self.ps.tp_size > 1
+                and self.model_config.is_multimodal
+                and has_shm_features(recv_reqs)
+            ):
+                barrier(group=self.tp_cpu_group)
+            for req in recv_reqs:
+                unwrap_shm_features(req)
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
         work_reqs = [
