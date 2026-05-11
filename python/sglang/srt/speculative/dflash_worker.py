@@ -1068,7 +1068,7 @@ class DFlashWorker:
         *,
         batch: ScheduleBatch,
         seq_lens_pre_verify: torch.Tensor,
-        num_committed_tokens: torch.Tensor,
+        commit_lens: torch.Tensor,
     ) -> None:
         """Commit Mamba intermediate states for accepted verify steps.
 
@@ -1080,7 +1080,7 @@ class DFlashWorker:
         if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             return
 
-        num_correct_drafts = num_committed_tokens.to(torch.int64) - 1
+        num_correct_drafts = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
@@ -1094,7 +1094,7 @@ class DFlashWorker:
             )
             to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
             can_track_mask = to_track_mask & (
-                to_track_ith < num_committed_tokens.to(to_track_ith.dtype)
+                to_track_ith < commit_lens.to(to_track_ith.dtype)
             )
             mamba_steps_to_track = torch.where(
                 can_track_mask,
@@ -1214,7 +1214,7 @@ class DFlashWorker:
 
         (
             new_bonus_tokens,
-            num_committed_tokens,
+            commit_lens,
             next_target_hidden,
             num_correct_drafts_per_req_cpu,
         ) = verify_input.verify(
@@ -1227,14 +1227,14 @@ class DFlashWorker:
             self._update_target_mamba_state_after_verify(
                 batch=batch,
                 seq_lens_pre_verify=seq_lens_pre_verify,
-                num_committed_tokens=num_committed_tokens,
+                commit_lens=commit_lens,
             )
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
         draft_input.bonus_tokens = new_bonus_tokens
         draft_input.target_hidden = next_target_hidden
-        draft_input.ctx_lens = num_committed_tokens
+        draft_input.ctx_lens = commit_lens
         self._append_target_hidden_to_draft_kv(batch, draft_input)
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE

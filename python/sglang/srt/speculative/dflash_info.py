@@ -27,7 +27,7 @@ from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 def _compute_paged_keep_slots(
     *,
     prefix_lens: torch.Tensor,
-    num_committed_tokens: torch.Tensor,
+    commit_lens: torch.Tensor,
     draft_token_num: int,
     page_size: int,
 ) -> torch.Tensor:
@@ -42,7 +42,7 @@ def _compute_paged_keep_slots(
 
     seq_dtype = prefix_lens.dtype
     extended_lens = prefix_lens + int(draft_token_num)
-    new_lens = prefix_lens + num_committed_tokens.to(seq_dtype)
+    new_lens = prefix_lens + commit_lens.to(seq_dtype)
     aligned_new_lens = ((new_lens + page_size - 1) // page_size) * page_size
     keep_lens = torch.minimum(aligned_new_lens, extended_lens)
     keep_slots = (keep_lens - prefix_lens).to(torch.int64)
@@ -321,8 +321,8 @@ class DFlashVerifyInput(SpecInput):
 
         Returns:
             new_bonus_tokens: int64 tensor [bs] (the new current token per request)
-            num_committed_tokens: int32 tensor [bs] (how many verify-input tokens are committed)
-            next_target_hidden: tensor [sum(num_committed_tokens), feature_dim]
+            commit_lens: int32 tensor [bs] (how many verify-input tokens are committed)
+            next_target_hidden: tensor [sum(commit_lens), feature_dim]
             num_correct_drafts_per_req_cpu: list[int] (accepted draft tokens per request)
         """
         if batch.forward_mode.is_idle():
@@ -392,7 +392,7 @@ class DFlashVerifyInput(SpecInput):
 
         max_acc = self.draft_token_num - 1
         num_correct_drafts_per_req_cpu: List[int] = []
-        num_committed_tokens_cpu: List[int] = []
+        commit_lens_cpu: List[int] = []
         new_bonus_tokens_list: List[int] = []
 
         for i, req in enumerate(batch.reqs):
@@ -422,15 +422,13 @@ class DFlashVerifyInput(SpecInput):
                     "DFLASH verify cannot determine current token: both output_ids and origin_input_ids are empty."
                 )
 
-            num_committed_tokens_cpu.append(appended)
+            commit_lens_cpu.append(appended)
             new_bonus_tokens_list.append(new_bonus_token)
             num_correct_drafts_per_req_cpu.append(max(0, appended - 1))
             req.spec_verify_ct += 1
             req.spec_num_correct_drafts += num_correct_drafts_per_req_cpu[-1]
 
-        num_committed_tokens = torch.tensor(
-            num_committed_tokens_cpu, dtype=torch.int32, device=device
-        )
+        commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
         new_bonus_tokens = torch.tensor(
             new_bonus_tokens_list, dtype=torch.int64, device=device
         )
@@ -440,7 +438,7 @@ class DFlashVerifyInput(SpecInput):
             out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
             keep_mask = (
                 torch.arange(self.draft_token_num, device=device)[None, :]
-                < num_committed_tokens[:, None]
+                < commit_lens[:, None]
             )
             batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
             batch.out_cache_loc = out_cache_loc[keep_mask]
@@ -449,23 +447,23 @@ class DFlashVerifyInput(SpecInput):
             row_offsets = torch.arange(self.draft_token_num, device=device)[None, :]
             keep_slots = _compute_paged_keep_slots(
                 prefix_lens=batch.seq_lens,
-                num_committed_tokens=num_committed_tokens,
+                commit_lens=commit_lens,
                 draft_token_num=self.draft_token_num,
                 page_size=page_size,
             )
             free_mask = row_offsets >= keep_slots[:, None]
             batch.token_to_kv_pool_allocator.free(out_cache_loc[free_mask])
 
-            keep_mask = row_offsets < num_committed_tokens[:, None]
+            keep_mask = row_offsets < commit_lens[:, None]
             batch.out_cache_loc = out_cache_loc[keep_mask]
 
         # Update req-level KV cache accounting.
-        for req, commit_len in zip(batch.reqs, num_committed_tokens_cpu, strict=True):
+        for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
             req.kv_committed_len += commit_len
             req.kv_allocated_len = req.kv_committed_len
 
         # Update req_to_token pool mapping for newly committed tokens.
-        end_offset = batch.seq_lens + num_committed_tokens.to(batch.seq_lens.dtype)
+        end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
@@ -476,12 +474,12 @@ class DFlashVerifyInput(SpecInput):
         )
 
         # Update batch seq lens.
-        batch.seq_lens.add_(num_committed_tokens.to(batch.seq_lens.dtype))
+        batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
         batch.seq_lens_cpu.add_(
-            torch.tensor(num_committed_tokens_cpu, dtype=batch.seq_lens_cpu.dtype)
+            torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
         )
         # Keep seq_lens_sum in sync; flashinfer indices updaters rely on this for buffer sizing.
-        batch.seq_lens_sum += sum(num_committed_tokens_cpu)
+        batch.seq_lens_sum += sum(commit_lens_cpu)
 
         # Build next-step context features from the committed verify-input tokens.
         hidden = logits_output.hidden_states
@@ -491,7 +489,7 @@ class DFlashVerifyInput(SpecInput):
             )
         hidden = hidden.view(bs, self.draft_token_num, -1)
         segments: List[torch.Tensor] = []
-        for i, ln in enumerate(num_committed_tokens_cpu):
+        for i, ln in enumerate(commit_lens_cpu):
             if ln > 0:
                 segments.append(hidden[i, :ln, :])
         next_target_hidden = torch.cat(segments, dim=0) if segments else hidden[:0]
@@ -501,7 +499,7 @@ class DFlashVerifyInput(SpecInput):
 
         return (
             new_bonus_tokens,
-            num_committed_tokens,
+            commit_lens,
             next_target_hidden,
             num_correct_drafts_per_req_cpu,
         )
