@@ -265,17 +265,9 @@ class SchedulerBatchResultProcessor:
                         )
 
                     if req.grammar is not None:
-                        # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                        try:
-                            req.grammar.accept_token(next_token_id)
-                        except ValueError as e:
-                            # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                            # This can happen if the grammar is not set correctly or the token is invalid.
-                            logger.error(
-                                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                            )
-                            self.abort_request(AbortReq(rid=req.rid))
-                        req.grammar.finished = req.finished()
+                        self._apply_prefill_grammar(
+                            req=req, next_token_id=next_token_id
+                        )
 
                 else:
                     # being chunked reqs' prefill is not finished
@@ -397,6 +389,19 @@ class SchedulerBatchResultProcessor:
             )
         logprob_pt += num_input_logprobs
         return logprob_pt
+
+    def _apply_prefill_grammar(self, *, req: Req, next_token_id: int) -> None:
+        # FIXME: this try-except block is for handling unexpected xgrammar issue.
+        try:
+            req.grammar.accept_token(next_token_id)
+        except ValueError as e:
+            # Grammar accept_token can raise ValueError if the token is not in the grammar.
+            # This can happen if the grammar is not set correctly or the token is invalid.
+            logger.error(
+                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+            )
+            self.abort_request(AbortReq(rid=req.rid))
+        req.grammar.finished = req.finished()
 
     def _apply_chunked_prefill_logprobs(
         self,
