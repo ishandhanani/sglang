@@ -67,7 +67,7 @@ Each form has its own marker. **Never mix** (no `num_X_ct`, no `num_accept_rate`
 
 Internal code uses `num_X` for counts (Rule 4), not `length` / `lens`.
 
-The only allowed `_length` name is `accept_length` (paper-aligned external metric, see Rule 3 exception). Outside kernel signatures, never write `accept_lens` / `accepted_length` / `commit_lens`.
+The only allowed `_length` name is `accept_length` (paper-aligned external metric, see Rule 3 exception). Outside kernel signatures, never write `accept_lens` / `accepted_length`.
 
 ### Exception: Triton kernel signatures
 
@@ -115,3 +115,4 @@ These rules apply to **spec-decoding-specific** identifiers. Pre-existing or fra
 - **Request-level state**: `req.input_ids`, `req.output_ids`, `req.origin_input_ids`, `next_token_ids` (`model_runner.sample` output)
 - **Frozen C++ kwargs**: `accept_token_num` (sgl-kernel)
 - **Non-token IDs**: `req_id`, `gpu_id`, `layer_id`, `program_id`
+- **DFlash domain terms**: `commit_lens` / `commit_lens_cpu` (dflash-specific "committed verify-input tokens" count; domain name is clearer than `num_committed_tokens`)
