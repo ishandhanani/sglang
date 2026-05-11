@@ -1183,7 +1183,11 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
     """Multi-step draft backend for TRT-LLM MLA used by EAGLE."""
 
     def __init__(
-        self, model_runner: "ModelRunner", topk: int, speculative_num_steps: int
+        self,
+        model_runner: "ModelRunner",
+        topk: int,
+        speculative_num_steps: int,
+        backend: str = "trtllm-gen",
     ):
         super().__init__(model_runner, topk, speculative_num_steps)
 
@@ -1193,4 +1197,5 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
                 skip_prefill=True,
                 kv_indptr_buf=self.kv_indptr[i],
                 q_indptr_decode_buf=self.q_indptr_decode,
+                backend=backend,
             )

@@ -2683,6 +2683,7 @@ class ServerArgs:
         if (
             self.attention_backend == "cutedsl_mla"
             or self.decode_attention_backend == "cutedsl_mla"
+            or self.prefill_attention_backend == "cutedsl_mla"
         ):
             assert (
                 self.prefill_attention_backend != "cutedsl_mla"
@@ -2696,6 +2697,15 @@ class ServerArgs:
                     f"CuteDSL MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
                 )
                 self.page_size = 64
+            if self.kv_cache_dtype not in [
+                "fp8_e4m3",
+                "bf16",
+                "bfloat16",
+                "auto",
+            ]:
+                raise ValueError(
+                    "CuteDSL MLA backend only supports kv-cache-dtype of fp8_e4m3, bf16, or auto."
+                )
             if self.prefill_attention_backend is None:
                 self.prefill_attention_backend = "trtllm_mla"
 
