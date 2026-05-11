@@ -287,27 +287,14 @@ class SchedulerBatchResultProcessor:
 
                     # Incrementally update input logprobs.
                     if batch.return_logprob:
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                        extend_input_len = extend_input_len_per_req[i]
-                        if extend_logprob_start_len < extend_input_len:
-                            # Update input logprobs.
-                            num_input_logprobs = (
-                                self.logprob_computer.calculate_num_input_logprobs(
-                                    req,
-                                    extend_input_len,
-                                    extend_logprob_start_len,
-                                )
-                            )
-                            if req.return_logprob:
-                                self.logprob_computer.add_input_logprob_return_values(
-                                    i,
-                                    req,
-                                    logits_output,
-                                    logprob_pt,
-                                    num_input_logprobs,
-                                    last_prefill_chunk=False,
-                                )
-                            logprob_pt += num_input_logprobs
+                        logprob_pt = self._apply_chunked_prefill_logprobs(
+                            req=req,
+                            i=i,
+                            logits_output=logits_output,
+                            extend_input_len_per_req=extend_input_len_per_req,
+                            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+                            logprob_pt=logprob_pt,
+                        )
 
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
@@ -409,6 +396,37 @@ class SchedulerBatchResultProcessor:
                 logits_output,
             )
         logprob_pt += num_input_logprobs
+        return logprob_pt
+
+    def _apply_chunked_prefill_logprobs(
+        self,
+        *,
+        req: Req,
+        i: int,
+        logits_output: LogitsProcessorOutput,
+        extend_input_len_per_req: Optional[List[int]],
+        extend_logprob_start_len_per_req: Optional[List[int]],
+        logprob_pt: int,
+    ) -> int:
+        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+        extend_input_len = extend_input_len_per_req[i]
+        if extend_logprob_start_len < extend_input_len:
+            # Update input logprobs.
+            num_input_logprobs = self.logprob_computer.calculate_num_input_logprobs(
+                req,
+                extend_input_len,
+                extend_logprob_start_len,
+            )
+            if req.return_logprob:
+                self.logprob_computer.add_input_logprob_return_values(
+                    i,
+                    req,
+                    logits_output,
+                    logprob_pt,
+                    num_input_logprobs,
+                    last_prefill_chunk=False,
+                )
+            logprob_pt += num_input_logprobs
         return logprob_pt
 
     def _resolve_spec_overlap_token_ids(
