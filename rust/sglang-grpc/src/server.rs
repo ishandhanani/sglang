@@ -756,6 +756,21 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         Ok(Response::new(proto::AbortResponse { success: true }))
     }
 
+    // Stream type for SubscribeKvEvents (see proto SglangService).
+    type SubscribeKvEventsStream = StreamResult<proto::KvEventBatch>;
+
+    async fn subscribe_kv_events(
+        &self,
+        _request: Request<proto::SubscribeKvEventsRequest>,
+    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
+        // KV event subscription needs the scheduler's KV cache event publisher
+        // wired through PyBridge. Stubbed for now — server-side wiring lands
+        // in a follow-up alongside the Python event-publisher integration.
+        Err(Status::unimplemented(
+            "SubscribeKvEvents not yet implemented in this server build",
+        ))
+    }
+
     async fn flush_cache(
         &self,
         _request: Request<proto::FlushCacheRequest>,
