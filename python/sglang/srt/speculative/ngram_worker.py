@@ -328,7 +328,8 @@ class NGRAMWorker:
                     )
                     req.time_stats.set_spec_verify_end_time(num_correct_drafts=correct)
 
-            # Store num_accept_tokens for per-request metrics
+            # Store num_accept_tokens (with bonus) for per-request metrics;
+            # downstream subtracts 1 to recover drafts-only counts.
             num_accept_tokens = verify_input.num_accept_tokens
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
