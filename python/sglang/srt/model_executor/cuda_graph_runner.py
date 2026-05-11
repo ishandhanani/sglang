@@ -1397,7 +1397,11 @@ class CudaGraphRunner:
                     spec_steps=self.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
                     draft_token_num=self.speculative_num_draft_tokens,
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    capture_hidden_mode=(
+                        CaptureHiddenMode.NULL
+                        if self.model_runner.spec_algorithm.is_standalone()
+                        else CaptureHiddenMode.FULL
+                    ),
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
