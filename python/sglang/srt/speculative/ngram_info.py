@@ -190,9 +190,11 @@ class NgramVerifyInput(SpecInput):
                             )
                             raise e
             req.spec_verify_ct += 1
-            num_correct_drafts = sum(1 for idx in accept_index_row if idx != -1) - 1
-            req.spec_num_correct_drafts += num_correct_drafts
-            req.update_spec_correct_drafts_histogram(num_correct_drafts)
+            num_correct_drafts_this_req = (
+                sum(1 for idx in accept_index_row if idx != -1) - 1
+            )
+            req.spec_num_correct_drafts += num_correct_drafts_this_req
+            req.update_spec_correct_drafts_histogram(num_correct_drafts_this_req)
 
         if has_finished:
             self.num_correct_drafts = (self.accepted_indices != -1).sum(dim=1) - 1
