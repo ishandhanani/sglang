@@ -60,6 +60,8 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_nan,
     maybe_detect_oob,
     select_top_k_tokens,
+    spec_capture_hidden_mode,
+    spec_info_consumes_hidden_states,
 )
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
@@ -129,8 +131,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Whether draft.forward consumes `spec_info.hidden_states` as input.
         # See EAGLEWorker (v1) for full discussion.
-        self.spec_info_consumes_hidden_states = (
-            not self.speculative_algorithm.is_standalone()
+        self.spec_info_consumes_hidden_states = spec_info_consumes_hidden_states(
+            server_args
         )
 
         # Do not capture cuda graph in `TpModelWorker` init,
@@ -672,9 +674,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self._target_worker = target_worker
         self.page_size = server_args.page_size
         # See EagleDraftWorker (above) / EAGLEWorker (v1) for discussion.
-        self.spec_info_consumes_hidden_states = not SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        ).is_standalone()
+        self.spec_info_consumes_hidden_states = spec_info_consumes_hidden_states(
+            server_args
+        )
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -750,20 +752,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or model_worker_batch.is_extend_in_batch
         ):
             # Target prefill
-            model_worker_batch.capture_hidden_mode = (
-                CaptureHiddenMode.FULL
-                if self.spec_info_consumes_hidden_states
-                else CaptureHiddenMode.NULL
+            model_worker_batch.capture_hidden_mode = spec_capture_hidden_mode(
+                self.server_args, CaptureHiddenMode.FULL
             )
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
 
             # Draft prefill
-            model_worker_batch.capture_hidden_mode = (
-                CaptureHiddenMode.LAST
-                if self.spec_info_consumes_hidden_states
-                else CaptureHiddenMode.NULL
+            model_worker_batch.capture_hidden_mode = spec_capture_hidden_mode(
+                self.server_args, CaptureHiddenMode.LAST
             )
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group

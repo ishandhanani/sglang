@@ -28,6 +28,7 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 
 if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
@@ -52,14 +53,45 @@ TREE_SPEC_KERNEL_AVAILABLE = (
 )  # This kernel is only available for CUDA and MUSA now
 
 
+def spec_info_consumes_hidden_states(
+    server_args: Optional[ServerArgs] = None,
+) -> bool:
+    """Architectural fact: does the draft architecture consume
+    `spec_info.hidden_states` as input via an fc-cat / input_proj layer?
+
+    True  - EAGLE / EAGLE3 / MIMO / multi-layer EAGLE (all chain-style drafts).
+    False - STANDALONE (vanilla LLM draft; ignores the field).
+
+    All `capture_hidden_mode` decisions on the spec connector route through
+    `spec_capture_hidden_mode`, which uses this predicate.
+    """
+    if server_args is None:
+        server_args = get_global_server_args()
+    return server_args.speculative_algorithm != "STANDALONE"
+
+
+def spec_capture_hidden_mode(
+    server_args: Optional[ServerArgs],
+    base_mode: "CaptureHiddenMode",
+) -> "CaptureHiddenMode":
+    """Returns `base_mode` if the draft architecture consumes spec_info
+    hidden_states, else NULL. Drop-in for the inline ternary at every
+    `capture_hidden_mode = FULL/LAST` site in the spec pipeline."""
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+    if spec_info_consumes_hidden_states(server_args):
+        return base_mode
+    return CaptureHiddenMode.NULL
+
+
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
         server_args = get_global_server_args()
 
-    # STANDALONE draft is a vanilla LLM that ignores spec_info.hidden_states;
-    # multi-layer eagle propagates hidden states inside the draft model rather
-    # than via the FutureMap-backed spec_info field.
-    if server_args.speculative_algorithm == "STANDALONE":
+    # STANDALONE draft ignores spec_info.hidden_states; multi-layer eagle
+    # propagates hidden states inside the draft model rather than via the
+    # FutureMap-backed spec_info field.
+    if not spec_info_consumes_hidden_states(server_args):
         return False
     # TODO(lsyin): also skip when step = 1
     return not server_args.enable_multi_layer_eagle

@@ -66,6 +66,8 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_nan,
     maybe_detect_oob,
     select_top_k_tokens,
+    spec_capture_hidden_mode,
+    spec_info_consumes_hidden_states,
 )
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -116,11 +118,10 @@ class EAGLEWorker(TpModelWorker):
         )
 
         # Whether draft.forward consumes `spec_info.hidden_states` as input
-        # (the EAGLE-paper "feature"). STANDALONE drafts are vanilla LLMs and
-        # ignore the field; everything else (EAGLE, EAGLE3, MIMO, multi-layer
-        # EAGLE) consumes it through some fc-cat-style input layer.
-        self.spec_info_consumes_hidden_states = (
-            not self.speculative_algorithm.is_standalone()
+        # (the EAGLE-paper "feature"). False for STANDALONE; True for all
+        # chain-style algorithms (EAGLE / EAGLE3 / MIMO / multi-layer EAGLE).
+        self.spec_info_consumes_hidden_states = spec_info_consumes_hidden_states(
+            server_args
         )
 
         # Adaptive speculative
@@ -580,10 +581,8 @@ class EAGLEWorker(TpModelWorker):
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
-        model_worker_batch.capture_hidden_mode = (
-            CaptureHiddenMode.FULL
-            if self.spec_info_consumes_hidden_states
-            else CaptureHiddenMode.NULL
+        model_worker_batch.capture_hidden_mode = spec_capture_hidden_mode(
+            self.server_args, CaptureHiddenMode.FULL
         )
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
         logits_output, next_token_ids = (
@@ -755,10 +754,8 @@ class EAGLEWorker(TpModelWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
 
-        spec_info.capture_hidden_mode = (
-            CaptureHiddenMode.LAST
-            if self.spec_info_consumes_hidden_states
-            else CaptureHiddenMode.NULL
+        spec_info.capture_hidden_mode = spec_capture_hidden_mode(
+            self.server_args, CaptureHiddenMode.LAST
         )
         spec_info.num_tokens_per_req = self.topk
         spec_info.num_tokens_for_logprob_per_req = self.topk
@@ -827,10 +824,8 @@ class EAGLEWorker(TpModelWorker):
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
-            capture_hidden_mode=(
-                CaptureHiddenMode.FULL
-                if self.spec_info_consumes_hidden_states
-                else CaptureHiddenMode.NULL
+            capture_hidden_mode=spec_capture_hidden_mode(
+                self.server_args, CaptureHiddenMode.FULL
             ),
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
@@ -1117,10 +1112,8 @@ class EAGLEWorker(TpModelWorker):
         )
         batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
-        batch.spec_info.capture_hidden_mode = (
-            CaptureHiddenMode.LAST
-            if self.spec_info_consumes_hidden_states
-            else CaptureHiddenMode.NULL
+        batch.spec_info.capture_hidden_mode = spec_capture_hidden_mode(
+            self.server_args, CaptureHiddenMode.LAST
         )
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=seq_lens_cpu
