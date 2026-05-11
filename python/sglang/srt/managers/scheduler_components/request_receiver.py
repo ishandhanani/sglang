@@ -66,65 +66,7 @@ class SchedulerRequestReceiver:
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
-        if self.server_args.enable_dp_attention:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
-            else:
-                work_reqs = None
-                control_reqs = None
-
-            if self.ps.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
-                )
-
-            if self.ps.attn_cp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_cp_group.rank,
-                    self.attn_cp_cpu_group,
-                    src=self.attn_cp_group.ranks[0],
-                )
-
-            # When dp_attention_local_control_broadcast is enabled, each DP
-            # group leader already receives control messages from the DP
-            # controller, so we broadcast within attn_tp_group + attn_cp_group
-            # instead of the full tp_group.  This avoids an expensive
-            # all-ranks gloo sync.
-            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
-            if _local_ctrl:
-                if self.ps.attn_tp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_tp_group.rank,
-                        self.attn_tp_cpu_group,
-                        src=self.attn_tp_group.ranks[0],
-                    )
-                if self.ps.attn_cp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_cp_group.rank,
-                        self.attn_cp_cpu_group,
-                        src=self.attn_cp_group.ranks[0],
-                    )
-            elif self.ps.tp_size != 1:
-                control_reqs = broadcast_pyobj(
-                    control_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
-                )
-            recv_reqs = work_reqs + control_reqs
-        elif self.ps.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.tp_group.rank,
-                self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
-            )
+        recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
 
         # Process MM requests under EPD-disaggregation mode
         if (
@@ -208,6 +150,68 @@ class SchedulerRequestReceiver:
                 )
             else:
                 recv_reqs = None
+        return recv_reqs
+
+    def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
+        if self.server_args.enable_dp_attention:
+            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+                work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
+            else:
+                work_reqs = None
+                control_reqs = None
+
+            if self.ps.attn_tp_size != 1:
+                work_reqs = broadcast_pyobj(
+                    work_reqs,
+                    self.attn_tp_group.rank,
+                    self.attn_tp_cpu_group,
+                    src=self.attn_tp_group.ranks[0],
+                )
+
+            if self.ps.attn_cp_size != 1:
+                work_reqs = broadcast_pyobj(
+                    work_reqs,
+                    self.attn_cp_group.rank,
+                    self.attn_cp_cpu_group,
+                    src=self.attn_cp_group.ranks[0],
+                )
+
+            # When dp_attention_local_control_broadcast is enabled, each DP
+            # group leader already receives control messages from the DP
+            # controller, so we broadcast within attn_tp_group + attn_cp_group
+            # instead of the full tp_group.  This avoids an expensive
+            # all-ranks gloo sync.
+            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
+            if _local_ctrl:
+                if self.ps.attn_tp_size != 1:
+                    control_reqs = broadcast_pyobj(
+                        control_reqs,
+                        self.attn_tp_group.rank,
+                        self.attn_tp_cpu_group,
+                        src=self.attn_tp_group.ranks[0],
+                    )
+                if self.ps.attn_cp_size != 1:
+                    control_reqs = broadcast_pyobj(
+                        control_reqs,
+                        self.attn_cp_group.rank,
+                        self.attn_cp_cpu_group,
+                        src=self.attn_cp_group.ranks[0],
+                    )
+            elif self.ps.tp_size != 1:
+                control_reqs = broadcast_pyobj(
+                    control_reqs,
+                    self.tp_group.rank,
+                    self.tp_cpu_group,
+                    src=self.tp_group.ranks[0],
+                )
+            recv_reqs = work_reqs + control_reqs
+        elif self.ps.tp_size != 1:
+            recv_reqs = broadcast_pyobj(
+                recv_reqs,
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
         return recv_reqs
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
