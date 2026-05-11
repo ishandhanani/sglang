@@ -307,7 +307,7 @@ class SchedulerBatchResultProcessor:
             batch.reqs, batch.return_logprob, skip_stream_req
         )
 
-        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+        can_run_cuda_graph = result.can_run_cuda_graph
         self.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
