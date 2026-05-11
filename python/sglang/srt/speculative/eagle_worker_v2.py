@@ -127,6 +127,12 @@ class EagleDraftWorker(BaseDraftWorker):
             server_args.speculative_algorithm
         )
 
+        # Whether draft.forward consumes `spec_info.hidden_states` as input.
+        # See EAGLEWorker (v1) for full discussion.
+        self.spec_info_consumes_hidden_states = (
+            not self.speculative_algorithm.is_standalone()
+        )
+
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
         backup_disable_cuda_graph = server_args.disable_cuda_graph
@@ -665,6 +671,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.device = server_args.device
         self._target_worker = target_worker
         self.page_size = server_args.page_size
+        # See EagleDraftWorker (above) / EAGLEWorker (v1) for discussion.
+        self.spec_info_consumes_hidden_states = not SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        ).is_standalone()
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )

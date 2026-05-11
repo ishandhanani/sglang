@@ -115,6 +115,14 @@ class EAGLEWorker(TpModelWorker):
             server_args.speculative_algorithm
         )
 
+        # Whether draft.forward consumes `spec_info.hidden_states` as input
+        # (the EAGLE-paper "feature"). STANDALONE drafts are vanilla LLMs and
+        # ignore the field; everything else (EAGLE, EAGLE3, MIMO, multi-layer
+        # EAGLE) consumes it through some fc-cat-style input layer.
+        self.spec_info_consumes_hidden_states = (
+            not self.speculative_algorithm.is_standalone()
+        )
+
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive:
