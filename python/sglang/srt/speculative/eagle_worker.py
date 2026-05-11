@@ -63,7 +63,6 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_oob,
     select_top_k_tokens,
     spec_capture_hidden_mode,
-    spec_info_consumes_hidden_states,
 )
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -111,13 +110,6 @@ class EAGLEWorker(TpModelWorker):
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
-        )
-
-        # Whether draft.forward consumes `spec_info.hidden_states` as input
-        # (the EAGLE-paper "feature"). False for STANDALONE; True for all
-        # chain-style algorithms (EAGLE / EAGLE3 / MIMO / multi-layer EAGLE).
-        self.spec_info_consumes_hidden_states = spec_info_consumes_hidden_states(
-            server_args
         )
 
         # Adaptive speculative

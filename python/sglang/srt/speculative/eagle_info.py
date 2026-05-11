@@ -43,6 +43,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
+    spec_info_consumes_hidden_states,
 )
 from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
 
@@ -724,13 +725,13 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         (draft model writes its own last hidden back via `capture_for_decode`
         and the draft loop). Returns None when the draft architecture doesn't
         consume the field (e.g., STANDALONE)."""
-        if not worker.spec_info_consumes_hidden_states:
+        if not spec_info_consumes_hidden_states(worker.server_args):
             return None
         return _draft_runner_of(worker).model_config.spec_hidden_size
 
     @classmethod
     def dtype_for(cls, worker) -> Optional[torch.dtype]:
-        if not worker.spec_info_consumes_hidden_states:
+        if not spec_info_consumes_hidden_states(worker.server_args):
             return None
         return _draft_runner_of(worker).model_config.dtype
 
@@ -868,7 +869,7 @@ class EagleDraftExtendInput(SpecInput):
         aux mode (low/mid/high features fused into a 3k-dim vector, reduced
         by draft's FC). Returns None when the draft architecture doesn't
         consume the field (e.g., STANDALONE)."""
-        if not worker.spec_info_consumes_hidden_states:
+        if not spec_info_consumes_hidden_states(worker.server_args):
             return None
         target_cfg = worker.target_worker.model_runner.model_config
         if (
@@ -880,7 +881,7 @@ class EagleDraftExtendInput(SpecInput):
 
     @classmethod
     def dtype_for(cls, worker) -> Optional[torch.dtype]:
-        if not worker.spec_info_consumes_hidden_states:
+        if not spec_info_consumes_hidden_states(worker.server_args):
             return None
         return worker.target_worker.model_runner.model_config.dtype
 

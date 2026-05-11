@@ -61,7 +61,6 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_oob,
     select_top_k_tokens,
     spec_capture_hidden_mode,
-    spec_info_consumes_hidden_states,
 )
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
@@ -127,12 +126,6 @@ class EagleDraftWorker(BaseDraftWorker):
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
-        )
-
-        # Whether draft.forward consumes `spec_info.hidden_states` as input.
-        # See EAGLEWorker (v1) for full discussion.
-        self.spec_info_consumes_hidden_states = spec_info_consumes_hidden_states(
-            server_args
         )
 
         # Do not capture cuda graph in `TpModelWorker` init,
@@ -673,10 +666,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.device = server_args.device
         self._target_worker = target_worker
         self.page_size = server_args.page_size
-        # See EagleDraftWorker (above) / EAGLEWorker (v1) for discussion.
-        self.spec_info_consumes_hidden_states = spec_info_consumes_hidden_states(
-            server_args
-        )
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
