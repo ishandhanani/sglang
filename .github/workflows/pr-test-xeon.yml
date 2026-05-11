@@ -97,6 +97,9 @@ jobs:
       - name: Run container
         run: |
           docker run -dt \
+            --env-file "$SGLANG_RUNNER_ENV_FILE" \
+            --cpuset-cpus="$CPUSET_CPUS" \
+            --cpuset-mems="$CPUSET_MEMS" \
             -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
             -v $HOME/.cache/huggingface:/root/.cache/huggingface \
             -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
