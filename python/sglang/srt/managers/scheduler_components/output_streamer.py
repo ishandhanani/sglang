@@ -135,13 +135,7 @@ class SchedulerOutputStreamer:
                 continue
 
             acc.accept(req=req)
-
-            if (
-                req.finished()
-                and self.ps.attn_tp_rank == 0
-                and self.server_args.enable_request_time_stats_logging
-            ):
-                req.log_time_stats()
+            acc.maybe_log_time_stats(req=req)
 
         dp_ranks = [self.ps.dp_rank] * len(acc.rids) if acc.rids else None
 
@@ -508,7 +502,8 @@ class _GenerationStreamAccumulator:
                 self.customized_info[k].append(v[send_token_offset : len(output_ids_)])
 
     def maybe_log_time_stats(self, *, req: Req) -> None:
-        raise NotImplementedError
+        if req.finished() and self.attn_tp_rank_zero and self.log_time_stats:
+            req.log_time_stats()
 
     def to_payload(
         self, *, load, dp_rank: int, is_idle_batch: bool, has_reqs: bool
