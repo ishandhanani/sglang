@@ -128,6 +128,16 @@ pub(crate) fn build_text_generate_dict(
     if let Some(rank) = req.routed_dp_rank {
         d.insert("routed_dp_rank".into(), serde_json::json!(rank));
     }
+    if let Some(ref dp) = req.disaggregated_params {
+        // See build_generate_dict for rationale.
+        if !dp.bootstrap_host.is_empty() {
+            d.insert("bootstrap_host".into(), serde_json::json!(dp.bootstrap_host));
+        }
+        if dp.bootstrap_port != 0 {
+            d.insert("bootstrap_port".into(), serde_json::json!(dp.bootstrap_port));
+        }
+        d.insert("bootstrap_room".into(), serde_json::json!(dp.bootstrap_room));
+    }
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
@@ -171,6 +181,21 @@ pub(crate) fn build_generate_dict(
     }
     if let Some(rank) = req.routed_dp_rank {
         d.insert("routed_dp_rank".into(), serde_json::json!(rank));
+    }
+    if let Some(ref dp) = req.disaggregated_params {
+        // Forward as top-level keys (matches TokenizedGenerateReqInput
+        // field names): bootstrap_host, bootstrap_port, bootstrap_room.
+        // The Python bridge passes these through to the scheduler's
+        // disagg path; the prefill leg registers the room, the decode
+        // leg fetches KV via NIXL/Mooncake on the same rendezvous.
+        if !dp.bootstrap_host.is_empty() {
+            d.insert("bootstrap_host".into(), serde_json::json!(dp.bootstrap_host));
+        }
+        if dp.bootstrap_port != 0 {
+            d.insert("bootstrap_port".into(), serde_json::json!(dp.bootstrap_port));
+        }
+        // bootstrap_room is int64; pass through as Number.
+        d.insert("bootstrap_room".into(), serde_json::json!(dp.bootstrap_room));
     }
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
