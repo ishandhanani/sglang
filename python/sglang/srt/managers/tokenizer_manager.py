@@ -2130,6 +2130,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
                 # FIXME: backward-compat alias for `spec_num_correct_drafts`, remove in next release.
                 meta_info["spec_accepted_drafts"] = num_correct_drafts
+                # FIXME: backward-compat alias for `spec_num_proposed_drafts`, remove in next release.
+                meta_info["spec_proposed_drafts"] = num_proposed_drafts
 
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (
