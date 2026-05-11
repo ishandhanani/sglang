@@ -383,17 +383,21 @@ class _GenerationStreamAccumulator:
                 # Decode server does not send input logprobs
                 and self.disaggregation_mode != DisaggregationMode.DECODE
                 # Only send when input logprobs have been computed (after prefill)
-                and req.input_token_logprobs_val is not None
+                and req.logprob.input_token_logprobs_val is not None
             ):
-                self.input_token_logprobs_val.append(req.input_token_logprobs_val)
-                self.input_token_logprobs_idx.append(req.input_token_logprobs_idx)
-                self.input_top_logprobs_val.append(req.input_top_logprobs_val)
-                self.input_top_logprobs_idx.append(req.input_top_logprobs_idx)
+                self.input_token_logprobs_val.append(
+                    req.logprob.input_token_logprobs_val
+                )
+                self.input_token_logprobs_idx.append(
+                    req.logprob.input_token_logprobs_idx
+                )
+                self.input_top_logprobs_val.append(req.logprob.input_top_logprobs_val)
+                self.input_top_logprobs_idx.append(req.logprob.input_top_logprobs_idx)
                 self.input_token_ids_logprobs_val.append(
-                    req.input_token_ids_logprobs_val
+                    req.logprob.input_token_ids_logprobs_val
                 )
                 self.input_token_ids_logprobs_idx.append(
-                    req.input_token_ids_logprobs_idx
+                    req.logprob.input_token_ids_logprobs_idx
                 )
                 req.input_logprob_sent = True
             else:
@@ -407,32 +411,32 @@ class _GenerationStreamAccumulator:
             if req.return_logprob:
                 logprob_end = max(len(output_ids_), 1)
                 self.output_token_logprobs_val.append(
-                    req.output_token_logprobs_val[
+                    req.logprob.output_token_logprobs_val[
                         send_output_token_logprobs_offset:logprob_end
                     ]
                 )
                 self.output_token_logprobs_idx.append(
-                    req.output_token_logprobs_idx[
+                    req.logprob.output_token_logprobs_idx[
                         send_output_token_logprobs_offset:logprob_end
                     ]
                 )
                 self.output_top_logprobs_val.append(
-                    req.output_top_logprobs_val[
+                    req.logprob.output_top_logprobs_val[
                         send_output_token_logprobs_offset:logprob_end
                     ]
                 )
                 self.output_top_logprobs_idx.append(
-                    req.output_top_logprobs_idx[
+                    req.logprob.output_top_logprobs_idx[
                         send_output_token_logprobs_offset:logprob_end
                     ]
                 )
                 self.output_token_ids_logprobs_val.append(
-                    req.output_token_ids_logprobs_val[
+                    req.logprob.output_token_ids_logprobs_val[
                         send_output_token_logprobs_offset:logprob_end
                     ]
                 )
                 self.output_token_ids_logprobs_idx.append(
-                    req.output_token_ids_logprobs_idx[
+                    req.logprob.output_token_ids_logprobs_idx[
                         send_output_token_logprobs_offset:logprob_end
                     ]
                 )
