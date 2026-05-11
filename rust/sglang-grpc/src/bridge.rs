@@ -794,11 +794,24 @@ fn extract_meta_info(chunk: &Bound<'_, PyDict>) -> HashMap<String, String> {
         && let Ok(meta_dict) = meta_obj.downcast::<PyDict>()
     {
         for (k, v) in meta_dict.iter() {
+            let Ok(key) = k.extract::<String>() else {
+                continue;
+            };
+            // `finish_reason` is dict-shaped internally: `{'type': 'length', ...}`.
+            // Downstream consumers (Dynamo bridge, OpenAI clients) want the
+            // canonical string ("stop"/"length"/"abort"). Extract the `type` so
+            // the wire carries a plain OpenAI value, not a JSON-encoded dict.
+            if key == "finish_reason"
+                && let Ok(d) = v.downcast::<PyDict>()
+                && let Ok(Some(t)) = d.get_item("type")
+                && let Ok(s) = t.extract::<String>()
+            {
+                meta.insert(key, s);
+                continue;
+            }
             // The proto schema is map<string, string>; encode each Python value as JSON
             // so clients can recover numbers, booleans, arrays, and objects losslessly.
-            if let Ok(key) = k.extract::<String>()
-                && let Ok(val) = py_value_to_json_string(&v)
-            {
+            if let Ok(val) = py_value_to_json_string(&v) {
                 meta.insert(key, val);
             }
         }

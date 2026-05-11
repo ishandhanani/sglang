@@ -164,10 +164,20 @@ class RuntimeHandle:
         try:
             gen = self.tokenizer_manager.generate_request(obj, request=None)
             if stream:
+                # TokenizerManager emits cumulative `output_ids` per chunk
+                # (matches the HTTP shape). gRPC consumers expect incremental
+                # token deltas — slice off the previously-emitted prefix
+                # before forwarding so each chunk's `output_ids` carries only
+                # the new tokens since the last chunk.
+                emitted = 0
                 async for chunk in gen:
                     finished = (
                         chunk.get("meta_info", {}).get("finish_reason") is not None
                     )
+                    cumulative = chunk.get("output_ids") or []
+                    if cumulative and len(cumulative) >= emitted:
+                        chunk["output_ids"] = cumulative[emitted:]
+                        emitted = len(cumulative)
                     chunk_callback(chunk, finished=finished)
                     if finished:
                         return
