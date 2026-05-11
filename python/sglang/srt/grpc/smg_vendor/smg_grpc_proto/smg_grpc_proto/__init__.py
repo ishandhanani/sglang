@@ -1,0 +1,37 @@
+"""SMG gRPC Proto - Protocol definitions for SGLang, vLLM, TRT-LLM, and MLX."""
+
+from importlib.metadata import version
+
+__version__ = version("smg-grpc-proto")
+
+# Re-export generated modules for convenient access
+# These imports will work after the package is built (stubs generated at build time)
+try:
+    from smg_grpc_proto.generated import (
+        mlx_engine_pb2,
+        mlx_engine_pb2_grpc,
+        sglang_encoder_pb2,
+        sglang_encoder_pb2_grpc,
+        sglang_scheduler_pb2,
+        sglang_scheduler_pb2_grpc,
+        trtllm_service_pb2,
+        trtllm_service_pb2_grpc,
+        vllm_engine_pb2,
+        vllm_engine_pb2_grpc,
+    )
+
+    __all__ = [
+        "sglang_scheduler_pb2",
+        "sglang_scheduler_pb2_grpc",
+        "sglang_encoder_pb2",
+        "sglang_encoder_pb2_grpc",
+        "vllm_engine_pb2",
+        "vllm_engine_pb2_grpc",
+        "trtllm_service_pb2",
+        "trtllm_service_pb2_grpc",
+        "mlx_engine_pb2",
+        "mlx_engine_pb2_grpc",
+    ]
+except ImportError:
+    # During development/build, generated modules may not exist yet
+    __all__ = []
