@@ -2353,7 +2353,6 @@ def _start_native_grpc_server_for_runtime(
             port=server_args.grpc_port,
             runtime_handle=runtime_handle,
             worker_threads=server_args.grpc_worker_threads,
-            max_prefill_tokens=server_args.grpc_max_prefill_tokens,
         )
         logger.info(
             f"Native gRPC server started on {server_args.host}:{server_args.grpc_port}"
