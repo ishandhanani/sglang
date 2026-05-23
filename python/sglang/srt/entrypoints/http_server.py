@@ -2353,6 +2353,7 @@ def _start_native_grpc_server_for_runtime(
             port=server_args.grpc_port,
             runtime_handle=runtime_handle,
             worker_threads=server_args.grpc_worker_threads,
+            response_timeout_secs=server_args.grpc_response_timeout_secs,
             max_prefill_tokens=server_args.grpc_max_prefill_tokens,
         )
         logger.info(

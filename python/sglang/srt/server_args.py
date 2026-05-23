@@ -377,6 +377,7 @@ class ServerArgs:
     grpc_mode: bool = False
     grpc_port: Optional[int] = None
     grpc_worker_threads: int = 4
+    grpc_response_timeout_secs: int = 300
     grpc_max_prefill_tokens: Optional[int] = None  # None = auto-detect from KV cache
     enable_grpc: bool = False
     smg_grpc: bool = False
@@ -1166,6 +1167,8 @@ class ServerArgs:
             )
         if self.grpc_worker_threads < 1:
             raise ValueError("--grpc-worker-threads must be >= 1")
+        if self.grpc_response_timeout_secs < 1:
+            raise ValueError("--grpc-response-timeout-secs must be >= 1")
 
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
@@ -4595,6 +4598,17 @@ class ServerArgs:
             type=int,
             default=4,
             help="Number of Tokio worker threads for the native gRPC server.",
+        )
+        parser.add_argument(
+            "--grpc-response-timeout-secs",
+            type=int,
+            default=ServerArgs.grpc_response_timeout_secs,
+            help=(
+                "Per-chunk timeout for the native gRPC server's response stream. "
+                "If no response chunk is produced within this many seconds the "
+                "server fails the stream with DeadlineExceeded. Increase for "
+                "high-backlog workloads where requests wait long for prefill."
+            ),
         )
         parser.add_argument(
             "--grpc-max-prefill-tokens",
