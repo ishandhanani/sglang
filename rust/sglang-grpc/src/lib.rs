@@ -9,6 +9,7 @@ pub mod proto {
 use pyo3::prelude::*;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Notify, Semaphore};
 
 use bridge::PyBridge;
@@ -97,12 +98,13 @@ fn read_max_total_num_tokens(runtime_handle: &PyObject) -> Option<usize> {
 ///   - `0`     → disable admission control entirely
 ///   - `N > 0` → use exactly N tokens as the prefill semaphore budget
 #[pyfunction]
-#[pyo3(signature = (host, port, runtime_handle, worker_threads=4, max_prefill_tokens=None))]
+#[pyo3(signature = (host, port, runtime_handle, worker_threads=4, response_timeout_secs=300, max_prefill_tokens=None))]
 fn start_server(
     host: String,
     port: u16,
     runtime_handle: PyObject,
     worker_threads: usize,
+    response_timeout_secs: u64,
     max_prefill_tokens: Option<usize>,
 ) -> PyResult<GrpcServerHandle> {
     let addr: SocketAddr = format!("{}:{}", host, port).parse().map_err(|e| {
@@ -163,6 +165,10 @@ fn start_server(
         semaphore,
         semaphore_capacity,
     ));
+    // Configure the per-chunk receive timeout for all gRPC streams in this
+    // process. OnceLock semantics — only the first call in the process wins,
+    // matching SGLang's "one gRPC server per launch" model.
+    server::set_response_timeout(Duration::from_secs(response_timeout_secs));
     let shutdown = Arc::new(Notify::new());
     let shutdown_clone = shutdown.clone();
 

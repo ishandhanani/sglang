@@ -80,7 +80,21 @@ fn trace_headers_to_json(headers: &HashMap<String, String>) -> Option<serde_json
 }
 
 type StreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Per-chunk receive timeout. Defaults to 300 s; overridable at server start
+/// via `start_server(..., response_timeout_secs=...)` which writes the chosen
+/// value into the OnceLock below. Read on the hot path.
+static RESPONSE_TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+/// Configure the per-chunk timeout. Called once during `run_grpc_server`.
+/// Subsequent calls are no-ops (OnceLock semantics).
+pub fn set_response_timeout(d: Duration) {
+    let _ = RESPONSE_TIMEOUT.set(d);
+}
+
+fn response_timeout() -> Duration {
+    *RESPONSE_TIMEOUT.get().unwrap_or(&Duration::from_secs(300))
+}
+
 /// How long an inference RPC will wait for a concurrency slot before returning
 /// RESOURCE_EXHAUSTED. 30 s is generous enough to absorb short saturation spikes
 /// while still giving clients a timely signal under sustained overload.
@@ -90,7 +104,7 @@ async fn recv_chunk_with_timeout(
     receiver: &mut Receiver<ResponseChunk>,
     timeout_message: &'static str,
 ) -> Result<Option<ResponseChunk>, Status> {
-    timeout(RESPONSE_TIMEOUT, receiver.recv())
+    timeout(response_timeout(), receiver.recv())
         .await
         .map_err(|_| Status::deadline_exceeded(timeout_message))
 }
