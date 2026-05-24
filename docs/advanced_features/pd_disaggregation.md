@@ -131,10 +131,14 @@ To enable NVLink transport for KV cache transfers with the mooncake backend (rec
 
 ```bash
 export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
+export SGLANG_MOONCAKE_TE_PROTOCOL=nvlink
 export MC_FORCE_MNNVL=True
+export NCCL_MNNVL_ENABLE=1
+export NCCL_CUMEM_ENABLE=1
 ```
 
 The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`.
+`SGLANG_MOONCAKE_TE_PROTOCOL` overrides the Mooncake transfer protocol. If it is not set, SGLang uses `nvlink` when `SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK` and otherwise uses `rdma`.
 
 #### Prefill Server Configuration
 | Variable | Description | Default |
