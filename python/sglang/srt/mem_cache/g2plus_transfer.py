@@ -249,7 +249,7 @@ class MooncakeG2plusTransferBackend:
         cls, scheduler, diagnostics: Optional[list[str]] = None
     ) -> Optional["MooncakeG2plusTransferBackend"]:
         server_args = scheduler.server_args
-        backend = str(getattr(server_args, "g2plus_transfer_backend", "http")).lower()
+        backend = str(getattr(server_args, "g2plus_transfer_backend", "auto")).lower()
         if backend not in {"auto", "mooncake"}:
             return None
         topology_rejection = _direct_topology_rejection(scheduler)
@@ -296,7 +296,6 @@ class MooncakeG2plusTransferBackend:
                     "mooncake target KV registration failed",
                 )
                 return None
-
             transfer = cls(
                 engine=engine,
                 tree_cache=scheduler.tree_cache,
@@ -515,7 +514,6 @@ class MooncakeG2plusTransferBackend:
             if ret != 0:
                 raise RuntimeError(f"Mooncake direct KV transfer failed with ret={ret}")
 
-
 class NixlG2plusTransferBackend:
     """NIXL-backed source-G2-host to target-G1-device transfer helper."""
 
@@ -560,7 +558,7 @@ class NixlG2plusTransferBackend:
         cls, scheduler, diagnostics: Optional[list[str]] = None
     ) -> Optional["NixlG2plusTransferBackend"]:
         server_args = scheduler.server_args
-        backend = str(getattr(server_args, "g2plus_transfer_backend", "http")).lower()
+        backend = str(getattr(server_args, "g2plus_transfer_backend", "auto")).lower()
         if backend not in {"auto", "nixl"}:
             return None
         topology_rejection = _direct_topology_rejection(scheduler)
@@ -913,10 +911,8 @@ def make_g2plus_transfer_backend(
     scheduler, diagnostics: Optional[list[str]] = None
 ) -> Optional[G2plusTransferBackend]:
     backend = str(
-        getattr(scheduler.server_args, "g2plus_transfer_backend", "http")
+        getattr(scheduler.server_args, "g2plus_transfer_backend", "auto")
     ).lower()
-    if backend == "http":
-        return None
     topology_rejection = _direct_topology_rejection(scheduler)
     if topology_rejection is not None:
         if backend in {"mooncake", "nixl"}:

@@ -170,7 +170,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
-G2PLUS_TRANSFER_BACKEND_CHOICES = ["auto", "mooncake", "nixl", "http"]
+G2PLUS_TRANSFER_BACKEND_CHOICES = ["auto", "mooncake", "nixl"]
 
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
@@ -660,7 +660,7 @@ class ServerArgs:
     g2plus_fetch_workers: int = 4
     g2plus_transfer_parallelism: int = default_g2plus_transfer_parallelism()
     g2plus_timeout_secs: float = 1.0
-    g2plus_transfer_backend: Literal["auto", "mooncake", "nixl", "http"] = "auto"
+    g2plus_transfer_backend: Literal["auto", "mooncake", "nixl"] = "auto"
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -6334,7 +6334,7 @@ class ServerArgs:
             type=str,
             choices=G2PLUS_TRANSFER_BACKEND_CHOICES,
             default=ServerArgs.g2plus_transfer_backend,
-            help="G2plus transfer backend. Use auto/mooncake/nixl for direct G2->G1 transfer; http is development staging only.",
+            help="G2plus transfer backend for direct source G2/host to target G1/GPU transfer.",
         )
 
         # Hierarchical sparse attention
