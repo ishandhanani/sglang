@@ -62,18 +62,23 @@ class SchedulerOutputProcessorMixin:
 
         Returns:
             - None if no cached tokens at all
-            - {"device": X, "host": Y} without storage breakdown
+            - {"device": X, "host": Y} without storage or remote-G2 breakdown
+            - {"device": X, "host": Y, "remote_g2": R} with router remote-G2 reuse
             - {"device": X, "host": Y, "storage": Z} with storage breakdown
         """
         if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0
             or req.cached_tokens_storage > 0
+            or getattr(req, "cached_tokens_remote_g2", 0) > 0
         ):
             details = {
                 "device": req.cached_tokens_device,
                 "host": req.cached_tokens_host,
             }
+            remote_g2_tokens = getattr(req, "cached_tokens_remote_g2", 0)
+            if remote_g2_tokens > 0:
+                details["remote_g2"] = remote_g2_tokens
             # Only include storage fields if L3 storage is enabled
             if getattr(self, "enable_hicache_storage", False):
                 details["storage"] = req.cached_tokens_storage
@@ -655,6 +660,10 @@ class SchedulerOutputProcessorMixin:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
+
+            router_manager = getattr(self, "router_kv_reuse_manager", None)
+            if router_manager is not None:
+                router_manager.release_request(req.rid)
 
             req.time_stats.set_completion_time()
 

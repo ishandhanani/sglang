@@ -188,6 +188,7 @@ from sglang.srt.managers.utils import GenerationBatchResult, validate_input_leng
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.router_kv_reuse import RouterKVReuseManager
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -442,6 +443,9 @@ class Scheduler(
 
         # Register draft KV pool (when spec + HiCache co-enabled).
         self._maybe_register_hicache_draft()
+
+        # Init router-directed KV reuse once HiCache pools are available.
+        self.init_router_kv_reuse()
 
         # Init running status
         self.init_running_status()
@@ -970,6 +974,9 @@ class Scheduler(
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+
+    def init_router_kv_reuse(self):
+        self.router_kv_reuse_manager = RouterKVReuseManager.from_scheduler(self)
 
     def _get_draft_kv_pool(self):
         """Return (draft_token_to_kv_pool, draft_model_config) for the current
@@ -2010,6 +2017,7 @@ class Scheduler(
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
+                remote_kv_reuse_plan=recv_req.remote_kv_reuse_plan,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
@@ -2221,6 +2229,41 @@ class Scheduler(
                     prefix_keys,
                 )
 
+    def _prepare_router_kv_reuse_for_schedule(self, req: Req) -> bool:
+        router_manager = getattr(self, "router_kv_reuse_manager", None)
+        if router_manager is None:
+            return True
+
+        try:
+            if not router_manager.has_reuse_plan(req):
+                return True
+            # Probe the current local prefix without taking COW/Mamba allocations.
+            # The final schedule path below recomputes the prefix after remote pages land.
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            result = router_manager.check_reuse_plan_progress(req)
+        except Exception:
+            logger.exception(
+                "Router KV reuse failed for rid=%s; continuing with local prefill",
+                req.rid,
+            )
+            req.remote_kv_reuse_plan = None
+            release = getattr(router_manager, "release_request", None)
+            if release is not None:
+                try:
+                    release(req.rid)
+                except Exception:
+                    logger.debug(
+                        "Failed to release router KV reuse state after error",
+                        exc_info=True,
+                    )
+            return True
+        return not result.pending
+
+    def _release_router_kv_reuse_request(self, rid: str) -> None:
+        router_manager = getattr(self, "router_kv_reuse_manager", None)
+        if router_manager is not None:
+            router_manager.release_request(rid)
+
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
@@ -2302,6 +2345,7 @@ class Scheduler(
                     self.tree_cache.release_aborted_request(candidate_req.rid)
                 elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
+                self._release_router_kv_reuse_request(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -2319,6 +2363,7 @@ class Scheduler(
         )
         if req_to_abort.time_stats is not None:
             req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        self._release_router_kv_reuse_request(req_to_abort.rid)
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
@@ -2333,6 +2378,7 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
+                self._release_router_kv_reuse_request(req.rid)
                 self.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -2724,6 +2770,9 @@ class Scheduler(
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
                 )
+
+            if not self._prepare_router_kv_reuse_for_schedule(req):
+                continue
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
@@ -3307,7 +3356,19 @@ class Scheduler(
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
 
+            router_manager = getattr(self, "router_kv_reuse_manager", None)
+            if router_manager is not None:
+                idle &= not router_manager.has_pending()
+
         return idle
+
+    def shutdown(self) -> None:
+        if getattr(self, "_shutdown_called", False):
+            return
+        self._shutdown_called = True
+        router_manager = getattr(self, "router_kv_reuse_manager", None)
+        if router_manager is not None:
+            router_manager.shutdown()
 
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
@@ -3538,6 +3599,7 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
+            self._release_router_kv_reuse_request(req.rid)
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:

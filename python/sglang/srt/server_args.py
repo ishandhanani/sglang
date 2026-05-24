@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
-from sglang.srt.environ import envs
+from sglang.srt.environ import default_g2plus_transfer_parallelism, envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
@@ -170,6 +170,8 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
+G2PLUS_TRANSFER_BACKEND_CHOICES = ["auto", "mooncake", "nixl", "http"]
+
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -650,6 +652,15 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
+    enable_router_kv_reuse: bool = False
+    enable_g2plus: bool = False
+    g2plus_worker_id: Optional[int] = None
+    g2plus_endpoint: Optional[str] = None
+    g2plus_peer_endpoints: Optional[str] = None
+    g2plus_fetch_workers: int = 4
+    g2plus_transfer_parallelism: int = default_g2plus_transfer_parallelism()
+    g2plus_timeout_secs: float = 1.0
+    g2plus_transfer_backend: Literal["auto", "mooncake", "nixl", "http"] = "auto"
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -852,6 +863,7 @@ class ServerArgs:
 
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
         self._handle_pd_disaggregation()
+        self._handle_router_kv_reuse()
 
         # Validate --prefill-only-disable-kv-cache args early (before dummy-model
         # short-circuit). The backend check is run later after backends settle.
@@ -3493,6 +3505,62 @@ class ServerArgs:
                 "flashinfer" if is_sm100_supported() else "triton"
             )
         return False
+
+    def _handle_router_kv_reuse(self):
+        """Normalize router-directed HiCache reuse knobs."""
+        if self.enable_g2plus:
+            self.enable_router_kv_reuse = True
+
+        if not self.enable_router_kv_reuse:
+            return
+
+        self.enable_hierarchical_cache = True
+        if self.enable_g2plus and self.g2plus_worker_id is None:
+            raise ValueError("--enable-g2plus requires --g2plus-worker-id")
+        if self.g2plus_worker_id is not None:
+            if isinstance(self.g2plus_worker_id, bool):
+                raise ValueError("--g2plus-worker-id must be a non-negative integer")
+            try:
+                self.g2plus_worker_id = int(self.g2plus_worker_id)
+            except (TypeError, ValueError) as err:
+                raise ValueError(
+                    "--g2plus-worker-id must be a non-negative integer"
+                ) from err
+            if self.g2plus_worker_id < 0:
+                raise ValueError("--g2plus-worker-id must be a non-negative integer")
+        self.g2plus_transfer_backend = str(self.g2plus_transfer_backend).lower()
+        if self.g2plus_transfer_backend not in G2PLUS_TRANSFER_BACKEND_CHOICES:
+            raise ValueError(
+                "--g2plus-transfer-backend must be one of "
+                f"{G2PLUS_TRANSFER_BACKEND_CHOICES}, got "
+                f"{self.g2plus_transfer_backend!r}"
+            )
+        if self.g2plus_fetch_workers < 1:
+            raise ValueError("--g2plus-fetch-workers must be >= 1")
+        if self.g2plus_transfer_parallelism < 1:
+            raise ValueError("--g2plus-transfer-parallelism must be >= 1")
+        if self.g2plus_timeout_secs <= 0:
+            raise ValueError("--g2plus-timeout-secs must be > 0")
+        if self.g2plus_endpoint and self.g2plus_endpoint.strip().startswith("{"):
+            endpoints = json.loads(self.g2plus_endpoint)
+            if not isinstance(endpoints, dict):
+                raise ValueError("--g2plus-endpoint must be a JSON object")
+            for key, endpoint in endpoints.items():
+                if not isinstance(endpoint, str) or not endpoint.strip():
+                    raise ValueError(
+                        "--g2plus-endpoint values must be non-empty strings; "
+                        f"got {endpoint!r} for {key!r}"
+                    )
+        if self.g2plus_peer_endpoints:
+            endpoints = json.loads(self.g2plus_peer_endpoints)
+            if not isinstance(endpoints, dict):
+                raise ValueError("--g2plus-peer-endpoints must be a JSON object")
+            for key, endpoint in endpoints.items():
+                if not isinstance(endpoint, str) or not endpoint.strip():
+                    raise ValueError(
+                        "--g2plus-peer-endpoints values must be non-empty strings; "
+                        f"got {endpoint!r} for {key!r}"
+                    )
 
     def _handle_speculative_decoding(self):
         if (
@@ -6214,6 +6282,59 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
+        )
+        parser.add_argument(
+            "--enable-router-kv-reuse",
+            action="store_true",
+            help="Enable router-directed remote KV reuse through HiCache.",
+        )
+        parser.add_argument(
+            "--enable-g2plus",
+            action="store_true",
+            help="Enable G2plus router-directed remote G2(host-pinned)->G1(GPU) KV reuse.",
+        )
+        parser.add_argument(
+            "--g2plus-worker-id",
+            type=int,
+            default=ServerArgs.g2plus_worker_id,
+            help="Worker id assigned by the external G2plus router.",
+        )
+        parser.add_argument(
+            "--g2plus-endpoint",
+            type=str,
+            default=ServerArgs.g2plus_endpoint,
+            help="Local source resolver endpoint, e.g. 10.0.0.1:39000 or JSON keyed by DP rank.",
+        )
+        parser.add_argument(
+            "--g2plus-peer-endpoints",
+            type=str,
+            default=ServerArgs.g2plus_peer_endpoints,
+            help="JSON object mapping worker ids or worker_id:dp_rank keys to source resolver endpoints.",
+        )
+        parser.add_argument(
+            "--g2plus-fetch-workers",
+            type=int,
+            default=ServerArgs.g2plus_fetch_workers,
+            help="Maximum concurrent G2plus source resolve or direct transfer control operations.",
+        )
+        parser.add_argument(
+            "--g2plus-transfer-parallelism",
+            type=int,
+            default=ServerArgs.g2plus_transfer_parallelism,
+            help="Maximum per-transfer direct KV slice copies to issue in parallel.",
+        )
+        parser.add_argument(
+            "--g2plus-timeout-secs",
+            type=float,
+            default=ServerArgs.g2plus_timeout_secs,
+            help="Timeout for G2plus source resolver/control-plane operations.",
+        )
+        parser.add_argument(
+            "--g2plus-transfer-backend",
+            type=str,
+            choices=G2PLUS_TRANSFER_BACKEND_CHOICES,
+            default=ServerArgs.g2plus_transfer_backend,
+            help="G2plus transfer backend. Use auto/mooncake/nixl for direct G2->G1 transfer; http is development staging only.",
         )
 
         # Hierarchical sparse attention
