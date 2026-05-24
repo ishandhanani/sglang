@@ -4,6 +4,7 @@ import atexit
 import base64
 import json
 import logging
+import socket
 import threading
 import time
 import urllib.error
@@ -594,6 +595,14 @@ def _parse_peer_endpoints(peer_endpoints: Optional[str]) -> Dict[str, str]:
 class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+
+    def get_request(self):
+        request, client_address = super().get_request()
+        try:
+            request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            logger.debug("Failed to set TCP_NODELAY on G2plus resolver socket")
+        return request, client_address
 
 
 def _router_kv_reuse_enabled(server_args: "ServerArgs") -> bool:
