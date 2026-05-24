@@ -139,6 +139,7 @@ export NCCL_CUMEM_ENABLE=1
 
 The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`.
 `SGLANG_MOONCAKE_TE_PROTOCOL` overrides the Mooncake transfer protocol. If it is not set, SGLang uses `nvlink` when `SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK` and otherwise uses `rdma`.
+When `SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK`, SGLang also defaults `MC_FORCE_MNNVL=True`, `NCCL_MNNVL_ENABLE=1`, and `NCCL_CUMEM_ENABLE=1` if the operator has not explicitly set those variables.
 
 #### Prefill Server Configuration
 | Variable | Description | Default |
