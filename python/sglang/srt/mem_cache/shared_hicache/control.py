@@ -59,6 +59,7 @@ def start_source_transfer_server(
     port: int,
     endpoint: str,
     worker_id: int | None,
+    attn_dp_rank: int,
     max_body_bytes: Callable[[], int],
     try_enter: Callable[[], bool],
     exit_resolver: Callable[[], None],
@@ -201,9 +202,10 @@ def start_source_transfer_server(
     )
     thread.start()
     logger.info(
-        "Shared HiCache source resolver listening on %s for worker_id=%s",
+        "Shared HiCache source resolver listening on %s for worker_id=%s attn_dp_rank=%s",
         endpoint,
         worker_id,
+        attn_dp_rank,
     )
     return server, thread
 

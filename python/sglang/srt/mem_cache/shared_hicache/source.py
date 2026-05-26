@@ -94,6 +94,7 @@ def resolve_host_pages(
     start_block: int,
     max_blocks: int,
     worker_id: Optional[int],
+    attn_dp_rank: int,
 ) -> tuple[list[ResolvedHostPage], str]:
     pages, reason, protected_nodes = resolve_host_page_locations(
         tree_cache,
@@ -101,6 +102,7 @@ def resolve_host_pages(
         start_block=start_block,
         max_blocks=max_blocks,
         worker_id=worker_id,
+        attn_dp_rank=attn_dp_rank,
     )
     try:
         resolved = [
@@ -127,25 +129,30 @@ def resolve_host_page_locations(
     start_block: int,
     max_blocks: int,
     worker_id: Optional[int],
-    tp_rank: int = 0,
-    tp_size: int = 1,
+    attn_dp_rank: int,
+    attn_tp_rank: int = 0,
+    attn_tp_size: int = 1,
     pp_size: int = 1,
     attn_cp_size: int = 1,
-    target_tp_rank: Optional[int] = None,
-    target_tp_size: Optional[int] = None,
+    target_attn_dp_rank: Optional[int] = None,
+    target_attn_tp_rank: Optional[int] = None,
+    target_attn_tp_size: Optional[int] = None,
 ) -> tuple[list[ResolvedHostPageLocation], str, list[TreeNode]]:
     if worker_id is None:
         return [], "missing_source_worker_id", []
     if plan.source_worker_id != worker_id:
         return [], "wrong_source_worker", []
+    if plan.source_attn_dp_rank != attn_dp_rank:
+        return [], "wrong_source_attn_dp_rank", []
     rank_rejection = _source_rank_rejection(
         plan,
-        tp_rank=tp_rank,
-        tp_size=tp_size,
+        attn_tp_rank=attn_tp_rank,
+        attn_tp_size=attn_tp_size,
         pp_size=pp_size,
         attn_cp_size=attn_cp_size,
-        target_tp_rank=target_tp_rank,
-        target_tp_size=target_tp_size,
+        target_attn_dp_rank=target_attn_dp_rank,
+        target_attn_tp_rank=target_attn_tp_rank,
+        target_attn_tp_size=target_attn_tp_size,
     )
     if rank_rejection is not None:
         return [], rank_rejection, []
@@ -259,12 +266,13 @@ def _is_timeout_error(err: BaseException) -> bool:
 def _source_rank_rejection(
     plan: SharedHiCachePlan,
     *,
-    tp_rank: int,
-    tp_size: int,
+    attn_tp_rank: int,
+    attn_tp_size: int,
     pp_size: int,
     attn_cp_size: int,
-    target_tp_rank: Optional[int],
-    target_tp_size: Optional[int],
+    target_attn_dp_rank: Optional[int],
+    target_attn_tp_rank: Optional[int],
+    target_attn_tp_size: Optional[int],
 ) -> Optional[str]:
     topology_rejection = shared_hicache_parallel_rejection(
         pp_size=int(pp_size),
@@ -273,38 +281,47 @@ def _source_rank_rejection(
     if topology_rejection is not None:
         return f"unsupported_source_topology:{topology_rejection}"
 
-    local_tp_size = int(tp_size)
-    local_tp_rank = int(tp_rank)
-    if plan.source_tp_size != local_tp_size:
+    local_attn_tp_size = int(attn_tp_size)
+    local_attn_tp_rank = int(attn_tp_rank)
+    if plan.source_attn_tp_size != local_attn_tp_size:
         return (
-            "wrong_source_tp_size:"
-            f"plan={plan.source_tp_size}:local={local_tp_size}"
+            "wrong_source_attn_tp_size:"
+            f"plan={plan.source_attn_tp_size}:local={local_attn_tp_size}"
         )
-    if target_tp_size is None:
-        if local_tp_size > 1:
-            return "missing_target_tp_size"
-        target_tp_size = 1
-    if target_tp_rank is None:
-        if local_tp_size > 1:
-            return "missing_target_tp_rank"
-        target_tp_rank = 0
+    if (
+        target_attn_dp_rank is not None
+        and plan.target_attn_dp_rank != int(target_attn_dp_rank)
+    ):
+        return (
+            "wrong_target_attn_dp_rank:"
+            f"plan={plan.target_attn_dp_rank}:target={int(target_attn_dp_rank)}"
+        )
 
-    target_tp_size = int(target_tp_size)
-    target_tp_rank = int(target_tp_rank)
-    if plan.target_tp_size != target_tp_size:
+    if target_attn_tp_size is None:
+        if local_attn_tp_size > 1:
+            return "missing_target_attn_tp_size"
+        target_attn_tp_size = 1
+    if target_attn_tp_rank is None:
+        if local_attn_tp_size > 1:
+            return "missing_target_attn_tp_rank"
+        target_attn_tp_rank = 0
+
+    target_attn_tp_size = int(target_attn_tp_size)
+    target_attn_tp_rank = int(target_attn_tp_rank)
+    if plan.target_attn_tp_size != target_attn_tp_size:
         return (
-            "wrong_target_tp_size:"
-            f"plan={plan.target_tp_size}:target={target_tp_size}"
+            "wrong_target_attn_tp_size:"
+            f"plan={plan.target_attn_tp_size}:target={target_attn_tp_size}"
         )
-    if target_tp_size != local_tp_size:
+    if target_attn_tp_size != local_attn_tp_size:
         return (
-            "incompatible_tp_size:"
-            f"source={local_tp_size}:target={target_tp_size}"
+            "incompatible_attn_tp_size:"
+            f"source={local_attn_tp_size}:target={target_attn_tp_size}"
         )
-    if target_tp_rank != local_tp_rank:
+    if target_attn_tp_rank != local_attn_tp_rank:
         return (
-            "wrong_source_tp_rank_for_target:"
-            f"source={local_tp_rank}:target={target_tp_rank}"
+            "wrong_source_attn_tp_rank_for_target:"
+            f"source={local_attn_tp_rank}:target={target_attn_tp_rank}"
         )
     return None
 
@@ -390,8 +407,9 @@ def handle_source_transfer(
     transfer_backend: Optional[SharedHiCacheTransferBackend],
     tree_cache,
     worker_id: Optional[int],
-    tp_rank: int = 0,
-    tp_size: int = 1,
+    attn_dp_rank: int,
+    attn_tp_rank: int = 0,
+    attn_tp_size: int = 1,
     pp_size: int = 1,
     attn_cp_size: int = 1,
 ) -> Mapping[str, Any]:
@@ -433,16 +451,25 @@ def handle_source_transfer(
         }
     target_metadata = payload.get("target_metadata")
     try:
-        target_tp_rank = _target_metadata_int(
-            target_metadata, "tp_rank"
+        target_attn_dp_rank = _target_metadata_int(
+            target_metadata, "attn_dp_rank"
         )
-        target_tp_size = _target_metadata_int(
-            target_metadata, "tp_size"
+        target_attn_tp_rank = _target_metadata_int(
+            target_metadata, "attn_tp_rank"
+        )
+        target_attn_tp_size = _target_metadata_int(
+            target_metadata, "attn_tp_size"
         )
     except ValueError as err:
         return {
             "ok": False,
             "reason": f"malformed_transfer_request:{err}",
+            "block_size_tokens": tree_cache.page_size,
+        }
+    if target_attn_dp_rank is None:
+        return {
+            "ok": False,
+            "reason": "malformed_transfer_request:target_metadata.attn_dp_rank_missing",
             "block_size_tokens": tree_cache.page_size,
         }
     try:
@@ -477,12 +504,14 @@ def handle_source_transfer(
         start_block=start_block,
         max_blocks=max_blocks,
         worker_id=worker_id,
-        tp_rank=tp_rank,
-        tp_size=tp_size,
+        attn_dp_rank=attn_dp_rank,
+        attn_tp_rank=attn_tp_rank,
+        attn_tp_size=attn_tp_size,
         pp_size=pp_size,
         attn_cp_size=attn_cp_size,
-        target_tp_rank=target_tp_rank,
-        target_tp_size=target_tp_size,
+        target_attn_dp_rank=target_attn_dp_rank,
+        target_attn_tp_rank=target_attn_tp_rank,
+        target_attn_tp_size=target_attn_tp_size,
     )
     resolve_ms = (time.perf_counter() - resolve_start) * 1000
     transfer_ms = 0.0
