@@ -14,9 +14,7 @@ from sglang.srt.mem_cache.shared_hicache.manager import SharedHiCacheManager
 from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
 from sglang.srt.mem_cache.shared_hicache.scheduler_mixin import (
     SharedHiCacheSchedulerMixin,
-    _SHARED_HICACHE_STATUS_FAILED,
-    _SHARED_HICACHE_STATUS_PENDING,
-    _SHARED_HICACHE_STATUS_READY,
+    SharedHiCachePrepareStatus,
 )
 from sglang.srt.mem_cache.shared_hicache.service import (
     _decode_control_payload,
@@ -384,7 +382,7 @@ class TestSharedHiCache(unittest.TestCase):
         scheduler = FakeConsensusScheduler(
             manager,
             status_overrides=[
-                [_SHARED_HICACHE_STATUS_FAILED],
+                [SharedHiCachePrepareStatus.Failed],
             ],
         )
         req = FakeSharedHiCacheReq("rid-1", local_prefix_len=24)
@@ -392,7 +390,7 @@ class TestSharedHiCache(unittest.TestCase):
         pending_rids = scheduler._prepare_shared_hicache_for_schedule_batch([req])
 
         self.assertEqual(pending_rids, set())
-        self.assertEqual(scheduler.status_inputs, [[_SHARED_HICACHE_STATUS_READY]])
+        self.assertEqual(scheduler.status_inputs, [[SharedHiCachePrepareStatus.Ready]])
         self.assertEqual(scheduler.prefix_inputs, [])
         self.assertEqual(manager.prepared, [])
         self.assertEqual(manager.released, ["rid-1"])
@@ -403,8 +401,8 @@ class TestSharedHiCache(unittest.TestCase):
         scheduler = FakeConsensusScheduler(
             manager,
             status_overrides=[
-                [_SHARED_HICACHE_STATUS_READY],
-                [_SHARED_HICACHE_STATUS_FAILED],
+                [SharedHiCachePrepareStatus.Ready],
+                [SharedHiCachePrepareStatus.Failed],
             ],
         )
         req = FakeSharedHiCacheReq("rid-1", local_prefix_len=24)
@@ -414,7 +412,7 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertEqual(pending_rids, set())
         self.assertEqual(
             scheduler.status_inputs,
-            [[_SHARED_HICACHE_STATUS_READY], [_SHARED_HICACHE_STATUS_READY]],
+            [[SharedHiCachePrepareStatus.Ready], [SharedHiCachePrepareStatus.Ready]],
         )
         self.assertEqual(scheduler.prefix_inputs, [[24], []])
         self.assertEqual(manager.prepared, ["rid-1"])
@@ -426,8 +424,8 @@ class TestSharedHiCache(unittest.TestCase):
         scheduler = FakeConsensusScheduler(
             manager,
             status_overrides=[
-                [_SHARED_HICACHE_STATUS_READY],
-                [_SHARED_HICACHE_STATUS_PENDING],
+                [SharedHiCachePrepareStatus.Ready],
+                [SharedHiCachePrepareStatus.Pending],
             ],
         )
         req = FakeSharedHiCacheReq("rid-1", local_prefix_len=24)
@@ -437,7 +435,7 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertEqual(pending_rids, {"rid-1"})
         self.assertEqual(
             scheduler.status_inputs,
-            [[_SHARED_HICACHE_STATUS_READY], [_SHARED_HICACHE_STATUS_READY]],
+            [[SharedHiCachePrepareStatus.Ready], [SharedHiCachePrepareStatus.Ready]],
         )
         self.assertEqual(scheduler.prefix_inputs, [[24], []])
         self.assertEqual(manager.prepared, ["rid-1"])

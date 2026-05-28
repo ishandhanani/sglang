@@ -16,10 +16,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _SHARED_HICACHE_PREPARE_LOOKAHEAD_EXTRA_REQS = 1
-_SHARED_HICACHE_STATUS_FAILED = 0
-_SHARED_HICACHE_STATUS_SKIP = 1
-_SHARED_HICACHE_STATUS_PENDING = 2
-_SHARED_HICACHE_STATUS_READY = 3
+
+
+class SharedHiCachePrepareStatus:
+    Failed = 0
+    Skip = 1
+    Pending = 2
+    Ready = 3
 
 
 class SharedHiCacheSchedulerMixin:
@@ -63,7 +66,7 @@ class SharedHiCacheSchedulerMixin:
 
         for req in reqs:
             if not shared_hicache_manager.has_reuse_plan(req):
-                probe_statuses.append(_SHARED_HICACHE_STATUS_SKIP)
+                probe_statuses.append(SharedHiCachePrepareStatus.Skip)
                 local_prefix_lens.append(0)
                 continue
             try:
@@ -72,7 +75,7 @@ class SharedHiCacheSchedulerMixin:
                 local_prefix_len = len(req.prefix_indices) + int(
                     getattr(req, "host_hit_length", 0) or 0
                 )
-                probe_status = _SHARED_HICACHE_STATUS_READY
+                probe_status = SharedHiCachePrepareStatus.Ready
             except Exception:
                 logger.exception(
                     "SharedHiCache failed while probing local prefix for rid=%s; "
@@ -80,7 +83,7 @@ class SharedHiCacheSchedulerMixin:
                     req.rid,
                 )
                 local_prefix_len = 0
-                probe_status = _SHARED_HICACHE_STATUS_FAILED
+                probe_status = SharedHiCachePrepareStatus.Failed
             probe_statuses.append(probe_status)
             local_prefix_lens.append(local_prefix_len)
 
@@ -91,12 +94,12 @@ class SharedHiCacheSchedulerMixin:
         for req, local_status, reduced_status, local_prefix_len in zip(
             reqs, probe_statuses, reduced_probe_statuses, local_prefix_lens
         ):
-            if reduced_status == _SHARED_HICACHE_STATUS_FAILED:
+            if reduced_status == SharedHiCachePrepareStatus.Failed:
                 req.shared_hicache_plan = None
                 self._release_shared_hicache_request(req.rid)
                 continue
-            if reduced_status == _SHARED_HICACHE_STATUS_SKIP:
-                if local_status == _SHARED_HICACHE_STATUS_READY:
+            if reduced_status == SharedHiCachePrepareStatus.Skip:
+                if local_status == SharedHiCachePrepareStatus.Ready:
                     logger.warning(
                         "SharedHiCache plan availability diverged across TP ranks for rid=%s; "
                         "falling back to local prefill",
@@ -128,16 +131,16 @@ class SharedHiCacheSchedulerMixin:
                 req.init_next_round_input(self.tree_cache, cow_mamba=False)
                 result = shared_hicache_manager.prepare_reuse(req)
                 prepare_status = (
-                    _SHARED_HICACHE_STATUS_PENDING
+                    SharedHiCachePrepareStatus.Pending
                     if result.pending
-                    else _SHARED_HICACHE_STATUS_READY
+                    else SharedHiCachePrepareStatus.Ready
                 )
             except Exception:
                 logger.exception(
                     "SharedHiCache failed for rid=%s; falling back to local prefill on all TP ranks",
                     req.rid,
                 )
-                prepare_status = _SHARED_HICACHE_STATUS_FAILED
+                prepare_status = SharedHiCachePrepareStatus.Failed
 
             prepared_reqs.append((req, result, common_local_prefix_len))
             prepare_statuses.append(prepare_status)
@@ -150,11 +153,11 @@ class SharedHiCacheSchedulerMixin:
         for (req, result, local_prefix_len), reduced_status in zip(
             prepared_reqs, reduced_prepare_statuses
         ):
-            if reduced_status == _SHARED_HICACHE_STATUS_FAILED:
+            if reduced_status == SharedHiCachePrepareStatus.Failed:
                 req.shared_hicache_plan = None
                 self._release_shared_hicache_request(req.rid)
                 continue
-            if reduced_status == _SHARED_HICACHE_STATUS_PENDING:
+            if reduced_status == SharedHiCachePrepareStatus.Pending:
                 pending_rids.add(str(req.rid))
                 continue
             ready_reqs.append(req)
