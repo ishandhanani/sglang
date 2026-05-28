@@ -204,9 +204,7 @@ def resolve_host_page_locations(
             break
         node, page_idx, hash_value = entry
         if node.id not in protected_ids:
-            node.protect_host()
-            protected_nodes.append(node)
-            protected_ids.add(node.id)
+            return [], "unprotected_hicache_host_lookup", protected_nodes
         entries.append((identity_hash, hash_value, node, page_idx))
 
     pages = [

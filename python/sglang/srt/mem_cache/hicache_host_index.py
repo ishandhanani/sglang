@@ -16,6 +16,15 @@ class HiCacheHostBlockIndex:
         self.lock = threading.RLock()
         self.block_index: dict[int, tuple[TreeNode, int, str]] = {}
 
+    def _drop_node_locked(self, node: TreeNode) -> None:
+        stale = [
+            block_hash
+            for block_hash, entry in self.block_index.items()
+            if entry[0] is node
+        ]
+        for block_hash in stale:
+            self.block_index.pop(block_hash, None)
+
     def clear(self) -> None:
         with self.lock:
             self.block_index.clear()
@@ -37,20 +46,18 @@ class HiCacheHostBlockIndex:
                     self.block_index[alias] = (node, page_idx, hash_value)
 
     def drop_node(self, node: TreeNode, *, locked: bool = False) -> None:
-        def drop() -> None:
-            stale = [
-                block_hash
-                for block_hash, entry in self.block_index.items()
-                if entry[0] is node
-            ]
-            for block_hash in stale:
-                self.block_index.pop(block_hash, None)
-
         if locked:
-            drop()
+            self._drop_node_locked(node)
         else:
             with self.lock:
-                drop()
+                self._drop_node_locked(node)
+
+    def claim_unprotected_node_for_eviction(self, node: TreeNode) -> bool:
+        with self.lock:
+            if node.host_value is None or node.host_ref_counter > 0:
+                return False
+            self._drop_node_locked(node)
+            return True
 
     def lookup(
         self, wanted_hashes: set[int], *, protect: bool = False

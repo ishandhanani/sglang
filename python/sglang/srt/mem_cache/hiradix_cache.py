@@ -650,6 +650,11 @@ class HiRadixCache(RadixCache):
         if getattr(self, "hicache_host_index", None) is not None:
             self.hicache_host_index.drop_node(node, locked=locked)
 
+    def _claim_hicache_host_node_for_eviction(self, node: TreeNode) -> bool:
+        if getattr(self, "hicache_host_index", None) is None:
+            return node.host_value is not None and node.host_ref_counter == 0
+        return self.hicache_host_index.claim_unprotected_node_for_eviction(node)
+
     def lookup_hicache_host_blocks(
         self, wanted_hashes: set[int], *, protect: bool = False
     ):
@@ -1001,7 +1006,7 @@ class HiRadixCache(RadixCache):
             if not x.evicted:
                 continue
 
-            if x.host_ref_counter > 0:
+            if not self._claim_hicache_host_node_for_eviction(x):
                 continue
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
