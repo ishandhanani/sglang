@@ -631,19 +631,26 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         return target_agent_name, int(target_metadata.get("gpu_id", 0))
 
     def _wait_for_transfer(self, agent, handle) -> Optional[tuple[int, int, int, int]]:
-        transfer_state = agent.transfer(handle)
-        while True:
-            if transfer_state == "ERR":
-                raise RuntimeError("NIXL direct KV transfer failed")
-            if transfer_state == "DONE":
-                break
-            time.sleep(0)
-            transfer_state = agent.check_xfer_state(handle)
-        telemetry = self._get_xfer_telemetry(agent, handle)
         release = getattr(agent, "release_xfer_handle", None)
-        if callable(release):
-            release(handle)
-        return telemetry
+        try:
+            transfer_state = agent.transfer(handle)
+            while True:
+                if transfer_state == "ERR":
+                    raise RuntimeError("NIXL direct KV transfer failed")
+                if transfer_state == "DONE":
+                    break
+                time.sleep(0)
+                transfer_state = agent.check_xfer_state(handle)
+            return self._get_xfer_telemetry(agent, handle)
+        finally:
+            if callable(release):
+                try:
+                    release(handle)
+                except Exception:
+                    logger.debug(
+                        "SharedHiCache NIXL transfer handle release failed",
+                        exc_info=True,
+                    )
 
     def _drain_target_notifications_locked(self) -> None:
         get_new_notifs = getattr(self.agent, "get_new_notifs", None)

@@ -27,6 +27,9 @@ from sglang.srt.mem_cache.shared_hicache.source import (
     resolve_host_pages,
 )
 from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
+from sglang.srt.mem_cache.shared_hicache.transfer import (
+    NixlSharedHiCacheTransferBackend,
+)
 from sglang.srt.mem_cache.utils import block_hash_aliases, hash_str_to_int64
 
 
@@ -92,6 +95,24 @@ class FakeTransferBackend:
     target_session_id = "target-session"
     target_kv_ptrs = [1]
     target_kv_item_lens = [64]
+
+
+class FakeNixlAgent:
+    def __init__(self, *, initial_state="DONE", check_error=None):
+        self.initial_state = initial_state
+        self.check_error = check_error
+        self.released = []
+
+    def transfer(self, handle):
+        return self.initial_state
+
+    def check_xfer_state(self, handle):
+        if self.check_error is not None:
+            raise self.check_error
+        return "DONE"
+
+    def release_xfer_handle(self, handle):
+        self.released.append(handle)
 
 
 class FakeSharedHiCacheReq:
@@ -211,6 +232,25 @@ class TestSharedHiCache(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "block_hash must be an integer"):
             SharedHiCachePlan.from_dict(_make_plan([{"block_hash": 11}]))
+
+    def test_nixl_transfer_handle_released_on_failure(self):
+        backend = NixlSharedHiCacheTransferBackend.__new__(
+            NixlSharedHiCacheTransferBackend
+        )
+        backend._capture_telemetry = False
+
+        err_agent = FakeNixlAgent(initial_state="ERR")
+        with self.assertRaisesRegex(RuntimeError, "NIXL direct KV transfer failed"):
+            backend._wait_for_transfer(err_agent, "err-handle")
+        self.assertEqual(err_agent.released, ["err-handle"])
+
+        stalled_agent = FakeNixlAgent(
+            initial_state="WAITING",
+            check_error=RuntimeError("poll failed"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "poll failed"):
+            backend._wait_for_transfer(stalled_agent, "poll-handle")
+        self.assertEqual(stalled_agent.released, ["poll-handle"])
 
     def test_hiradix_cpu_events_maintain_host_index(self):
         cache = HiRadixCache.__new__(HiRadixCache)
