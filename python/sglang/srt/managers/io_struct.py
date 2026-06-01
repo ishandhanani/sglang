@@ -133,7 +133,32 @@ MultimodalDataInputFormat = Union[
     List[MultimodalDataInputItem],
     MultimodalDataInputItem,
 ]
-SharedHiCachePlanInput = Union[SharedHiCachePlan, Dict[str, Any]]
+CacheHintsInput = Union[Dict[str, Any], List[Optional[Dict[str, Any]]]]
+
+
+def _shared_hicache_hint_from_cache_hints(
+    cache_hints: Optional[Any],
+    field_name: str = "cache_hints",
+) -> Optional[Any]:
+    if cache_hints is None:
+        return None
+    if not isinstance(cache_hints, dict):
+        raise ValueError(f"{field_name} must be a dict.")
+    return cache_hints.get("shared_hicache")
+
+
+def _cache_hints_has_shared_hicache(
+    cache_hints: Optional[Any],
+    field_name: str = "cache_hints",
+) -> bool:
+    if cache_hints is None:
+        return False
+    if isinstance(cache_hints, list):
+        return any(
+            _cache_hints_has_shared_hicache(item, f"{field_name}[{i}]")
+            for i, item in enumerate(cache_hints)
+        )
+    return _shared_hicache_hint_from_cache_hints(cache_hints, field_name) is not None
 
 
 @dataclass
@@ -233,13 +258,12 @@ class GenerateReqInput(BaseReq):
     disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
-    # External SharedHiCache host-cache reuse metadata.
+    # Internal router-provided cache execution hints.
+    # `shared_hicache` is normalized into `shared_hicache_plan` below.
+    cache_hints: Optional[CacheHintsInput] = None
     shared_hicache_plan: Optional[
-        Union[
-            SharedHiCachePlanInput,
-            List[Optional[SharedHiCachePlanInput]],
-        ]
-    ] = None
+        Union[SharedHiCachePlan, List[Optional[SharedHiCachePlan]]]
+    ] = field(default=None, init=False, repr=False)
 
     # For background responses (OpenAI responses API)
     background: bool = False
@@ -392,9 +416,12 @@ class GenerateReqInput(BaseReq):
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
 
-        if self.shared_hicache_plan is not None and self.parallel_sample_num != 1:
+        if (
+            _cache_hints_has_shared_hicache(self.cache_hints)
+            and self.parallel_sample_num != 1
+        ):
             raise ValueError(
-                "shared_hicache_plan does not support parallel_sample_num > 1"
+                "cache_hints.shared_hicache does not support parallel_sample_num > 1"
             )
 
         # If using parallel sampling with a single example, convert to batch
@@ -421,7 +448,9 @@ class GenerateReqInput(BaseReq):
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
-        self.shared_hicache_plan = SharedHiCachePlan.coerce(self.shared_hicache_plan)
+        self.shared_hicache_plan = SharedHiCachePlan.coerce(
+            _shared_hicache_hint_from_cache_hints(self.cache_hints)
+        )
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -443,7 +472,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_bootstrap_params(num)
-        self._normalize_shared_hicache_plan(num)
+        self._normalize_cache_hints(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -646,23 +675,31 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
-    def _normalize_shared_hicache_plan(self, num):
-        if self.shared_hicache_plan is None:
+    def _normalize_cache_hints(self, num):
+        if self.cache_hints is None:
             self.shared_hicache_plan = [None] * num
-        elif isinstance(self.shared_hicache_plan, list):
-            if len(self.shared_hicache_plan) != self.batch_size:
+        elif isinstance(self.cache_hints, list):
+            if len(self.cache_hints) != self.batch_size:
                 raise ValueError(
-                    "The length of shared_hicache_plan should be equal to the batch size."
+                    "The length of cache_hints should be equal to the batch size."
                 )
-            self.shared_hicache_plan = [
-                SharedHiCachePlan.coerce(plan) for plan in self.shared_hicache_plan
+            plans = [
+                SharedHiCachePlan.coerce(
+                    _shared_hicache_hint_from_cache_hints(
+                        hints, f"cache_hints[{i}]"
+                    )
+                )
+                for i, hints in enumerate(self.cache_hints)
             ]
+            self.shared_hicache_plan = plans * self.parallel_sample_num
         else:
             if self.batch_size != 1:
                 raise ValueError(
-                    "shared_hicache_plan must be a list when batch size is greater than 1."
+                    "cache_hints must be a list when batch size is greater than 1."
                 )
-            plan = SharedHiCachePlan.coerce(self.shared_hicache_plan)
+            plan = SharedHiCachePlan.coerce(
+                _shared_hicache_hint_from_cache_hints(self.cache_hints)
+            )
             self.shared_hicache_plan = [plan] * num
 
     def _validate_session_params(self):
@@ -745,11 +782,6 @@ class GenerateReqInput(BaseReq):
             ),
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
-            shared_hicache_plan=(
-                self.shared_hicache_plan[i]
-                if isinstance(self.shared_hicache_plan, list)
-                else self.shared_hicache_plan
-            ),
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
@@ -766,6 +798,11 @@ class GenerateReqInput(BaseReq):
                 if self.multi_item_delimiter_indices is not None
                 else None
             ),
+        )
+        sub.shared_hicache_plan = (
+            self.shared_hicache_plan[i]
+            if isinstance(self.shared_hicache_plan, list)
+            else self.shared_hicache_plan
         )
         cache[i] = sub
         return sub
