@@ -6,6 +6,9 @@ from enum import IntEnum
 from typing import Any, Optional
 
 
+SHARED_HICACHE_DEFAULT_TRANSFER_PARALLELISM = 8
+
+
 @contextmanager
 def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
     """Temporarily set environment variables, restoring originals on exit.
@@ -369,6 +372,9 @@ class Envs:
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
+    SGLANG_SHARED_HICACHE_FETCH_WORKERS = EnvInt(4)
+    SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM = EnvInt(None)
+    SGLANG_SHARED_HICACHE_NIXL_TELEMETRY = EnvBool(False)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
@@ -812,6 +818,13 @@ class Envs:
 
 envs = Envs()
 EnvField._allow_set_name = False
+
+
+def default_shared_hicache_transfer_parallelism() -> int:
+    value = envs.SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM.get()
+    if value is None:
+        value = SHARED_HICACHE_DEFAULT_TRANSFER_PARALLELISM
+    return max(1, int(value))
 
 
 def _print_deprecated_env(old_name: str, new_name: Optional[str] = None):

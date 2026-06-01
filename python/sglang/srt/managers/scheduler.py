@@ -219,6 +219,9 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.shared_hicache.scheduler_mixin import (
+    SharedHiCacheSchedulerMixin,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -290,6 +293,7 @@ class Scheduler(
     SchedulerPPMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
+    SharedHiCacheSchedulerMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -509,6 +513,9 @@ class Scheduler(
             metrics_collector_context=self.metrics_collector_context,
             metrics_collector=self.metrics_collector,
         )
+
+        # Init SharedHiCache once HiCache pools and metrics wiring are available.
+        self.init_shared_hicache()
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
@@ -1748,6 +1755,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
+            _release_shared_hicache_request=self._release_shared_hicache_request,
         )
 
     def init_req_max_new_tokens(self, req):
@@ -1942,6 +1950,7 @@ class Scheduler(
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
+                shared_hicache_plan=recv_req.shared_hicache_plan,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
@@ -2234,6 +2243,7 @@ class Scheduler(
                     self.tree_cache.release_aborted_request(candidate_req.rid)
                 elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
+                self._release_shared_hicache_request(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -2249,7 +2259,9 @@ class Scheduler(
             ),
             req_to_abort,
         )
-        req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        if req_to_abort.time_stats is not None:
+            req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        self._release_shared_hicache_request(req_to_abort.rid)
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
@@ -2264,6 +2276,7 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
+                self._release_shared_hicache_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -2642,6 +2655,10 @@ class Scheduler(
                     self.running_batch.reqs,
                 )
 
+        shared_hicache_pending_rids = self._prepare_shared_hicache_for_schedule_batch(
+            self._shared_hicache_schedule_candidates(self.waiting_queue, running_bs)
+        )
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -2673,7 +2690,10 @@ class Scheduler(
                     req.rid
                 )
 
-            req.init_next_round_input(self.tree_cache)
+            if str(req.rid) in shared_hicache_pending_rids:
+                continue
+
+            self._init_next_round_input_with_shared_hicache_tp_sync(req)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3331,7 +3351,19 @@ class Scheduler(
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
 
+            shared_hicache_manager = getattr(self, "shared_hicache_manager", None)
+            if shared_hicache_manager is not None:
+                idle &= not shared_hicache_manager.has_pending()
+
         return idle
+
+    def shutdown(self) -> None:
+        if getattr(self, "_shutdown_called", False):
+            return
+        self._shutdown_called = True
+        shared_hicache_manager = getattr(self, "shared_hicache_manager", None)
+        if shared_hicache_manager is not None:
+            shared_hicache_manager.shutdown()
 
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
@@ -3581,6 +3613,7 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
+            self._release_shared_hicache_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:

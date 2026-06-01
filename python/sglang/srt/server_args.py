@@ -48,6 +48,10 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.mem_cache.shared_hicache.config import (
+    SharedHiCacheConfig,
+    normalize_shared_hicache_server_config,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
@@ -693,6 +697,9 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
+    enable_shared_hicache: bool = False
+    shared_hicache_worker_id: Optional[int] = None
+    shared_hicache_config: Optional[Union[str, Dict[str, Any], SharedHiCacheConfig]] = None
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -907,6 +914,7 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
+        self._handle_shared_hicache()
 
         # Validate --prefill-only-disable-kv-cache args early (before dummy-model
         # short-circuit). The backend check is run later after backends settle.
@@ -3800,6 +3808,20 @@ class ServerArgs:
             )
         return False
 
+    def _handle_shared_hicache(self):
+        """Normalize Shared HiCache reuse knobs."""
+        (
+            self.enable_shared_hicache,
+            worker_id,
+            self.shared_hicache_config,
+        ) = normalize_shared_hicache_server_config(
+            enable_shared_hicache=self.enable_shared_hicache,
+            raw_config=self.shared_hicache_config,
+            worker_id=self.shared_hicache_worker_id,
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
+        )
+        self.shared_hicache_worker_id = worker_id
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -6282,7 +6304,6 @@ class ServerArgs:
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         )
-
         # Hierarchical sparse attention
         parser.add_argument(
             "--enable-hisparse",
@@ -6755,6 +6776,34 @@ class ServerArgs:
             "--enable-deepseek-v4-fp4-indexer",
             action="store_true",
             help="Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
+        )
+        parser.add_argument(
+            "--enable-shared-hicache",
+            action="store_true",
+            default=ServerArgs.enable_shared_hicache,
+            help="Enable Shared HiCache CPU-pinned KV cache sharing between workers.",
+        )
+        parser.add_argument(
+            "--shared-hicache-worker-id",
+            type=str,
+            default=ServerArgs.shared_hicache_worker_id,
+            help=(
+                "Explicit Shared HiCache worker id for standalone launches. "
+                "Dynamo sets this from its endpoint connection id."
+            ),
+        )
+        parser.add_argument(
+            "--shared-hicache-bootstrap-port",
+            type=int,
+            default=ServerArgs.shared_hicache_bootstrap_port,
+            help="Base port for this worker's Shared HiCache ZMQ control endpoints; TP rank adds its rank to this port.",
+        )
+        parser.add_argument(
+            "--shared-hicache-transfer-backend",
+            type=str,
+            choices=SHARED_HICACHE_TRANSFER_BACKEND_CHOICES,
+            default=ServerArgs.shared_hicache_transfer_backend,
+            help="Shared HiCache direct transfer backend. Required when --enable-shared-hicache is set.",
         )
         parser.add_argument(
             "--scheduler-recv-interval",

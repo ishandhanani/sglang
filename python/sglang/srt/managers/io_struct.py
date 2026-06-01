@@ -33,6 +33,7 @@ from pydantic import PlainValidator
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Modality
+from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
@@ -132,6 +133,7 @@ MultimodalDataInputFormat = Union[
     List[MultimodalDataInputItem],
     MultimodalDataInputItem,
 ]
+SharedHiCachePlanInput = Union[SharedHiCachePlan, Dict[str, Any]]
 
 
 @dataclass
@@ -231,6 +233,13 @@ class GenerateReqInput(BaseReq):
     disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
+    # External SharedHiCache host-cache reuse metadata.
+    shared_hicache_plan: Optional[
+        Union[
+            SharedHiCachePlanInput,
+            List[Optional[SharedHiCachePlanInput]],
+        ]
+    ] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
@@ -367,7 +376,6 @@ class GenerateReqInput(BaseReq):
         # Determine parallel sample count
         if self.sampling_params is None:
             self.parallel_sample_num = 1
-            return
         elif isinstance(self.sampling_params, dict):
             self.parallel_sample_num = self.sampling_params.get("n", 1)
         else:  # isinstance(self.sampling_params, list):
@@ -377,6 +385,11 @@ class GenerateReqInput(BaseReq):
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
+
+        if self.shared_hicache_plan is not None and self.parallel_sample_num != 1:
+            raise ValueError(
+                "shared_hicache_plan does not support parallel_sample_num > 1"
+            )
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
@@ -402,6 +415,7 @@ class GenerateReqInput(BaseReq):
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
+        self.shared_hicache_plan = SharedHiCachePlan.coerce(self.shared_hicache_plan)
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -423,6 +437,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_bootstrap_params(num)
+        self._normalize_shared_hicache_plan(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -625,6 +640,25 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
+    def _normalize_shared_hicache_plan(self, num):
+        if self.shared_hicache_plan is None:
+            self.shared_hicache_plan = [None] * num
+        elif isinstance(self.shared_hicache_plan, list):
+            if len(self.shared_hicache_plan) != self.batch_size:
+                raise ValueError(
+                    "The length of shared_hicache_plan should be equal to the batch size."
+                )
+            self.shared_hicache_plan = [
+                SharedHiCachePlan.coerce(plan) for plan in self.shared_hicache_plan
+            ]
+        else:
+            if self.batch_size != 1:
+                raise ValueError(
+                    "shared_hicache_plan must be a list when batch size is greater than 1."
+                )
+            plan = SharedHiCachePlan.coerce(self.shared_hicache_plan)
+            self.shared_hicache_plan = [plan] * num
+
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
         if self.session_params is not None:
@@ -705,6 +739,11 @@ class GenerateReqInput(BaseReq):
             ),
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
+            shared_hicache_plan=(
+                self.shared_hicache_plan[i]
+                if isinstance(self.shared_hicache_plan, list)
+                else self.shared_hicache_plan
+            ),
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
@@ -787,6 +826,7 @@ class TokenizedGenerateReqInput(BaseReq):
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    shared_hicache_plan: Optional[SharedHiCachePlan] = None
 
     # Priority for the request
     priority: Optional[int] = None
