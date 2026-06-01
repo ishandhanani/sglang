@@ -53,7 +53,7 @@ client request
   v
 router
   |  chooses target worker
-  |  attaches SharedHiCachePlan hint:
+  |  attaches cache_hints.shared_hicache:
   |    source_worker_id, target_worker_id, block hashes, TP shape, expiry
   v
 target engine frontend / tokenizer path
@@ -87,10 +87,11 @@ Detailed lifecycle:
 1. The router receives a client request and computes block hashes for the
    request prefix.
 2. The router picks a target worker for the request.
-3. If another worker has useful host-tier blocks, the router attaches a
-   `shared_hicache_plan` to the engine request. This is a hint, not a lease.
-4. The SGLang engine API carries `shared_hicache_plan` through request objects
-   into `ScheduleBatch.Req`.
+3. If another worker has useful host-tier blocks, the router attaches
+   `cache_hints.shared_hicache` to the engine request. This is a hint, not a
+   lease.
+4. The SGLang engine API normalizes `cache_hints.shared_hicache` into the
+   internal `SharedHiCachePlan` carried by scheduler request objects.
 5. The target scheduler runs normal local prefix matching first.
 6. The target scheduler asks Shared HiCache to prepare extra prefix blocks only
    for the remaining suffix beyond the local device/host hit.

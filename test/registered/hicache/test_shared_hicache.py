@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.hicache_host_index import HiCacheHostBlockIndex
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
@@ -232,6 +233,51 @@ class TestSharedHiCache(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "block_hash must be an integer"):
             SharedHiCachePlan.from_dict(_make_plan([{"block_hash": 11}]))
+
+    def test_generate_req_input_reads_shared_plan_from_cache_hints(self):
+        req = GenerateReqInput(
+            text="hello",
+            sampling_params={},
+            cache_hints={"shared_hicache": _make_plan([11])},
+        )
+
+        req.normalize_batch_and_arguments()
+
+        self.assertIsInstance(req.shared_hicache_plan, SharedHiCachePlan)
+        self.assertEqual(req.shared_hicache_plan.block_hashes, (11,))
+
+    def test_generate_req_input_normalizes_batched_cache_hints(self):
+        req = GenerateReqInput(
+            text=["hello", "world"],
+            sampling_params=[{}, {}],
+            cache_hints=[
+                {"shared_hicache": _make_plan([11])},
+                None,
+            ],
+        )
+
+        req.normalize_batch_and_arguments()
+
+        self.assertIsInstance(req.shared_hicache_plan[0], SharedHiCachePlan)
+        self.assertIsNone(req.shared_hicache_plan[1])
+        self.assertIsInstance(req[0].shared_hicache_plan, SharedHiCachePlan)
+        self.assertIsNone(req[1].shared_hicache_plan)
+
+        with self.assertRaisesRegex(ValueError, "cache_hints must be a list"):
+            GenerateReqInput(
+                text=["hello", "world"],
+                sampling_params=[{}, {}],
+                cache_hints={"shared_hicache": _make_plan([11])},
+            ).normalize_batch_and_arguments()
+
+        with self.assertRaisesRegex(
+            ValueError, "cache_hints.shared_hicache does not support"
+        ):
+            GenerateReqInput(
+                text="hello",
+                sampling_params={"n": 2},
+                cache_hints={"shared_hicache": _make_plan([11])},
+            ).normalize_batch_and_arguments()
 
     def test_nixl_transfer_handle_released_on_failure(self):
         backend = NixlSharedHiCacheTransferBackend.__new__(

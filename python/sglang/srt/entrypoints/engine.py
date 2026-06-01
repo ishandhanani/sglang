@@ -61,6 +61,7 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    CacheHintsInput,
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
@@ -75,7 +76,6 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
-    SharedHiCachePlanInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -349,7 +349,7 @@ class Engine(EngineScoreMixin, EngineBase):
         disagg_prefill_dp_rank: Optional[int] = None,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
-        shared_hicache_plan: Optional[SharedHiCachePlanInput] = None,
+        cache_hints: Optional[CacheHintsInput] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
@@ -387,7 +387,7 @@ class Engine(EngineScoreMixin, EngineBase):
             bootstrap_room=bootstrap_room,
             routed_dp_rank=routed_dp_rank,
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
-            shared_hicache_plan=shared_hicache_plan,
+            cache_hints=cache_hints,
             external_trace_header=external_trace_header,
             rid=rid,
             session_params=session_params,
@@ -453,7 +453,7 @@ class Engine(EngineScoreMixin, EngineBase):
         disagg_prefill_dp_rank: Optional[int] = None,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
-        shared_hicache_plan: Optional[SharedHiCachePlanInput] = None,
+        cache_hints: Optional[CacheHintsInput] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
@@ -491,7 +491,7 @@ class Engine(EngineScoreMixin, EngineBase):
             bootstrap_room=bootstrap_room,
             routed_dp_rank=routed_dp_rank,
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
-            shared_hicache_plan=shared_hicache_plan,
+            cache_hints=cache_hints,
             external_trace_header=external_trace_header,
             rid=rid,
             session_params=session_params,
