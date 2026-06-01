@@ -62,18 +62,23 @@ class SchedulerOutputStreamer:
 
         Returns:
             - None if no cached tokens at all
-            - {"device": X, "host": Y} without storage breakdown
+            - {"device": X, "host": Y} without storage or shared-hicache breakdown
+            - {"device": X, "host": Y, "shared_hicache": R} with Shared HiCache reuse
             - {"device": X, "host": Y, "storage": Z} with storage breakdown
         """
         if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0
             or req.cached_tokens_storage > 0
+            or getattr(req, "cached_tokens_shared_hicache", 0) > 0
         ):
             details = {
                 "device": req.cached_tokens_device,
                 "host": req.cached_tokens_host,
             }
+            shared_hicache_tokens = getattr(req, "cached_tokens_shared_hicache", 0)
+            if shared_hicache_tokens > 0:
+                details["shared_hicache"] = shared_hicache_tokens
             # In PD mode the L3 hit is produced on prefill and reported on
             # decode via metadata, while decode may not have a local storage backend.
             if req.cached_tokens_storage > 0 or self.enable_hicache_storage():

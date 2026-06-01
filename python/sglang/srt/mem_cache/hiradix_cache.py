@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PrefetchTimeoutConfig,
 )
+from sglang.srt.mem_cache.hicache_host_index import HiCacheHostBlockIndex
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -111,6 +112,14 @@ class HiRadixCache(RadixCache):
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
+        self.enable_shared_hicache = bool(
+            getattr(server_args, "enable_shared_hicache", False)
+        )
+        self.hicache_host_index = (
+            HiCacheHostBlockIndex(self.page_size)
+            if self.enable_shared_hicache
+            else None
+        )
 
         (
             extra_config,
@@ -706,7 +715,44 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
+        if getattr(self, "hicache_host_index", None) is not None:
+            self.hicache_host_index.clear()
         super().reset()
+
+    def _index_hicache_host_node(self, node: TreeNode) -> None:
+        if getattr(self, "hicache_host_index", None) is not None:
+            self.hicache_host_index.index_node(node)
+
+    def _drop_hicache_host_node(self, node: TreeNode, *, locked: bool = False) -> None:
+        if getattr(self, "hicache_host_index", None) is not None:
+            self.hicache_host_index.drop_node(node, locked=locked)
+
+    def _claim_hicache_host_node_for_eviction(self, node: TreeNode) -> bool:
+        if getattr(self, "hicache_host_index", None) is None:
+            return node.host_value is not None and node.host_ref_counter == 0
+        return self.hicache_host_index.claim_unprotected_node_for_eviction(node)
+
+    def lookup_hicache_host_blocks(
+        self, wanted_hashes: set[int], *, protect: bool = False
+    ):
+        if getattr(self, "hicache_host_index", None) is None:
+            return ({}, []) if protect else {}
+        return self.hicache_host_index.lookup(wanted_hashes, protect=protect)
+
+    def insert_shared_hicache_device_blocks(
+        self, *, key: RadixKey, value: torch.Tensor
+    ) -> InsertResult:
+        return self.insert(InsertParams(key=key, value=value, chunked=True))
+
+    def _record_store_event(self, node, medium=None):
+        super()._record_store_event(node, medium=medium)
+        if medium == StorageMedium.CPU:
+            self._index_hicache_host_node(node)
+
+    def _record_remove_event(self, node, medium=None):
+        if medium == StorageMedium.CPU:
+            self._drop_hicache_host_node(node)
+        super()._record_remove_event(node, medium=medium)
 
     def get_height(self, node: TreeNode):
         height = 0
@@ -904,6 +950,22 @@ class HiRadixCache(RadixCache):
                 # write to host if the node is not backuped
                 self.write_backup(node)
 
+    def _count_finished_write_through_acks(self):
+        finish_count = 0
+        for _, finish_event, _ in self.cache_controller.ack_write_queue:
+            if not finish_event.query():
+                break
+            finish_count += 1
+        return finish_count
+
+    def _drain_finished_write_through_acks(self, finish_count):
+        while finish_count > 0:
+            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+            finish_event.synchronize()
+            for ack_id in ack_list:
+                self._finish_write_through_ack(ack_id, release_lock=True)
+            finish_count -= 1
+
     def writing_check(self, write_back=False):
         if write_back:
             # blocking till all write back complete
@@ -916,28 +978,24 @@ class HiRadixCache(RadixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        # NOTE: all ranks has the same ongoing_write_through, can skip sync if empty
-        if len(self.ongoing_write_through) == 0:
+        if self.enable_shared_hicache:
+            self._drain_finished_write_through_acks(
+                self._count_finished_write_through_acks()
+            )
             return
 
-        finish_count = 0
-        if self.pp_rank == 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                if not finish_event.query():
-                    break
-                finish_count += 1
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        if (
+            len(self.ongoing_write_through) == 0
+            and len(self.cache_controller.ack_write_queue) == 0
+        ):
+            return
 
-        if finish_count > 0:
-            logger.debug(f"Process {finish_count} write back operations")
-        while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
-                self._finish_write_through_ack(ack_id, release_lock=True)
-            finish_count -= 1
+        finish_count = self._count_finished_write_through_acks()
+        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        self._all_reduce_attn_groups(queue_size, torch.distributed.ReduceOp.MIN)
+
+        finish_count = int(queue_size.item())
+        self._drain_finished_write_through_acks(finish_count)
 
     def loading_check(self):
         finish_count = 0
@@ -1011,7 +1069,7 @@ class HiRadixCache(RadixCache):
             if node.parent is None:
                 assert (
                     node is self.root_node
-                ), f"This request holds the node from another tree"
+                ), "This request holds the node from another tree"
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -1119,7 +1177,7 @@ class HiRadixCache(RadixCache):
             if not x.evicted:
                 continue
 
-            if x.host_ref_counter > 0:
+            if not self._claim_hicache_host_node_for_eviction(x):
                 continue
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
@@ -1624,6 +1682,9 @@ class HiRadixCache(RadixCache):
 
         if child.backuped:
             self._replace_pending_write_through_node(child, [new_node, child])
+
+        self._index_hicache_host_node(new_node)
+        self._index_hicache_host_node(child)
 
         return new_node
 
