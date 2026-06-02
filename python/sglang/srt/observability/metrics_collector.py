@@ -646,6 +646,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 documentation="Tokens staged by Shared HiCache KV reuse by backend, outcome, and reason code.",
                 labelnames=shared_hicache_labels,
             )
+            self.shared_hicache_staging_tokens_total = Counter(
+                name="sglang:shared_hicache_staging_tokens_total",
+                documentation="Target KV staging tokens planned, granted, or unavailable for Shared HiCache reuse.",
+                labelnames=shared_hicache_labels,
+            )
             self.shared_hicache_wait_seconds = Histogram(
                 name="sglang:shared_hicache_wait_seconds",
                 documentation="Scheduler wait time for Shared HiCache KV reuse in seconds.",
@@ -1226,6 +1231,31 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self.shared_hicache_transfer_bytes_total.labels(**labels).inc(
                 max(0, int(transfer_bytes))
             )
+
+    def observe_shared_hicache_staging(
+        self,
+        *,
+        backend: str,
+        outcome: str,
+        reason: str,
+        tokens: int,
+    ) -> None:
+        staging_tokens_total = getattr(
+            self, "shared_hicache_staging_tokens_total", None
+        )
+        if staging_tokens_total is None:
+            return
+
+        tokens = max(0, int(tokens))
+        if tokens <= 0:
+            return
+        labels = {
+            **self.labels,
+            "backend": backend,
+            "outcome": outcome,
+            "reason_code": _shared_hicache_reason_code(reason),
+        }
+        staging_tokens_total.labels(**labels).inc(tokens)
 
     def observe_shared_hicache_quarantine(
         self,
