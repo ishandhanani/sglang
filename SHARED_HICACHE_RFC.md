@@ -203,17 +203,17 @@ SGLang `f07f09a45`, Dynamo `650ea95c8`:
 - nonzero Shared HiCache request, token, transfer-byte, and cached-token metrics;
 - zero direct-transfer failures and source-transfer timeouts.
 
-### Split Write-Through Event Fix Gate
+### Shared HiCache + Router vs Mooncake Store
 
 SGLang `d33602478`, Dynamo `650ea95c8`:
 
-| Metric | Direct before fix | Direct after fix | Prior Mooncake Store baseline |
-|---|---:|---:|---:|
-| Remote cache-read tokens | 29376 | 46080 | 37728 |
-| Remote target avg latency | 3034.7 ms | 2858.5 ms | 3902.9 ms |
-| Remote target p95 latency | 3496.9 ms | 3373.3 ms | 5462.6 ms |
-| E2E reuse workflow | 10.390 s | 9.723 s | 11.693 s |
-| Direct staged inserts | 32 | 48 | n/a |
+| Metric | Shared HiCache + router | Mooncake Store |
+|---|---:|---:|
+| Remote cache-read tokens | 46080 | 37728 |
+| Remote target avg latency | 2858.5 ms | 3902.9 ms |
+| Remote target p95 latency | 3373.3 ms | 5462.6 ms |
+| E2E reuse workflow | 9.723 s | 11.693 s |
+| Direct staged inserts | 48 | n/a |
 
 Setup:
 
