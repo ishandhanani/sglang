@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 import torch
 
+from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.shared_hicache.source import ResolvedHostPage
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SharedHiCacheDeviceAllocation:
+    device_indices: Optional[torch.Tensor]
+    requested_tokens: int
+    granted_tokens: int
+    available_tokens_before: Optional[int]
+    available_tokens_after_evict: Optional[int] = None
+    evicted_tokens: int = 0
 
 
 class SharedHiCacheTarget:
@@ -45,6 +57,138 @@ class SharedHiCacheTarget:
                 token_count,
             )
         return device_indices
+
+    def alloc_page_aligned_device_indices(
+        self,
+        token_count: int,
+        *,
+        page_size: int,
+        min_token_count: Optional[int] = None,
+    ) -> SharedHiCacheDeviceAllocation:
+        requested_tokens = max(0, int(token_count))
+        min_token_count = page_size if min_token_count is None else min_token_count
+        min_token_count = max(page_size, int(min_token_count))
+
+        available_tokens_before = self.available_device_tokens()
+        if requested_tokens <= 0:
+            return SharedHiCacheDeviceAllocation(
+                device_indices=None,
+                requested_tokens=requested_tokens,
+                granted_tokens=0,
+                available_tokens_before=available_tokens_before,
+            )
+
+        device_indices = self.alloc_device_indices(requested_tokens)
+        if device_indices is not None:
+            return SharedHiCacheDeviceAllocation(
+                device_indices=device_indices,
+                requested_tokens=requested_tokens,
+                granted_tokens=int(device_indices.numel()),
+                available_tokens_before=available_tokens_before,
+            )
+
+        evicted_tokens, available_tokens_after_evict = self._evict_device_tokens(
+            requested_tokens,
+            available_tokens_before=available_tokens_before,
+        )
+        if evicted_tokens > 0:
+            logger.info(
+                "Shared HiCache target staging evicted %d GPU KV tokens requested_tokens=%d available_tokens_before=%s available_tokens_after_evict=%s",
+                evicted_tokens,
+                requested_tokens,
+                available_tokens_before,
+                available_tokens_after_evict,
+            )
+            device_indices = self.alloc_device_indices(requested_tokens)
+            if device_indices is not None:
+                return SharedHiCacheDeviceAllocation(
+                    device_indices=device_indices,
+                    requested_tokens=requested_tokens,
+                    granted_tokens=int(device_indices.numel()),
+                    available_tokens_before=available_tokens_before,
+                    available_tokens_after_evict=available_tokens_after_evict,
+                    evicted_tokens=evicted_tokens,
+                )
+
+        available_tokens = (
+            available_tokens_after_evict
+            if available_tokens_after_evict is not None
+            else available_tokens_before
+        )
+        if available_tokens is None:
+            return SharedHiCacheDeviceAllocation(
+                device_indices=None,
+                requested_tokens=requested_tokens,
+                granted_tokens=0,
+                available_tokens_before=available_tokens_before,
+                available_tokens_after_evict=available_tokens_after_evict,
+                evicted_tokens=evicted_tokens,
+            )
+
+        partial_tokens = min(requested_tokens, available_tokens)
+        partial_tokens = (partial_tokens // page_size) * page_size
+        if partial_tokens < min_token_count:
+            return SharedHiCacheDeviceAllocation(
+                device_indices=None,
+                requested_tokens=requested_tokens,
+                granted_tokens=0,
+                available_tokens_before=available_tokens_before,
+                available_tokens_after_evict=available_tokens_after_evict,
+                evicted_tokens=evicted_tokens,
+            )
+
+        device_indices = self.alloc_device_indices(partial_tokens)
+        if device_indices is None:
+            return SharedHiCacheDeviceAllocation(
+                device_indices=None,
+                requested_tokens=requested_tokens,
+                granted_tokens=0,
+                available_tokens_before=available_tokens_before,
+                available_tokens_after_evict=available_tokens_after_evict,
+                evicted_tokens=evicted_tokens,
+            )
+        return SharedHiCacheDeviceAllocation(
+            device_indices=device_indices,
+            requested_tokens=requested_tokens,
+            granted_tokens=int(device_indices.numel()),
+            available_tokens_before=available_tokens_before,
+            available_tokens_after_evict=available_tokens_after_evict,
+            evicted_tokens=evicted_tokens,
+        )
+
+    def _evict_device_tokens(
+        self,
+        token_count: int,
+        *,
+        available_tokens_before: Optional[int],
+    ) -> tuple[int, Optional[int]]:
+        if available_tokens_before is None or available_tokens_before >= token_count:
+            return 0, available_tokens_before
+
+        try:
+            evict_from_tree_cache(self.tree_cache, token_count)
+        except Exception:
+            logger.debug(
+                "Shared HiCache target staging cache eviction failed",
+                exc_info=True,
+            )
+            return 0, available_tokens_before
+
+        available_tokens_after = self.available_device_tokens()
+        if available_tokens_after is None:
+            return 0, None
+        return max(0, available_tokens_after - available_tokens_before), available_tokens_after
+
+    def available_device_tokens(self) -> Optional[int]:
+        allocator = self.tree_cache.cache_controller.mem_pool_device_allocator
+        available_size = getattr(allocator, "available_size", None)
+        if not callable(available_size):
+            return None
+        try:
+            return max(0, int(available_size()))
+        except Exception:
+            logger.debug("Shared HiCache device allocator availability probe failed")
+            return None
 
     def free_device_indices(self, device_indices: Optional[torch.Tensor]) -> None:
         if device_indices is None:
