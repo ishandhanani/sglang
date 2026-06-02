@@ -2,10 +2,10 @@
 
 ## TLDR
 
-SGLang should expose a **router-initiated KV-cache hint** surface. This allows an external orchestrator (ex. Dynamo router) pass structured cache intent to SGLang without directly manipulating KV-cache internals. SGLang parses the hint, validates it, and lets the scheduler/KV-cache manager decide whether to accept, clip, defer,
+SGLang should expose a **router-initiated KV-cache hint** surface. This allows an external orchestrator (ex. Dynamo router) to pass structured cache intent to SGLang without directly manipulating KV-cache internals. SGLang parses the hint, validates it, and lets the scheduler/KV-cache manager decide whether to accept, clip, defer,
 or ignore it.
 
-Initial hints include:
+Examples of some hints include:
 
 - **Share:** reuse KV from another worker or shared tier.
 - **Prefetch / Onboard:** move likely-needed KV into a hotter tier.
@@ -46,6 +46,8 @@ Tool calls have a wide latency distribution:
 - external service wait: minutes.
 
 The right KV policy depends on that latency. As an example, a long tool call (i.e web-search) could allow for KV for that request to be offloaded until the web-search returns.
+
+![Offload KV until websearch completes](kv1.png)
 
 ## Problem Statement
 
@@ -179,6 +181,8 @@ Use cases:
 This already exists via `SessionCache` and Dynamo uses it for subagent KV cache lifecyle
 When a subagent ends, the router asks SGLang to mark its KV for cleanup and/or demote reusable blocks to HiCache
 instead of leaving everything in GPU until local pressure eventually finds it.
+
+![Evict cache after subagent closes](kv2.png)
 
 ### Demote / Offload
 
