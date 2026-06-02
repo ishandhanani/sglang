@@ -245,4 +245,4 @@ This is intentionally the smallest first hint:
 - it is native to SGLang's HiCache/radix machinery;
 - it leaves scheduler/cache-manager ownership inside SGLang.
 
-Detailed RFC: [Shared HiCache](2026-06-02-shared-hicache-rfc.md).
+Detailed RFC: [Shared HiCache](SHARED_HICACHE_RFC.md).
