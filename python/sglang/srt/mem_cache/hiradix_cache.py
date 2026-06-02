@@ -708,6 +708,53 @@ class HiRadixCache(RadixCache):
         else:
             return {}
 
+    def _track_write_through_node(self, node: TreeNode) -> None:
+        node.write_through_pending_id = node.id
+        self.ongoing_write_through[node.id] = (node, [node])
+
+    def _replace_pending_write_through_node(
+        self, old_node: TreeNode, new_nodes: List[TreeNode]
+    ) -> None:
+        ack_id = old_node.write_through_pending_id
+        if ack_id is None:
+            return
+
+        pending = self.ongoing_write_through.get(ack_id)
+        if pending is None:
+            return
+
+        lock_node, publish_nodes = pending
+        updated_nodes = []
+        replaced = False
+        for node in publish_nodes:
+            if node is old_node:
+                updated_nodes.extend(new_nodes)
+                replaced = True
+            else:
+                updated_nodes.append(node)
+
+        if not replaced:
+            return
+
+        for node in new_nodes:
+            node.write_through_pending_id = ack_id
+        self.ongoing_write_through[ack_id] = (lock_node, updated_nodes)
+
+    def _finish_write_through_ack(self, ack_id: int, *, release_lock: bool) -> None:
+        pending = self.ongoing_write_through.pop(ack_id)
+        lock_node, publish_nodes = pending
+
+        for node in publish_nodes:
+            if node.write_through_pending_id == ack_id:
+                node.write_through_pending_id = None
+            # DMA confirmed -- block is now on host.
+            self._record_store_event(node, medium=StorageMedium.CPU)
+            if self.enable_storage:
+                self.write_backup_storage(node)
+
+        if release_lock:
+            self.dec_lock_ref(lock_node)
+
     def _get_hybrid_storage_attach_kwargs(self) -> dict:
         """Extra kwargs for attach_storage_backend when controller is HybridCacheController."""
         if isinstance(self.cache_controller, HybridCacheController):
