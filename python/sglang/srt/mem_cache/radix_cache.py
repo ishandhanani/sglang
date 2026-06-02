@@ -217,6 +217,8 @@ class TreeNode:
         self.host_ref_counter = 0
         # store the host indices of KV cache
         self.host_value: Optional[torch.Tensor] = None
+        # If a write-through host copy is in flight, this is the ack id that
+        # will publish this node's CPU event after the DMA completes.
         self.write_through_pending_id: Optional[int] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None

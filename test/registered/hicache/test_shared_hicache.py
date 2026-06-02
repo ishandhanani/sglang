@@ -85,6 +85,32 @@ class FakeHostPool:
         return self.pages[int(index)]
 
 
+class FakeDoneEvent:
+    def query(self):
+        return True
+
+    def synchronize(self):
+        pass
+
+
+class FakeWriteThroughController:
+    write_policy = "write_through"
+
+    def __init__(self):
+        self.ack_write_queue = []
+        self.next_host_index = 1000
+
+    def write(self, *, device_indices, node_id, **kwargs):
+        host_indices = torch.arange(
+            self.next_host_index,
+            self.next_host_index + len(device_indices),
+            dtype=torch.int64,
+        )
+        self.next_host_index += len(device_indices)
+        self.ack_write_queue.append((None, FakeDoneEvent(), [node_id]))
+        return host_indices
+
+
 class FakeTree:
     def __init__(self, page_size=2):
         self.page_size = page_size
@@ -346,6 +372,76 @@ class TestSharedHiCache(unittest.TestCase):
 
         cache._record_remove_event(node, medium=StorageMedium.CPU)
         self.assertEqual(cache.lookup_hicache_host_blocks({block_hash}), {})
+
+    def test_hiradix_split_pending_write_through_publishes_cpu_prefix(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.disable = False
+        cache.page_size = 2
+        cache.is_eagle = False
+        cache.enable_storage = False
+        cache.enable_kv_cache_events = True
+        cache.enable_shared_hicache = True
+        cache.hicache_host_index = None
+        cache.cache_controller = FakeWriteThroughController()
+        cache.write_through_threshold = 1
+        cache.ongoing_write_through = {}
+        cache.kv_event_queue = []
+        cache.evictable_size_ = 0
+        cache.protected_size_ = 0
+        cache.evictable_leaves = set()
+        cache.evictable_host_leaves = set()
+        cache.root_node = TreeNode(priority=-10**9)
+        cache.root_node.key = RadixKey(array("q"))
+        cache.root_node.value = []
+        cache.root_node.host_value = []
+        cache.root_node.hash_value = []
+        cache.root_node.lock_ref = 1
+        cache._update_leaf_status = lambda node: None
+        cache._update_host_leaf_status = lambda node: None
+        cache.inc_lock_ref = lambda node: None
+        cache.dec_lock_ref = lambda node: None
+        cache.evict_host = lambda num_tokens: 0
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3, 4])),
+                value=torch.tensor([10, 11, 12, 13], dtype=torch.int64),
+            )
+        )
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 5, 6])),
+                value=torch.tensor([20, 21, 22, 23], dtype=torch.int64),
+            )
+        )
+
+        self.assertEqual(
+            [
+                tuple(event.token_ids)
+                for event in cache.kv_event_queue
+                if event.medium == StorageMedium.CPU
+            ],
+            [],
+        )
+
+        cache._drain_finished_write_through_acks(
+            cache._count_finished_write_through_acks()
+        )
+
+        cpu_events = [
+            event
+            for event in cache.kv_event_queue
+            if event.medium == StorageMedium.CPU
+        ]
+        prefix_hash = cpu_events[0].block_hashes[0]
+        self.assertEqual(
+            [(event.parent_block_hash, tuple(event.token_ids)) for event in cpu_events],
+            [
+                (None, (1, 2)),
+                (prefix_hash, (3, 4)),
+                (prefix_hash, (5, 6)),
+            ],
+        )
 
     def test_hicache_host_index_does_not_claim_protected_node(self):
         node = TreeNode()
