@@ -8,15 +8,16 @@ from typing import Any, Iterable, Mapping, Optional
 
 import numpy as np
 
-from sglang.srt.mem_cache.shared_hicache.transfer import (
-    SharedHiCacheTransferBackend,
-    build_shared_hicache_transfer_notification,
-    shared_hicache_parallel_rejection,
-)
 from sglang.srt.mem_cache.radix_cache import TreeNode
 from sglang.srt.mem_cache.shared_hicache.plan import (
     SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
     SharedHiCachePlan,
+)
+from sglang.srt.mem_cache.shared_hicache.topology import (
+    shared_hicache_parallel_rejection,
+)
+from sglang.srt.mem_cache.shared_hicache.transfer.common import (
+    SharedHiCacheTransferBackend,
 )
 
 logger = logging.getLogger(__name__)
@@ -348,24 +349,18 @@ def _parse_target_kv_metadata(
     if any(length <= 0 or length > uint64_max for length in target_kv_item_lens):
         return None, None, None, "target_kv_item_len_out_of_range"
 
-    expected_item_lens = getattr(transfer_backend, "target_kv_item_lens", None)
-    if expected_item_lens is not None:
-        try:
-            expected_item_lens = [int(length) for length in expected_item_lens]
-        except (TypeError, ValueError):
-            return None, None, None, "local_target_kv_item_lens_invalid"
-        if len(expected_item_lens) != len(target_kv_item_lens):
-            return (
-                None,
-                None,
-                None,
-                "target_kv_item_lens_count_mismatch",
-            )
-        for idx, (expected, actual) in enumerate(
-            zip(expected_item_lens, target_kv_item_lens)
-        ):
-            if expected != actual:
-                return None, None, None, "target_kv_item_lens_mismatch"
+    if len(transfer_backend.target_kv_item_lens) != len(target_kv_item_lens):
+        return (
+            None,
+            None,
+            None,
+            "target_kv_item_lens_count_mismatch",
+        )
+    for expected, actual in zip(
+        transfer_backend.target_kv_item_lens, target_kv_item_lens
+    ):
+        if expected != actual:
+            return None, None, None, "target_kv_item_lens_mismatch"
 
     return target_session_id, target_kv_ptrs, target_kv_item_lens, None
 
@@ -373,11 +368,9 @@ def _parse_target_kv_metadata(
 def parse_source_transfer_request(
     *,
     payload: Mapping[str, Any],
-    transfer_backend: Optional[SharedHiCacheTransferBackend],
+    transfer_backend: SharedHiCacheTransferBackend,
     tree_cache,
 ) -> tuple[Optional[SourceTransferRequest], Optional[Mapping[str, Any]]]:
-    if transfer_backend is None or not getattr(transfer_backend, "enabled", False):
-        return None, {"ok": False, "reason": "direct_transfer_unavailable"}
     if "transfer_backend" not in payload:
         return None, {
             "ok": False,
@@ -553,18 +546,15 @@ def execute_source_transfer_request(
             target_page_indices = np.array(target_page_indices_list, dtype=np.int32)
             transfer_start = time.perf_counter()
             try:
-                notification = build_shared_hicache_transfer_notification(
+                transfer_backend.transfer_pages(
                     transfer_id=request.transfer_id,
                     transferred_blocks=len(pages),
-                    reason=reason,
-                )
-                transfer_backend.transfer_pages(
+                    completion_reason=reason,
                     source_page_indices=source_page_indices,
                     target_page_indices=target_page_indices,
                     target_kv_ptrs=request.target_kv_ptrs,
                     target_kv_item_lens=request.target_kv_item_lens,
                     target_metadata=request.target_metadata,
-                    notification=notification,
                 )
             except Exception as err:
                 transfer_ms = (time.perf_counter() - transfer_start) * 1000

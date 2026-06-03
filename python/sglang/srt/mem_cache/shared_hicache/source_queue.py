@@ -10,7 +10,7 @@ from sglang.srt.mem_cache.shared_hicache.source import (
     execute_source_transfer_request,
     parse_source_transfer_request,
 )
-from sglang.srt.mem_cache.shared_hicache.transfer import (
+from sglang.srt.mem_cache.shared_hicache.transfer.common import (
     SharedHiCacheTransferBackend,
 )
 
@@ -25,7 +25,7 @@ class SharedHiCacheSourceTransferQueue:
         *,
         tree_cache,
         worker_id: Optional[str],
-        transfer_backend: Optional[SharedHiCacheTransferBackend],
+        transfer_backend: SharedHiCacheTransferBackend,
         worker_limit: int,
         send_transfer_done: Callable[[str, Mapping[str, Any]], None],
         tp_rank: int = 0,
@@ -56,23 +56,13 @@ class SharedHiCacheSourceTransferQueue:
         self._transfers: dict[str, Optional[Future]] = {}
         self._prewarm_workers(worker_limit)
 
-    def _direct_transfer_enabled(self) -> bool:
-        transfer_backend = getattr(self, "transfer_backend", None)
-        return transfer_backend is not None and bool(
-            getattr(transfer_backend, "enabled", False)
-        )
-
     def _prewarm_workers(self, worker_limit: int) -> None:
-        transfer_backend = getattr(self, "transfer_backend", None)
-        prepare = getattr(transfer_backend, "prepare_source_worker", None)
-        if not self._direct_transfer_enabled() or not callable(prepare):
-            return
         barrier = threading.Barrier(worker_limit) if int(worker_limit) > 1 else None
 
         def _prepare() -> None:
             if barrier is not None:
                 barrier.wait(timeout=30.0)
-            prepare()
+            self.transfer_backend.prepare_source_worker()
 
         futures = [self._executor.submit(_prepare) for _ in range(int(worker_limit))]
         for future in futures:

@@ -13,7 +13,9 @@ from sglang.srt.mem_cache.shared_hicache.plan import (
     normalize_endpoint,
 )
 from sglang.srt.mem_cache.shared_hicache.source import ResolvedHostPage
-from sglang.srt.mem_cache.shared_hicache.transfer import SharedHiCacheTransferBackend
+from sglang.srt.mem_cache.shared_hicache.transfer.common import (
+    SharedHiCacheTransferBackend,
+)
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
@@ -190,7 +192,7 @@ class SharedHiCacheTargetTransferTracker:
     def __init__(
         self,
         *,
-        transfer_backend: Optional[SharedHiCacheTransferBackend],
+        transfer_backend: SharedHiCacheTransferBackend,
     ):
         self.transfer_backend = transfer_backend
         self._lock = threading.Lock()
