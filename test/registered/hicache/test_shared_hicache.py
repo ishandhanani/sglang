@@ -329,7 +329,7 @@ class TestSharedHiCache(unittest.TestCase):
         unsigned_hash = signed_hash & (2**64 - 1)
 
         plan = SharedHiCachePlan.from_dict(
-            _make_plan([unsigned_hash], engine_block_hashes=[signed_hash])
+            _make_plan([unsigned_hash], engine_block_hashes=[unsigned_hash])
         )
 
         self.assertGreater(unsigned_hash, 2**63 - 1)
