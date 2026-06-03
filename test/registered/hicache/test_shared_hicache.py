@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.shared_hicache.source import (
     execute_source_transfer_request,
     parse_source_transfer_request,
 )
-from sglang.srt.mem_cache.shared_hicache.transfer import (
+from sglang.srt.mem_cache.shared_hicache.transfer.nixl import (
     NixlSharedHiCacheTransferBackend,
 )
 from sglang.srt.mem_cache.utils import hash_str_to_int64
@@ -122,7 +122,6 @@ class FakeTree:
 
 class FakeTransferBackend:
     name = "nixl"
-    enabled = True
     target_session_id = "target-session"
     target_kv_ptrs = [1]
     target_kv_item_lens = [64]

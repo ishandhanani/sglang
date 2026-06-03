@@ -7,9 +7,96 @@ from sglang.srt.mem_cache.shared_hicache.plan import (
     SHARED_HICACHE_PLAN_VERSION,
     SharedHiCachePlan,
 )
-from sglang.srt.mem_cache.shared_hicache.transfer import (
-    shared_hicache_parallel_rejection,
-)
+
+
+def _server_arg(scheduler, name: str, default: int) -> int:
+    server_args = getattr(scheduler, "server_args", None)
+    value = getattr(server_args, name, default)
+    return int(value if value is not None else default)
+
+
+def _parallel_value(scheduler, name: str, default: int) -> int:
+    ps = getattr(scheduler, "ps", None)
+    if ps is not None and hasattr(ps, name):
+        value = getattr(ps, name)
+    else:
+        value = getattr(scheduler, name, default)
+    return int(value if value is not None else default)
+
+
+def scheduler_parallel_metadata(scheduler) -> dict[str, int]:
+    """Return rank metadata needed for same-shape direct reuse."""
+
+    return {
+        "tp_rank": _parallel_value(scheduler, "tp_rank", 0),
+        "tp_size": _parallel_value(
+            scheduler, "tp_size", _server_arg(scheduler, "tp_size", 1)
+        ),
+        "pp_rank": _parallel_value(scheduler, "pp_rank", 0),
+        "pp_size": _parallel_value(
+            scheduler, "pp_size", _server_arg(scheduler, "pp_size", 1)
+        ),
+        "attn_cp_rank": _parallel_value(scheduler, "attn_cp_rank", 0),
+        "attn_cp_size": _parallel_value(
+            scheduler, "attn_cp_size", _server_arg(scheduler, "attn_cp_size", 1)
+        ),
+        "attn_tp_rank": _parallel_value(scheduler, "attn_tp_rank", 0),
+        "attn_tp_size": _parallel_value(
+            scheduler, "attn_tp_size", _server_arg(scheduler, "tp_size", 1)
+        ),
+        "attn_dp_rank": _parallel_value(scheduler, "attn_dp_rank", 0),
+        "attn_dp_size": _parallel_value(
+            scheduler, "attn_dp_size", _server_arg(scheduler, "dp_size", 1)
+        ),
+        "dp_rank": _parallel_value(scheduler, "dp_rank", 0),
+        "dp_size": _parallel_value(
+            scheduler, "dp_size", _server_arg(scheduler, "dp_size", 1)
+        ),
+    }
+
+
+def shared_hicache_parallel_rejection(
+    *,
+    pp_size: int,
+    attn_cp_size: int,
+    attn_dp_size: int = 1,
+    tp_size: Optional[int] = None,
+    attn_tp_size: Optional[int] = None,
+) -> Optional[str]:
+    unsupported = []
+    if pp_size != 1:
+        unsupported.append(f"pp_size={pp_size}")
+    if attn_cp_size != 1:
+        unsupported.append(f"attn_cp_size={attn_cp_size}")
+    if attn_dp_size != 1:
+        unsupported.append(f"attn_dp_size={attn_dp_size}")
+    if (
+        tp_size is not None
+        and attn_tp_size is not None
+        and int(tp_size) != int(attn_tp_size)
+    ):
+        unsupported.append(f"tp_size={tp_size}:attn_tp_size={attn_tp_size}")
+    if unsupported:
+        return (
+            "SharedHiCache direct transfer supports same-shape attention TP, but "
+            "PP/CP/attention-DP "
+            f"are deferred; got {', '.join(unsupported)}"
+        )
+    return None
+
+
+def shared_hicache_topology_rejection_from_scheduler(scheduler) -> Optional[str]:
+    return shared_hicache_parallel_rejection(
+        pp_size=_server_arg(scheduler, "pp_size", 1),
+        attn_cp_size=_server_arg(scheduler, "attn_cp_size", 1),
+        attn_dp_size=_parallel_value(
+            scheduler, "attn_dp_size", _server_arg(scheduler, "dp_size", 1)
+        ),
+        tp_size=_server_arg(scheduler, "tp_size", 1),
+        attn_tp_size=_parallel_value(
+            scheduler, "attn_tp_size", _server_arg(scheduler, "tp_size", 1)
+        ),
+    )
 
 
 @dataclass(frozen=True)

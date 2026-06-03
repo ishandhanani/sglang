@@ -6,7 +6,6 @@ import logging
 import threading
 import time
 import uuid
-from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping, Optional
@@ -18,63 +17,63 @@ from sglang.srt.environ import (
     default_shared_hicache_transfer_parallelism,
     envs,
 )
-from sglang.srt.mem_cache.shared_hicache.config import (
-    shared_hicache_transfer_backend_name,
+from sglang.srt.mem_cache.shared_hicache.topology import scheduler_parallel_metadata
+from sglang.srt.mem_cache.shared_hicache.transfer.common import (
+    SharedHiCacheTransferBackend,
 )
 
 logger = logging.getLogger(__name__)
 
-SHARED_HICACHE_NIXL_NOTIFICATION_PREFIX = "shared_hicache:"
+_SHARED_HICACHE_NIXL_NOTIFICATION_PREFIX = "shared_hicache:"
 
 if TYPE_CHECKING:
     import torch
 
 
-class SharedHiCacheTransferBackend(ABC):
-    name: str
+def _build_completion_notification(
+    *,
+    transfer_id: str,
+    transferred_blocks: int,
+    reason: str,
+) -> str:
+    payload = {
+        "transfer_id": str(transfer_id),
+        "transferred_blocks": int(transferred_blocks),
+        "reason": str(reason),
+    }
+    return _SHARED_HICACHE_NIXL_NOTIFICATION_PREFIX + json.dumps(
+        payload, separators=(",", ":")
+    )
 
-    def __init__(
-        self,
-        *,
-        target_session_id: str,
-        target_kv_ptrs,
-        target_kv_item_lens,
-        parallel_metadata: Optional[Mapping[str, int]] = None,
+
+def _parse_completion_notification(
+    message: bytes | str,
+) -> Optional[tuple[str, int, str]]:
+    if isinstance(message, bytes):
+        try:
+            message = message.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(message, str) or not message.startswith(
+        _SHARED_HICACHE_NIXL_NOTIFICATION_PREFIX
     ):
-        if not getattr(self, "name", None):
-            raise ValueError("SharedHiCache transfer backend must define a name")
-        self.target_session_id = str(target_session_id)
-        self.target_kv_ptrs = [int(ptr) for ptr in target_kv_ptrs]
-        self.target_kv_item_lens = [int(length) for length in target_kv_item_lens]
-        self.parallel_metadata = {
-            key: int(value) for key, value in (parallel_metadata or {}).items()
-        }
-
-    @property
-    @abstractmethod
-    def enabled(self) -> bool: ...
-
-    def target_descriptor(self) -> dict[str, Any]:
-        return {
-            "backend": self.name,
-            "session_id": self.target_session_id,
-            **self.parallel_metadata,
-        }
-
-    @abstractmethod
-    def transfer_pages(
-        self,
-        *,
-        source_page_indices: np.ndarray,
-        target_page_indices: np.ndarray,
-        target_kv_ptrs: list[int],
-        target_kv_item_lens: list[int],
-        target_metadata: Optional[Mapping[str, Any]] = None,
-        notification: Optional[str] = None,
-    ) -> None: ...
-
-    def shutdown(self) -> None:
-        pass
+        return None
+    try:
+        payload = json.loads(message[len(_SHARED_HICACHE_NIXL_NOTIFICATION_PREFIX) :])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    transfer_id = str(payload.get("transfer_id") or "")
+    if not transfer_id:
+        return None
+    try:
+        transferred_blocks = int(payload.get("transferred_blocks", 0))
+    except (TypeError, ValueError):
+        return None
+    if transferred_blocks < 0:
+        return None
+    return transfer_id, transferred_blocks, str(payload.get("reason", "ok"))
 
 
 def _target_kv_pool_from_scheduler(scheduler):
@@ -84,96 +83,6 @@ def _target_kv_pool_from_scheduler(scheduler):
             "SharedHiCache direct transfer does not support hybrid linear-attention KV pools"
         )
     return target_pool
-
-
-def _server_arg(scheduler, name: str, default: int) -> int:
-    server_args = getattr(scheduler, "server_args", None)
-    value = getattr(server_args, name, default)
-    return int(value if value is not None else default)
-
-
-def _parallel_value(scheduler, name: str, default: int) -> int:
-    ps = getattr(scheduler, "ps", None)
-    if ps is not None and hasattr(ps, name):
-        value = getattr(ps, name)
-    else:
-        value = getattr(scheduler, name, default)
-    return int(value if value is not None else default)
-
-
-def scheduler_parallel_metadata(scheduler) -> dict[str, int]:
-    """Return rank metadata needed for same-shape direct reuse."""
-
-    return {
-        "tp_rank": _parallel_value(scheduler, "tp_rank", 0),
-        "tp_size": _parallel_value(
-            scheduler, "tp_size", _server_arg(scheduler, "tp_size", 1)
-        ),
-        "pp_rank": _parallel_value(scheduler, "pp_rank", 0),
-        "pp_size": _parallel_value(
-            scheduler, "pp_size", _server_arg(scheduler, "pp_size", 1)
-        ),
-        "attn_cp_rank": _parallel_value(scheduler, "attn_cp_rank", 0),
-        "attn_cp_size": _parallel_value(
-            scheduler, "attn_cp_size", _server_arg(scheduler, "attn_cp_size", 1)
-        ),
-        "attn_tp_rank": _parallel_value(scheduler, "attn_tp_rank", 0),
-        "attn_tp_size": _parallel_value(
-            scheduler, "attn_tp_size", _server_arg(scheduler, "tp_size", 1)
-        ),
-        "attn_dp_rank": _parallel_value(scheduler, "attn_dp_rank", 0),
-        "attn_dp_size": _parallel_value(
-            scheduler, "attn_dp_size", _server_arg(scheduler, "dp_size", 1)
-        ),
-        "dp_rank": _parallel_value(scheduler, "dp_rank", 0),
-        "dp_size": _parallel_value(
-            scheduler, "dp_size", _server_arg(scheduler, "dp_size", 1)
-        ),
-    }
-
-
-def shared_hicache_parallel_rejection(
-    *,
-    pp_size: int,
-    attn_cp_size: int,
-    attn_dp_size: int = 1,
-    tp_size: Optional[int] = None,
-    attn_tp_size: Optional[int] = None,
-) -> Optional[str]:
-    unsupported = []
-    if pp_size != 1:
-        unsupported.append(f"pp_size={pp_size}")
-    if attn_cp_size != 1:
-        unsupported.append(f"attn_cp_size={attn_cp_size}")
-    if attn_dp_size != 1:
-        unsupported.append(f"attn_dp_size={attn_dp_size}")
-    if (
-        tp_size is not None
-        and attn_tp_size is not None
-        and int(tp_size) != int(attn_tp_size)
-    ):
-        unsupported.append(f"tp_size={tp_size}:attn_tp_size={attn_tp_size}")
-    if unsupported:
-        return (
-            "SharedHiCache direct transfer supports same-shape attention TP, but "
-            "PP/CP/attention-DP "
-            f"are deferred; got {', '.join(unsupported)}"
-        )
-    return None
-
-
-def _direct_topology_rejection(scheduler) -> Optional[str]:
-    return shared_hicache_parallel_rejection(
-        pp_size=_server_arg(scheduler, "pp_size", 1),
-        attn_cp_size=_server_arg(scheduler, "attn_cp_size", 1),
-        attn_dp_size=_parallel_value(
-            scheduler, "attn_dp_size", _server_arg(scheduler, "dp_size", 1)
-        ),
-        tp_size=_server_arg(scheduler, "tp_size", 1),
-        attn_tp_size=_parallel_value(
-            scheduler, "attn_tp_size", _server_arg(scheduler, "tp_size", 1)
-        ),
-    )
 
 
 def _scheduler_gpu_id(scheduler) -> int:
@@ -228,52 +137,6 @@ def _create_nixl_agent(*, transfer_parallelism: int):
             f"NIXL backend {backend!r} not found. Available: {available_plugins}"
         )
     return agent, agent_name, backend
-
-
-def build_shared_hicache_transfer_notification(
-    *,
-    transfer_id: str,
-    transferred_blocks: int,
-    reason: str,
-) -> str:
-    payload = {
-        "transfer_id": str(transfer_id),
-        "transferred_blocks": int(transferred_blocks),
-        "reason": str(reason),
-    }
-    return SHARED_HICACHE_NIXL_NOTIFICATION_PREFIX + json.dumps(
-        payload, separators=(",", ":")
-    )
-
-
-def parse_shared_hicache_transfer_notification(
-    message: bytes | str,
-) -> Optional[tuple[str, int, str]]:
-    if isinstance(message, bytes):
-        try:
-            message = message.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-    if not isinstance(message, str) or not message.startswith(
-        SHARED_HICACHE_NIXL_NOTIFICATION_PREFIX
-    ):
-        return None
-    try:
-        payload = json.loads(message[len(SHARED_HICACHE_NIXL_NOTIFICATION_PREFIX) :])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, Mapping):
-        return None
-    transfer_id = str(payload.get("transfer_id") or "")
-    if not transfer_id:
-        return None
-    try:
-        transferred_blocks = int(payload.get("transferred_blocks", 0))
-    except (TypeError, ValueError):
-        return None
-    if transferred_blocks < 0:
-        return None
-    return transfer_id, transferred_blocks, str(payload.get("reason", "ok"))
 
 
 def _source_host_buf_infos(tree_cache) -> tuple[list[int], list[int]]:
@@ -368,8 +231,6 @@ def _build_grouped_transfer_arrays(
 
 
 def _nixl_req_array(addrs: np.ndarray, lengths: np.ndarray, gpu_id: int) -> np.ndarray:
-    if addrs.size == 0:
-        return np.empty((0, 3), dtype=np.uint64)
     return np.column_stack(
         (
             addrs.astype(np.uint64, copy=False),
@@ -401,7 +262,6 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         tree_cache,
         target_kv_ptrs,
         target_kv_item_lens,
-        target_registered: bool,
         gpu_id: int,
         parallel_metadata: Optional[Mapping[str, int]] = None,
         transfer_parallelism: Optional[int] = None,
@@ -416,8 +276,6 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         self.agent_name = agent_name
         self.backend_name = backend_name
         self.tree_cache = tree_cache
-        self._target_registered = bool(target_registered)
-        self._source_pool_ready = False
         self._source_worker_states: dict[int, _NixlSourceWorkerState] = {}
         self._source_worker_lock = threading.Lock()
         self._target_notification_lock = threading.Lock()
@@ -431,66 +289,39 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         self._shutdown = False
 
     @classmethod
-    def from_scheduler(cls, scheduler) -> Optional["NixlSharedHiCacheTransferBackend"]:
-        server_args = scheduler.server_args
-        backend = shared_hicache_transfer_backend_name(server_args)
-        if backend != "nixl":
-            return None
-        topology_rejection = _direct_topology_rejection(scheduler)
-        if topology_rejection is not None:
-            logger.warning(
-                "SharedHiCache NIXL direct transfer disabled: %s",
-                topology_rejection,
-            )
-            return None
-
-        try:
-            transfer_parallelism = default_shared_hicache_transfer_parallelism()
-            agent, agent_name, backend_name = _create_nixl_agent(
-                transfer_parallelism=transfer_parallelism
-            )
-            target_pool = _target_kv_pool_from_scheduler(scheduler)
-            target_kv_ptrs, target_kv_lens, target_kv_item_lens = (
-                target_pool.get_contiguous_buf_infos()
-            )
-            gpu_id = _scheduler_gpu_id(scheduler)
-            target_descs = agent.register_memory(
-                [
-                    (int(ptr), int(length), gpu_id, "")
-                    for ptr, length in zip(target_kv_ptrs, target_kv_lens)
-                ],
-                "VRAM",
-            )
-            if not target_descs:
-                logger.warning(
-                    "SharedHiCache NIXL disabled: target KV registration failed"
-                )
-                return None
-            transfer = cls(
-                agent=agent,
-                agent_name=agent_name,
-                backend_name=backend_name,
-                tree_cache=scheduler.tree_cache,
-                target_kv_ptrs=target_kv_ptrs,
-                target_kv_item_lens=target_kv_item_lens,
-                target_registered=True,
-                gpu_id=gpu_id,
-                parallel_metadata=scheduler_parallel_metadata(scheduler),
-                transfer_parallelism=transfer_parallelism,
-            )
-            transfer._register_source_host_pool()
-            if transfer.enabled:
-                transfer._log_ready()
-                return transfer
-            transfer.shutdown()
-            return None
-        except Exception:
-            logger.exception("SharedHiCache NIXL direct transfer initialization failed")
-            return None
-
-    @property
-    def enabled(self) -> bool:
-        return self._target_registered and self._source_pool_ready
+    def from_scheduler(cls, scheduler) -> "NixlSharedHiCacheTransferBackend":
+        transfer_parallelism = default_shared_hicache_transfer_parallelism()
+        agent, agent_name, backend_name = _create_nixl_agent(
+            transfer_parallelism=transfer_parallelism
+        )
+        target_pool = _target_kv_pool_from_scheduler(scheduler)
+        target_kv_ptrs, target_kv_lens, target_kv_item_lens = (
+            target_pool.get_contiguous_buf_infos()
+        )
+        gpu_id = _scheduler_gpu_id(scheduler)
+        target_descs = agent.register_memory(
+            [
+                (int(ptr), int(length), gpu_id, "")
+                for ptr, length in zip(target_kv_ptrs, target_kv_lens)
+            ],
+            "VRAM",
+        )
+        if not target_descs:
+            raise RuntimeError("SharedHiCache NIXL target KV registration failed")
+        transfer = cls(
+            agent=agent,
+            agent_name=agent_name,
+            backend_name=backend_name,
+            tree_cache=scheduler.tree_cache,
+            target_kv_ptrs=target_kv_ptrs,
+            target_kv_item_lens=target_kv_item_lens,
+            gpu_id=gpu_id,
+            parallel_metadata=scheduler_parallel_metadata(scheduler),
+            transfer_parallelism=transfer_parallelism,
+        )
+        transfer._validate_source_host_pool()
+        transfer._log_ready()
+        return transfer
 
     def target_descriptor(self) -> dict[str, Any]:
         descriptor = super().target_descriptor()
@@ -519,27 +350,14 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             self._transfer_parallelism,
         )
 
-    def _register_source_host_pool(self) -> None:
+    def _validate_source_host_pool(self) -> None:
         host_pool = self.tree_cache.cache_controller.mem_pool_host
-        if getattr(host_pool, "layout", None) != "layer_first":
-            logger.info(
-                "SharedHiCache NIXL direct transfer disabled for HiCache layout=%s; "
-                "source host pool must be layer_first",
-                getattr(host_pool, "layout", None),
-            )
-            return
         if not hasattr(host_pool, "kv_buffer"):
-            logger.info(
-                "SharedHiCache NIXL direct transfer disabled: no host kv_buffer"
-            )
-            return
-        try:
-            _, source_kv_item_lens = _source_host_buf_infos(self.tree_cache)
-            _validate_kv_item_lens_match(source_kv_item_lens, self.target_kv_item_lens)
-        except RuntimeError as err:
-            logger.info("SharedHiCache NIXL direct transfer disabled: %s", err)
-            return
-        self._source_pool_ready = True
+            raise RuntimeError(
+                "SharedHiCache NIXL direct transfer requires a host kv_buffer"
+        )
+        _, source_kv_item_lens = _source_host_buf_infos(self.tree_cache)
+        _validate_kv_item_lens_match(source_kv_item_lens, self.target_kv_item_lens)
 
     def _create_source_worker_state(self) -> _NixlSourceWorkerState:
         host_pool = self.tree_cache.cache_controller.mem_pool_host
@@ -589,7 +407,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             return state
 
     def prepare_source_worker(self) -> None:
-        if self._shutdown or not self.enabled:
+        if self._shutdown:
             raise RuntimeError("NIXL direct KV transfer backend is not enabled")
         self._source_worker_state()
 
@@ -633,11 +451,8 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
                     )
 
     def _drain_target_notifications_locked(self) -> None:
-        get_new_notifs = getattr(self.agent, "get_new_notifs", None)
-        if not callable(get_new_notifs):
-            return
         try:
-            notif_map = get_new_notifs()
+            notif_map = self.agent.get_new_notifs()
         except Exception:
             logger.debug(
                 "SharedHiCache NIXL target notification poll failed", exc_info=True
@@ -647,7 +462,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             return
         for messages in notif_map.values():
             for message in messages or ():
-                parsed = parse_shared_hicache_transfer_notification(message)
+                parsed = _parse_completion_notification(message)
                 if parsed is None:
                     continue
                 transfer_id, transferred_blocks, reason = parsed
@@ -676,27 +491,26 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
                 expired = self._retired_target_notification_order.popleft()
                 self._retired_target_notifications.discard(expired)
 
-    def _source_host_buf_infos(self) -> tuple[list[int], list[int]]:
-        return _source_host_buf_infos(self.tree_cache)
-
     def transfer_pages(
         self,
         *,
+        transfer_id: str,
+        transferred_blocks: int,
+        completion_reason: str,
         source_page_indices: np.ndarray,
         target_page_indices: np.ndarray,
         target_kv_ptrs: list[int],
         target_kv_item_lens: list[int],
         target_metadata: Optional[Mapping[str, Any]] = None,
-        notification: Optional[str] = None,
     ) -> None:
-        if self._shutdown or not self.enabled:
+        if self._shutdown:
             raise RuntimeError("NIXL direct KV transfer backend is not enabled")
         setup_start = time.perf_counter()
         source_state = self._source_worker_state()
         target_agent_name, target_gpu_id = self._add_remote_target(
             source_state, target_metadata
         )
-        source_kv_ptrs, source_kv_item_lens = self._source_host_buf_infos()
+        source_kv_ptrs, source_kv_item_lens = _source_host_buf_infos(self.tree_cache)
         src_addrs, dst_addrs, lengths, num_blocks = _build_grouped_transfer_arrays(
             source_page_indices=source_page_indices,
             target_page_indices=target_page_indices,
@@ -722,8 +536,12 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             dst_descs,
             target_agent_name,
         ]
-        if notification:
-            xfer_args.append(str(notification).encode("utf-8"))
+        completion_notification = _build_completion_notification(
+            transfer_id=transfer_id,
+            transferred_blocks=transferred_blocks,
+            reason=completion_reason,
+        )
+        xfer_args.append(completion_notification.encode("utf-8"))
         handle = source_state.agent.initialize_xfer(*xfer_args)
         if not handle:
             raise RuntimeError("NIXL direct KV transfer initialization failed")
@@ -746,30 +564,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         if self._shutdown:
             return
         self._shutdown = True
-        self._source_pool_ready = False
         self._source_worker_states = {}
         self._target_notifications = {}
         self._retired_target_notifications = set()
         self._retired_target_notification_order = deque()
-        self._target_registered = False
-
-
-def make_shared_hicache_transfer_backend(
-    scheduler,
-) -> SharedHiCacheTransferBackend:
-    backend = shared_hicache_transfer_backend_name(scheduler.server_args)
-    if backend != "nixl":
-        raise RuntimeError(
-            f"SharedHiCache transfer backend {backend!r} is not supported; "
-            "specify --shared-hicache-transfer-backend nixl"
-        )
-    topology_rejection = _direct_topology_rejection(scheduler)
-    if topology_rejection is not None:
-        raise RuntimeError(topology_rejection)
-
-    transfer = NixlSharedHiCacheTransferBackend.from_scheduler(scheduler)
-    if transfer is None:
-        raise RuntimeError(
-            "SharedHiCache NIXL transfer backend was requested but unavailable"
-        )
-    return transfer

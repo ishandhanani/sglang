@@ -44,12 +44,14 @@ from sglang.srt.mem_cache.shared_hicache.source_queue import (
 from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
 from sglang.srt.mem_cache.shared_hicache.topology import (
     SharedHiCacheTopology,
+    scheduler_parallel_metadata,
     validate_shared_hicache_plan,
 )
 from sglang.srt.mem_cache.shared_hicache.transfer import (
-    SharedHiCacheTransferBackend,
     make_shared_hicache_transfer_backend,
-    scheduler_parallel_metadata,
+)
+from sglang.srt.mem_cache.shared_hicache.transfer.common import (
+    SharedHiCacheTransferBackend,
 )
 
 if TYPE_CHECKING:
@@ -88,7 +90,7 @@ class SharedHiCacheManager:
         tree_cache,
         worker_id: Optional[str],
         parallel_metadata: Optional[Mapping[str, int]] = None,
-        direct_transfer: Optional[SharedHiCacheTransferBackend] = None,
+        direct_transfer: SharedHiCacheTransferBackend,
         metrics_collector=None,
     ):
         self.tree_cache = tree_cache
@@ -102,11 +104,6 @@ class SharedHiCacheManager:
         self.prefetch_stop_policy = getattr(
             server_args, "hicache_storage_prefetch_policy", "timeout"
         )
-        if not getattr(direct_transfer, "enabled", False):
-            raise RuntimeError(
-                "SharedHiCache requires an enabled direct transfer backend; "
-                "specify --shared-hicache-transfer-backend nixl"
-            )
         self.direct_transfer = direct_transfer
         self.metrics_collector = metrics_collector
         self.endpoint = self._local_control_endpoint(config)
@@ -227,7 +224,7 @@ class SharedHiCacheManager:
         )
 
     def _current_backend_label(self) -> str:
-        return str(getattr(self.direct_transfer, "name", "direct"))
+        return self.direct_transfer.name
 
     def _observe_reuse(
         self,
@@ -292,10 +289,6 @@ class SharedHiCacheManager:
             )
 
     def _shutdown_direct_transfer_backend(self) -> None:
-        direct_transfer = getattr(self, "direct_transfer", None)
-        shutdown = getattr(direct_transfer, "shutdown", None)
-        if shutdown is None:
-            return
         lock = getattr(self, "_direct_transfer_shutdown_lock", None)
         if lock is None:
             lock = threading.Lock()
@@ -303,13 +296,10 @@ class SharedHiCacheManager:
         with lock:
             if getattr(self, "_direct_transfer_shutdown_done", False):
                 return
-            shutdown()
+            self.direct_transfer.shutdown()
             self._direct_transfer_shutdown_done = True
 
     def _defer_direct_transfer_shutdown(self) -> None:
-        direct_transfer = getattr(self, "direct_transfer", None)
-        if getattr(direct_transfer, "shutdown", None) is None:
-            return
         if getattr(self, "_direct_transfer_shutdown_deferred", False):
             return
         self._direct_transfer_shutdown_deferred = True
@@ -893,15 +883,8 @@ class SharedHiCacheManager:
         backend = "none"
         bytes_per_page = 0
         if device_indices is not None:
-            direct_transfer = getattr(self, "direct_transfer", None)
-            backend = str(getattr(direct_transfer, "name", "direct"))
-            try:
-                bytes_per_page = sum(
-                    int(length)
-                    for length in getattr(direct_transfer, "target_kv_item_lens", [])
-                )
-            except Exception:
-                bytes_per_page = 0
+            backend = self.direct_transfer.name
+            bytes_per_page = sum(self.direct_transfer.target_kv_item_lens)
         pending = SharedHiCachePendingFetch(
             plan=plan,
             plan_offset=plan_offset,
