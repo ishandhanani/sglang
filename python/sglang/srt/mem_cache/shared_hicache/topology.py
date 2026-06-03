@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import asdict, dataclass
 from typing import Mapping, Optional
 
@@ -8,15 +7,9 @@ from sglang.srt.mem_cache.shared_hicache.plan import (
     SHARED_HICACHE_PLAN_VERSION,
     SharedHiCachePlan,
 )
-from sglang.srt.mem_cache.shared_hicache.service import (
-    endpoint_format_fields,
-    format_control_endpoint,
-)
 from sglang.srt.mem_cache.shared_hicache.transfer import (
     shared_hicache_parallel_rejection,
 )
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -59,56 +52,6 @@ class SharedHiCacheTopology:
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
 
-    def endpoint_format_values(self) -> dict[str, int]:
-        return self.to_dict()
-
-    def format_local_control_endpoint(self, endpoint_spec: object) -> Optional[str]:
-        endpoint = format_control_endpoint(
-            endpoint_spec,
-            self.endpoint_format_values(),
-        )
-        if endpoint is None:
-            return None
-        fields = endpoint_format_fields(endpoint_spec)
-        if self.tp_size > 1 and not fields.intersection({"tp_rank"}):
-            logger.warning(
-                "SharedHiCache source resolver endpoint must include {tp_rank} "
-                "when tp_size=%d; not starting source resolver for this rank",
-                self.tp_size,
-            )
-            return None
-        return endpoint
-
-    def candidate_endpoints_for_plan(self, plan: SharedHiCachePlan) -> list[str]:
-        endpoints: list[str] = []
-
-        def add(endpoint: Optional[str]) -> None:
-            if endpoint and endpoint not in endpoints:
-                endpoints.append(endpoint)
-
-        if plan.source_endpoint:
-            source_tp_rank = (
-                int(plan.source_tp_rank)
-                if plan.source_tp_rank is not None
-                else int(self.tp_rank)
-            )
-            target_tp_rank = (
-                int(plan.target_tp_rank)
-                if plan.target_tp_rank is not None
-                else int(self.tp_rank)
-            )
-            values = self.endpoint_format_values()
-            values.update(
-                {
-                    "source_tp_rank": source_tp_rank,
-                    "source_tp_size": int(plan.source_tp_size),
-                    "target_tp_rank": target_tp_rank,
-                    "target_tp_size": int(self.tp_size),
-                }
-            )
-            add(format_control_endpoint(plan.source_endpoint, values))
-        return endpoints
-
     def validate_target_rank(self, plan: SharedHiCachePlan) -> Optional[str]:
         topology_rejection = shared_hicache_parallel_rejection(
             pp_size=self.pp_size,
@@ -122,8 +65,7 @@ class SharedHiCacheTopology:
 
         if plan.target_tp_size != self.tp_size:
             return (
-                "wrong_target_tp_size:"
-                f"plan={plan.target_tp_size}:local={self.tp_size}"
+                f"wrong_target_tp_size:plan={plan.target_tp_size}:local={self.tp_size}"
             )
         if plan.source_tp_size != self.tp_size:
             return (
@@ -136,10 +78,10 @@ class SharedHiCacheTopology:
             else int(self.tp_rank)
         )
         if int(target_tp_rank) != self.tp_rank:
-            return "wrong_target_tp_rank:" f"plan={target_tp_rank}:local={self.tp_rank}"
+            return f"wrong_target_tp_rank:plan={target_tp_rank}:local={self.tp_rank}"
         source_tp_rank = plan.source_tp_rank
         if source_tp_rank is not None and int(source_tp_rank) != self.tp_rank:
-            return "wrong_source_tp_rank:" f"plan={source_tp_rank}:local={self.tp_rank}"
+            return f"wrong_source_tp_rank:plan={source_tp_rank}:local={self.tp_rank}"
         return None
 
 

@@ -82,7 +82,6 @@ class SharedHiCachePlan:
     request_id: str
     target_worker_id: int
     source_worker_id: int
-    source_endpoint: Optional[str]
     source_medium: str
     block_hashes: tuple[int, ...]
     planned_prefix_blocks: int
@@ -101,6 +100,9 @@ class SharedHiCachePlan:
     def from_dict(cls, data: Mapping[str, Any]) -> "SharedHiCachePlan":
         if not isinstance(data, Mapping):
             raise ValueError("SharedHiCache plan must be a mapping")
+
+        if "source_endpoint" in data:
+            raise ValueError("source_endpoint is not supported; use route registry")
 
         if "block_hashes" not in data:
             raise ValueError("SharedHiCache plan missing block_hashes")
@@ -133,12 +135,6 @@ class SharedHiCachePlan:
         if start_block_index < 0:
             raise ValueError("start_block_index must be non-negative")
 
-        source_endpoint = data.get("source_endpoint")
-        if source_endpoint is not None:
-            if not isinstance(source_endpoint, str) or not source_endpoint.strip():
-                raise ValueError("source_endpoint must be a non-empty string")
-            source_endpoint = normalize_endpoint(source_endpoint)
-
         try:
             plan = cls(
                 plan_id=str(data.get("plan_id", "")),
@@ -149,7 +145,6 @@ class SharedHiCachePlan:
                 source_worker_id=_coerce_int(
                     data["source_worker_id"], "source_worker_id"
                 ),
-                source_endpoint=source_endpoint,
                 source_medium=_canonical_source_medium(data["source_medium"]),
                 block_hashes=block_hashes,
                 planned_prefix_blocks=min(planned_prefix_blocks, len(block_hashes)),

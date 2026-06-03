@@ -2279,7 +2279,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--shared-hicache-config</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON object or JSON file path for Shared HiCache peer-worker CPU_PINNED-&gt;GPU KV reuse. Keys: control, transfer, timeout_secs, transfer_backend. Runtime parallelism is controlled by SGLANG_SHARED_HICACHE_* env vars.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON object or JSON file path for Shared HiCache peer-worker CPU_PINNED-&gt;GPU KV reuse. Required keys: control.host, control.base_port, registry.endpoint. Optional keys: registry.serve, transfer, timeout_secs, transfer_backend. Runtime parallelism is controlled by SGLANG_SHARED_HICACHE_* env vars.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>

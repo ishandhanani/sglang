@@ -1,268 +1,221 @@
-# Shared HiCache
+# Shared HiCache Developer Guide
 
-This folder implements SGLang's Shared HiCache path: reuse KV pages that already
-exist in another SGLang worker's HiCache host tier, then transfer those pages
-directly into the target worker's GPU KV cache.
+Shared HiCache is a default-off path for reusing KV pages that another SGLang
+worker has already written to its HiCache host tier (`CPU_PINNED`). The router
+sends a `cache_hints.shared_hicache` plan; the target validates it, pulls pages
+from the source through NIXL, stages them into GPU KV, then schedules with a
+longer cached prefix.
 
-## Scope
+Core invariant: router plans are hints, not leases. The source revalidates by
+hash at transfer time, and every failure must fall back to ordinary prefill.
 
-- Shared HiCache is opt-in and scheduler-driven.
-- The router provides a reuse plan on the request.
-- The target scheduler decides whether the plan still applies.
-- The source worker revalidates the requested host pages by block hash before
-  transferring.
-- The target inserts transferred device pages into its radix cache only after
-  the transfer completes.
-- Failures are fail-open: a request should continue with normal prefill if
-  shared reuse cannot be completed.
+## Fast Map
 
-Do not treat the router plan as an ownership lease. It is only a hint. The
-source is authoritative at transfer time.
+- `io_struct.py`: parses `cache_hints.shared_hicache` into `SharedHiCachePlan`.
+- `plan.py`: strict plan schema, int normalization, expiry.
+- `topology.py`: target/source worker, TP rank, TP shape, block-size checks.
+- `scheduler_mixin.py`: local-prefix probe, TP MIN reductions, pending rids.
+- `manager.py`: target-side orchestration; currently the main cleanup target.
+- `target.py`: target GPU staging allocation, eviction, quarantine, insert.
+- `source.py`: source request parse, hash lookup, host protection, transfer.
+- `source_queue.py`: bounded source transfer worker pool.
+- `control.py` / `service.py`: JSON ZMQ transfer path and `/route` registry.
+- `transfer.py`: NIXL backend and transfer-agent setup.
 
-## Main Files
+Do not collapse the small files back into `manager.py`. If cleaning up, move
+pending target lifecycle out of `manager.py` instead.
 
-- `config.py`: config parsing and environment defaults.
-- `plan.py`: `SharedHiCachePlan` parsing, validation, and serialization.
-- `scheduler_mixin.py`: scheduler entry point for plan resolution and
-  target-side reuse preparation.
-- `manager.py`: main orchestration object used by the scheduler.
-- `source.py`: source-side plan validation, host lookup, host-page protection,
-  and transfer execution.
-- `target.py`: target-side device allocation, transfer staging, and radix-cache
-  insertion.
-- `transfer.py`: direct-transfer backend abstraction and NIXL implementation.
-- `service.py`: source-side async transfer worker service.
-- `control.py`: target/source control-plane messages and transfer-handle glue.
-- `pending.py`: pending target transfer state and timeout helpers.
-
-## Router To Engine Walkthrough
-
-Roles:
-
-- Router: external request router that knows which workers have advertised
-  host-tier KV blocks.
-- Target worker: the SGLang worker selected to serve the request now.
-- Source worker: the SGLang worker that may still have the wanted blocks in its
-  HiCache host tier.
-
-High-level flow:
+## Request Flow
 
 ```text
-client request
-  |
-  v
 router
-  |  chooses target worker
-  |  attaches cache_hints.shared_hicache:
-  |    source_worker_id, target_worker_id, block hashes, TP shape, expiry
-  v
-target engine frontend / tokenizer path
-  |
-  v
-target scheduler waiting queue
-  |
-  v
-target SharedHiCache manager
-  |  validates plan and current local prefix
-  |  allocates target GPU KV pages
-  |  sends async transfer request to source TP rank
-  v
-source SharedHiCache service
-  |  revalidates plan, rank, expiry, and host block hashes
-  |  decides whether it can serve now
-  |  protects source host nodes only if it will transfer
-  |  performs NIXL host-to-target-GPU transfer
-  v
-target SharedHiCache manager
-  |  receives completion notification
-  |  validates transferred hash sequence
-  |  inserts transferred pages into target radix cache
-  |  schedules request using the extended prefix
-  v
-model forward on target worker
+  -> request.cache_hints.shared_hicache
+  -> io_struct.py: SharedHiCachePlan
+  -> scheduler_mixin.py: normal local prefix first, TP MIN sync
+  -> manager.py: validate plan, resolve source route, allocate staging, submit
+  -> service.py/source_queue.py: source worker receives async ZMQ request
+  -> source.py: validate rank/hash, protect host pages, call NIXL transfer
+  -> transfer.py: source HostPinned pages -> target GPU KV pages
+  -> control.py/manager.py: target observes completion
+  -> target.py: insert staged pages into HiRadix
+  -> req.shared_hicache_hit_length extends cached prefix
 ```
 
-Detailed lifecycle:
+If a request times out, gets a source reject, cannot allocate staging, or fails
+insert validation, clear/drop the plan and continue prefill.
 
-1. The router receives a client request and computes block hashes for the
-   request prefix.
-2. The router picks a target worker for the request.
-3. If another worker has useful host-tier blocks, the router attaches
-   `cache_hints.shared_hicache` to the engine request. This is a hint, not a
-   lease.
-4. The SGLang engine API normalizes `cache_hints.shared_hicache` into the
-   internal `SharedHiCachePlan` carried by scheduler request objects.
-5. The target scheduler runs normal local prefix matching first.
-6. The target scheduler asks Shared HiCache to prepare extra prefix blocks only
-   for the remaining suffix beyond the local device/host hit.
-7. The target manager validates that the plan names this worker as target, that
-   the TP shape/rank is compatible, that the block size matches the local page
-   size, and that the plan has not expired.
-8. The target reserves GPU KV indices for the planned suffix. These indices are
-   not visible to the radix cache yet.
-9. The target sends a JSON transfer request to the source control endpoint for
-   the matching TP rank. The request includes target session metadata, target KV
-   pointers, target page indices, and the original plan.
-10. The source service receives the request on its per-rank async worker.
-11. The source revalidates source worker id, source/target TP rank, plan expiry,
-    block size, and the requested block hashes against the current HiCache host
-    block index.
-12. The source may reject without pinning if blocks are missing, the request is
-    malformed, topology/rank ownership is wrong, or source policy says it should
-    not serve now.
-13. If the source accepts, it protects the matched host nodes with
-    `TreeNode.protect_host()`. Host eviction must not free those pages while the
-    direct transfer is in flight.
-14. The source transfer backend copies pages from source host memory into the
-    target GPU KV pages and sends a completion notification to the target.
-15. The source releases host protection in a `finally` path after transfer
-    completion or failure.
-16. The target observes transfer completion, validates that returned pages are
-    contiguous and match the expected hashes, then inserts the target KV indices
-    into the radix cache.
-17. If insertion succeeds, `req.shared_hicache_hit_length` is updated and the
-    scheduler uses the longer prefix for model forward.
-18. If any step fails, the target frees or quarantines reserved GPU KV indices,
-    records a miss/error metric, and the request continues with normal prefill.
+## Enable It
 
-Source admission rule:
+Requires hierarchical cache:
 
-- Source is authoritative at transfer time.
-- Source can say no even if the router hint said it probably had the blocks.
-- Once source says yes and starts transfer, it must keep the accepted host pages
-  protected until transfer finishes or fails.
+```bash
+--enable-hierarchical-cache
+```
 
-## Request Lifecycle
+Enable Shared HiCache:
 
-1. The scheduler receives a request with a Shared HiCache plan.
-2. `scheduler_mixin.py` computes the current local prefix and calls the manager.
-3. `manager.py` validates plan shape, TP ownership, block alignment, local cache
-   state, and available transfer backend.
-4. The target reserves target GPU KV indices through `SharedHiCacheTarget`.
-5. The target submits a source transfer request through the control plane.
-6. `service.py` runs source transfer work asynchronously.
-7. `source.py` revalidates source worker id, TP rank, plan expiry, block size,
-   and host block hashes.
-8. Source host nodes are protected while host page indices are resolved and the
-   transfer is in flight.
-9. `transfer.py` copies source host pages into target GPU KV pages.
-10. The target receives completion, validates contiguous hashes, inserts pages
-    into the radix cache, and records metrics.
-11. On any failure, reserved target indices are freed or quarantined depending
-    on whether transfer outcome is known.
+```bash
+--shared-hicache-config /path/to/shared_hicache_config.json
+```
 
-## Pinning And Lifetime
+Config shape:
 
-There are two separate lifetime windows:
+```json
+{
+  "worker_id": 1,
+  "control": {"host": "10.0.0.11", "base_port": 41000},
+  "registry": {"endpoint": "http://10.0.0.11:40999", "serve": true},
+  "transfer": {"backend": "nixl"},
+  "timeout_secs": 1.0
+}
+```
 
-- Router plan to source transfer:
-  - No pin is held.
-  - The plan can become stale.
-  - The source must revalidate block hashes and fail open on misses.
+Useful envs:
 
-- Source lookup to transfer completion:
-  - Source host pages are protected with `TreeNode.protect_host()`.
-  - HiCache host eviction skips nodes whose `host_ref_counter > 0`.
-  - Protection is released with `TreeNode.release_host()` in a `finally` path.
+```bash
+SGLANG_SHARED_HICACHE_FETCH_WORKERS=4
+SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM=8
+SGLANG_SHARED_HICACHE_NIXL_TELEMETRY=false
+```
 
-Use `lookup_hicache_host_blocks(..., protect=True)` when resolving source host
-blocks for direct transfer. Do not read host indices from the host block index
-without protecting the owning nodes.
+Every rank binds `tcp://<control.host>:<control.base_port + tp_rank>` and
+registers `(worker_id, tp_rank) -> endpoint` in the registry. Set
+`registry.serve=true` on exactly one worker config, normally source rank 0.
 
-## Control Plane
+## Plan Requirements
 
-Control endpoints are `tcp://` endpoints with `{tp_rank}` expansion. Each TP
-rank owns its own source-transfer worker service and transfer backend.
+Minimum useful `cache_hints.shared_hicache` fields:
 
-Expected target-to-source request fields include:
+```json
+{
+  "target_worker_id": 2,
+  "source_worker_id": 1,
+  "source_medium": "CPU_PINNED",
+  "block_hashes": [111, 222],
+  "kv_block_hashes": [111, 222],
+  "planned_prefix_blocks": 2,
+  "block_size_tokens": 64,
+  "expires_at_ms": 1760000010000,
+  "source_tp_rank": 0,
+  "source_tp_size": 4,
+  "target_tp_rank": 0,
+  "target_tp_size": 4
+}
+```
 
-- `transfer_id`
-- `target_control_endpoint`
-- `transfer_backend`
-- `plan`
-- `start_block`
-- `max_blocks`
-- `target_session_id`
-- `target_kv_ptrs`
-- `target_kv_item_lens`
-- `target_page_indices`
-- `target_metadata`
+Rules that matter in practice:
 
-Payloads must stay JSON-serializable. Do not send Python objects over the
-control plane.
+- `source_medium` must be `CPU_PINNED`.
+- Source endpoints are never carried in plans; targets use the route registry.
+- `block_size_tokens` must equal the local HiRadix page size.
+- `source_worker_id != target_worker_id`.
+- TP rank/size must match local topology.
+- `kv_block_hashes`, when present, must match `block_hashes` length.
+- Batched requests need a `cache_hints` list matching batch size.
+- `parallel_sample_num > 1` with Shared HiCache hints is rejected.
 
-## Plan Semantics
+## Target Staging
 
-`SharedHiCachePlan` is block-based. Important fields:
+Allocation order:
 
-- `source_worker_id`
-- `target_worker_id`
-- `block_hashes`
-- `kv_block_hashes`
-- `planned_prefix_blocks`
-- `block_size_tokens`
-- `source_tp_rank`
-- `source_tp_size`
-- `target_tp_rank`
-- `target_tp_size`
-- `start_block_index`
-- `expires_at`
+1. Full page-aligned staging allocation.
+2. Evict ordinary target GPU KV and retry full allocation.
+3. Stage largest page-aligned suffix that fits.
+4. If nothing fits, drop the plan and prefill normally.
 
-Rank fields may be omitted only when the plan is rank-generic and the local
-rank can safely infer ownership. Explicit rank mismatches must reject.
+Page cleanup:
 
-Always compare transferred pages against the expected planned hashes before
-inserting them into the target radix cache.
+- Known no-write failure: free target device indices.
+- Timeout / maybe-inflight transfer: quarantine target device indices.
+- Insert failure after possible write: quarantine unless known safe to free.
 
-## Metrics
+## Source Lifetime
 
-Metrics are enabled through the scheduler metrics gate. Do not create an
-independent metrics path for this feature.
+Before source lookup, the plan can be stale and no pin is held.
 
-Important labels:
+During transfer:
 
-- `backend`: current transfer backend, usually `nixl`.
-- `outcome`: `hit`, `miss`, `skip`, or `error`.
-- `reason_code`: detailed reason such as `ok`, `insert_returned_zero`,
-  `missing_first_block`, `target_staging_alloc_failed`, `fetch_worker_unavailable`,
-  `source_endpoint_unavailable`, or timeout/error codes.
-- `tp_rank`: local TP rank.
+- Resolve host pages through the protected lookup path.
+- Protect nodes with `TreeNode.protect_host()`.
+- Release with `TreeNode.release_host()` in `finally`.
+- Never transfer from host-index entries without protecting owner nodes.
 
-Successful Shared HiCache transfer hits use:
+## Host Event Gotcha
+
+Do not publish HostPinned CPU events before write-through DMA ack. Routers treat
+those events as source visibility.
+
+Keep this regression test:
 
 ```text
-outcome="hit", reason_code="ok"
+test_hiradix_split_pending_write_through_publishes_cpu_prefix
 ```
 
-## Development Rules
+It protects the pending write-through split case:
 
-- Keep this path fail-open.
-- Revalidate all router-provided plan data at the source.
-- Keep control-plane payloads typed and JSON-compatible.
-- Preserve TP-rank ownership checks.
-- Do not block the HTTP request path on source transfer execution.
-- Do not hold source host protection longer than the transfer needs.
-- Free target device indices on known failures.
-- Quarantine target device indices when direct-transfer outcome is
-  indeterminate.
-- Keep source and target cleanup idempotent.
-- Prefer focused runtime validation over broad synthetic tests for this feature.
+```text
+pending host-backed node splits
+  -> ack drains
+  -> publish prefix fragment and both suffix fragments
+```
 
-## Validation Checklist
+Do not replace this with early CPU event publication or split-time DMA drains.
 
-For functional validation, check:
+## Validate Locally
 
-- Source phase completes without HTTP errors.
-- Target phase completes without HTTP errors.
-- Frontend logs have no `no endpoints available` during load.
-- Source logs show `SharedHiCache NIXL transferred`.
-- Target logs show `Shared HiCache staged ... direct=True`.
-- `sglang:cached_tokens_total{cache_source="shared_hicache"}` is nonzero.
-- `sglang:shared_hicache_tokens_total` is nonzero with
-  `outcome="hit", reason_code="ok"`.
-- No `direct_transfer_failed`, transfer timeout, source timeout, queue-full, or
-  rank-rejection logs are present.
-- GPU memory returns to idle after cleanup.
+```bash
+python3 -m pytest test/registered/hicache/test_shared_hicache.py -q
+python3 -m compileall -q \
+  python/sglang/srt/mem_cache/shared_hicache \
+  python/sglang/srt/mem_cache/hicache_host_index.py \
+  python/sglang/srt/mem_cache/hiradix_cache.py \
+  python/sglang/srt/mem_cache/radix_cache.py \
+  test/registered/hicache/test_shared_hicache.py
+git diff --check
+rg -n "G2[p]lus|g2[p]lus|Remote[G]2|remote_[g]2|remote_[w]2" python docs docs_new test
+```
 
-For launch scripts, readiness must prove a pinned request can route. A
-successful `/v1/models` response alone is not sufficient.
+Key tests cover plan parsing, batched hints, TP convergence, source reject
+paths, host protection, staging/eviction/partial allocation, quarantine, and the
+split write-through event fix.
+
+## Runtime Proof
+
+A `/v1/models` response only proves the server started. Real proof needs:
+
+- source logs: `SharedHiCache NIXL transferred`
+- target logs: `Shared HiCache staged`
+- nonzero `cached_tokens_details.shared_hicache` when requested
+- nonzero `sglang:cached_tokens_total{cache_source="shared_hicache"}`
+- nonzero `sglang:shared_hicache_tokens_total{outcome="hit",reason_code="ok"}`
+- no `target_staging_alloc_failed`, transfer timeout, queue-full, rank reject,
+  or direct-transfer failure logs
+
+## Debug First
+
+No hits:
+
+- Was hierarchical cache enabled on both workers?
+- Is Shared HiCache enabled and is `worker_id` set?
+- Did the target request actually include `cache_hints.shared_hicache`?
+- Is the plan expired?
+- Do source/target worker ids and TP ranks match reality?
+- Does the source have HostPinned events for the requested hash chain?
+
+Source request missing:
+
+- Did every source rank register with the route registry?
+- Is the registry endpoint reachable from target to source?
+- Are ZMQ TCP ports reachable from target to source?
+
+Target falls back:
+
+- Check staging counters first.
+- Check hash mismatch / non-contiguous page rejection logs.
+- Check quarantine counters for timeout or maybe-inflight transfers.
+
+Perf looks bad:
+
+- First prove effective reuse with cached-token and staging metrics.
+- Then inspect transfer setup/wait time.
+- Do not tune NIXL tail before proving source visibility and target staging.
