@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.shared_hicache.source import (
     execute_source_transfer_request,
     parse_source_transfer_request,
 )
+from sglang.srt.mem_cache.shared_hicache.topology import SharedHiCacheTopology
 from sglang.srt.mem_cache.shared_hicache.transfer.nixl import (
     NixlSharedHiCacheTransferBackend,
 )
@@ -224,19 +225,13 @@ def _make_manager():
     manager = SharedHiCacheManager.__new__(SharedHiCacheManager)
     manager.worker_id = "target-worker"
     manager.tree_cache = FakeTree(page_size=2)
-    manager._set_parallel_metadata(
-        {
-            "tp_rank": 1,
-            "tp_size": 2,
-            "pp_rank": 0,
-            "pp_size": 1,
-            "attn_cp_rank": 0,
-            "attn_cp_size": 1,
-            "attn_tp_rank": 1,
-            "attn_tp_size": 2,
-            "attn_dp_rank": 0,
-            "attn_dp_size": 1,
-        }
+    manager._set_topology(
+        SharedHiCacheTopology(
+            tp_rank=1,
+            tp_size=2,
+            attn_tp_rank=1,
+            attn_tp_size=2,
+        )
     )
     return manager
 
@@ -262,7 +257,7 @@ class TestSharedHiCache(unittest.TestCase):
         )
 
         manager = SharedHiCacheManager.__new__(SharedHiCacheManager)
-        manager._set_parallel_metadata({"tp_rank": 3, "tp_size": 4})
+        manager._set_topology(SharedHiCacheTopology(tp_rank=3, tp_size=4))
         self.assertEqual(
             manager._local_control_endpoint(config),
             "tcp://127.0.0.1:39003",
@@ -545,9 +540,7 @@ class TestSharedHiCache(unittest.TestCase):
             transfer_backend=FakeTransferBackend(),
             tree_cache=FakeTree(),
             worker_id="source-worker",
-            tp_rank=0,
-            tp_size=2,
-            attn_tp_size=2,
+            topology=SharedHiCacheTopology(tp_rank=0, tp_size=2, attn_tp_size=2),
         )
 
         self.assertFalse(response["ok"])
