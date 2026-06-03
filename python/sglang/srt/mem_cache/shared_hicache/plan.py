@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
-from sglang.srt.mem_cache.utils import block_hash_aliases
 
 SHARED_HICACHE_PLAN_VERSION = 1
 SHARED_HICACHE_DIRECT_TIMEOUT_REASON = "source_transfer_timeout_maybe_inflight"
@@ -80,13 +79,6 @@ def _coerce_array(value: Any, field_name: str) -> list[Any]:
 
 def _coerce_block_hash(value: Any) -> int:
     return _coerce_int(value, "block_hash")
-
-
-def expand_block_hash_aliases(values: Iterable[int]) -> set[int]:
-    aliases: set[int] = set()
-    for value in values:
-        aliases.update(block_hash_aliases(value))
-    return aliases
 
 
 @dataclass(frozen=True)
