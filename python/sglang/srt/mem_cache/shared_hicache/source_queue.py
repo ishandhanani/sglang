@@ -45,6 +45,21 @@ class SharedHiCacheSourceTransferQueue:
         self._capacity = threading.BoundedSemaphore(max(8, worker_limit * 2))
         self._lock = threading.Lock()
         self._transfers: dict[str, Optional[Future]] = {}
+        self._prewarm_workers(worker_limit)
+
+    def _prewarm_workers(self, worker_limit: int) -> None:
+        barrier = threading.Barrier(worker_limit) if worker_limit > 1 else None
+
+        def _prepare() -> None:
+            if barrier is not None:
+                barrier.wait(timeout=30.0)
+            # NIXL source-worker registration can exceed the target transfer
+            # timeout; do it before requests can enter the transfer queue.
+            self.transfer_backend.prepare_source_worker()
+
+        futures = [self._executor.submit(_prepare) for _ in range(worker_limit)]
+        for future in futures:
+            future.result(timeout=30.0)
 
     def active_count(self) -> int:
         with self._lock:
