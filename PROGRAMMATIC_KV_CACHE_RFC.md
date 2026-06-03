@@ -2,8 +2,7 @@
 
 ## TLDR
 
-SGLang should expose a **router-initiated KV-cache hint** surface. This allows an external orchestrator (ex. Dynamo router) to pass structured cache intent to SGLang without directly manipulating KV-cache internals. SGLang parses the hint, validates it, and lets the scheduler/KV-cache manager decide whether to accept, clip, defer,
-or ignore it.
+SGLang should expose a **router-initiated KV-cache hint** surface. This allows an external orchestrator (ex. Dynamo router) to pass structured cache intent to SGLang without directly manipulating KV-cache internals. SGLang parses the hint, validates it, and lets the scheduler/KV-cache manager decide whether to accept, clip, defer, or ignore it.
 
 Examples of some hints include:
 
@@ -15,8 +14,13 @@ Examples of some hints include:
 - **Session Lifecycle:** tag subagent/session KV and handle close-time cleanup
   or demotion.
 
-The first concrete implementation is Shared HiCache.The Dynamo router sends `cache_hints.shared_hicache`, and SGLang uses native
-HiCache/radix machinery to pull source `CPU_PINNED` KV into target `GPU` KV.
+The first concrete implementation is Shared HiCache. The Dynamo router sends
+`cache_hints.shared_hicache`, and SGLang uses native HiCache/radix machinery to
+pull source `CPU_PINNED` KV into target `GPU` KV. The hint carries logical cache
+identity and block hashes; concrete transport routes are runtime configuration,
+not request payload. This implementation provides the API surface needed for
+future hints because the machinery to move KV natively between workers will be
+present.
 
 ## Motivation
 

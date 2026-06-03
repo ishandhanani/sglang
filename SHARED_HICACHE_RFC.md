@@ -54,7 +54,6 @@ Dynamo sends Shared HiCache through the generic `cache_hints` envelope:
       "request_id": "request-id",
       "target_worker_id": 2,
       "source_worker_id": 1,
-      "source_endpoint": "tcp://source-host:port",
       "source_medium": "CPU_PINNED",
       "block_hashes": [123, 456, 789],
       "kv_block_hashes": [123, 456, 789],
@@ -72,7 +71,11 @@ Dynamo sends Shared HiCache through the generic `cache_hints` envelope:
 }
 ```
 
-SGLang normalizes this into `SharedHiCachePlan`.
+SGLang normalizes this into `SharedHiCachePlan`. The plan intentionally does
+not carry concrete source endpoints. Source endpoints are discovered through a
+runtime route registry keyed by `(worker_id, tp_rank)`, matching the
+disaggregation architecture where routing metadata is owned by engine runtime
+configuration rather than by request hints.
 
 Strict validation:
 
@@ -80,6 +83,7 @@ Strict validation:
 - batched requests must provide one hint object per request;
 - `parallel_sample_num > 1` is rejected;
 - integer fields must be actual integers;
+- stale `source_endpoint` payloads are rejected;
 - `source_medium` must be `CPU_PINNED`;
 - target worker id must match local worker id;
 - source and target workers must differ;
@@ -95,16 +99,18 @@ Strict validation:
 5. A later request arrives.
 6. Dynamo chooses worker B as target and attaches cache_hints.shared_hicache.
 7. Worker B validates the plan and probes local prefix coverage.
-8. Worker B allocates page-aligned target GPU KV staging pages.
-9. Worker B sends a ZMQ transfer request to worker A.
-10. Worker A resolves block hashes to live HiCache host pages.
-11. Worker A protects source host pages against eviction.
-12. Worker A uses NIXL to write source host pages into target GPU pages.
-13. Worker B receives completion notification.
-14. Worker B verifies contiguous expected block hashes.
-15. Worker B inserts staged GPU pages into the local radix cache.
-16. Worker B schedules the request with a longer cached prefix.
-17. Worker A releases source host protection.
+8. Worker B resolves Worker A's source TP route from the Shared HiCache route
+   registry.
+9. Worker B allocates page-aligned target GPU KV staging pages.
+10. Worker B sends a ZMQ transfer request to Worker A.
+11. Worker A resolves block hashes to live HiCache host pages.
+12. Worker A protects source host pages against eviction.
+13. Worker A uses NIXL to write source host pages into target GPU pages.
+14. Worker B receives completion notification.
+15. Worker B verifies contiguous expected block hashes.
+16. Worker B inserts staged GPU pages into the local radix cache.
+17. Worker B schedules the request with a longer cached prefix.
+18. Worker A releases source host protection.
 ```
 
 ## Source-Side Contract
@@ -163,7 +169,7 @@ Shared HiCache is fail-open for normal misses:
 - no hint -> local behavior;
 - invalid hint -> local behavior;
 - expired plan -> local behavior;
-- source endpoint unavailable -> local behavior;
+- source route unavailable -> local behavior;
 - source missing pages -> local behavior;
 - source cannot protect pages -> local behavior;
 - target staging allocation unavailable -> local behavior;
@@ -179,14 +185,34 @@ SGLang flags:
 
 ```bash
 --enable-shared-hicache
+--shared-hicache-config /path/to/shared_hicache_config.json
+```
+
+Config shape:
+
+```json
+{
+  "worker_id": 1,
+  "control": {"host": "10.0.0.11", "base_port": 41000},
+  "registry": {"endpoint": "http://10.0.0.11:40999", "serve": true},
+  "transfer": {"backend": "nixl"},
+  "timeout_secs": 1.0
+}
 ```
 
 Rules:
 
 - Shared HiCache requires `--enable-hierarchical-cache`.
 - Worker id is explicit.
+- Every rank binds `tcp://<control.host>:<control.base_port + tp_rank>`.
+- Every rank registers `(worker_id, tp_rank) -> endpoint` in the route registry.
+- Set `registry.serve=true` on exactly one worker config in the process group,
+  normally source rank 0.
 - The supported source medium is `CPU_PINNED`.
 - Runtime parallelism is controlled by `SGLANG_SHARED_HICACHE_*` env vars.
+- High source-transfer worker counts such as
+  `SGLANG_SHARED_HICACHE_FETCH_WORKERS=8` require sufficient memlock for NIXL/UCX
+  registration. The validated 4K fetch8 gate used inherited unlimited memlock.
 
 ## Current Validation
 
@@ -229,6 +255,31 @@ Setup:
 - zero direct-transfer failures, source-transfer timeouts, staging allocation
   failures, transfer timeouts, or tracebacks.
 
+### Route Registry Hard Cut
+
+SGLang PR branch `97888421d`, Dynamo `650ea95c8` plus adapter-side
+`source_endpoint` removal:
+
+- removed request-carried `source_endpoint` and `{tp_rank}` endpoint templating;
+- route lookup now uses `(worker_id, tp_rank)` through the Shared HiCache
+  registry;
+- focused SGLang pytest: `23 passed`;
+- MiniMax-M2.7 TP4 exact-4096 gate on TRY-67676:
+  - cold target: `12/12` HTTP 200, avg `5760.02 ms`, p95 `7381.59 ms`;
+  - source populate: `12/12` HTTP 200;
+  - source write: `12/12` HTTP 200;
+  - remote target: `12/12` HTTP 200, avg `2980.13 ms`, p95 `3437.19 ms`;
+  - remote target cache-read: `46080`;
+  - remote-vs-cold speedup: `48.26%` avg latency, `53.44%` p95 latency;
+  - `56` NIXL transfer logs, `48` direct staged inserts;
+  - zero direct-transfer failures, source-transfer timeouts, transfer timeouts,
+    queue-full logs, or tracebacks.
+
+The failed 2026-06-02 rerun was traced to benchmark environment drift: fetch8
+without inherited unlimited memlock. With
+`sudo prlimit --pid <shell-pid> --memlock=unlimited:unlimited`, the same
+route-registry hard cut passed.
+
 ## Current PR Shape
 
 Major implementation surfaces:
@@ -243,6 +294,8 @@ Major implementation surfaces:
   `python/sglang/srt/mem_cache/shared_hicache/source.py`;
 - NIXL transfer:
   `python/sglang/srt/mem_cache/shared_hicache/transfer.py`;
+- control plane and route registry:
+  `python/sglang/srt/mem_cache/shared_hicache/service.py`;
 - manager/orchestration:
   `python/sglang/srt/mem_cache/shared_hicache/manager.py`;
 - metrics: `python/sglang/srt/observability/metrics_collector.py`;
