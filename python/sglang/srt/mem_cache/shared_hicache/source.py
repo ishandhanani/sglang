@@ -134,38 +134,40 @@ def resolve_host_page_locations(
     if start_block < 0 or max_blocks <= 0:
         return [], "empty_request", []
 
-    identity_hashes = plan.planned_hashes
-    kv_hashes = plan.planned_kv_block_hashes or identity_hashes
-    if start_block >= len(identity_hashes):
+    router_hashes = plan.planned_router_block_hashes
+    engine_hashes = plan.planned_engine_block_hashes
+    if start_block >= len(router_hashes):
         return [], "already_local", []
 
-    requested_identity_hashes = identity_hashes[start_block : start_block + max_blocks]
-    requested_kv_hashes = kv_hashes[start_block : start_block + max_blocks]
+    requested_router_hashes = router_hashes[start_block : start_block + max_blocks]
+    requested_engine_hashes = engine_hashes[start_block : start_block + max_blocks]
     entries: list[tuple[int, TreeNode, int]] = []
     block_index, protected_nodes, lookup_error = _lookup_hicache_host_blocks(
-        tree_cache, set(requested_kv_hashes)
+        tree_cache, set(requested_engine_hashes)
     )
     if lookup_error is not None:
         return [], lookup_error, protected_nodes
 
     protected_ids = {node.id for node in protected_nodes}
     reason = "ok"
-    for identity_hash, kv_hash in zip(requested_identity_hashes, requested_kv_hashes):
-        entry = _host_block_entry(block_index, kv_hash)
+    for router_hash, engine_hash in zip(
+        requested_router_hashes, requested_engine_hashes
+    ):
+        entry = _host_block_entry(block_index, engine_hash)
         if entry is None:
             reason = "partial" if entries else "missing_first_block"
             break
         node, page_idx, _ = entry
         if node.id not in protected_ids:
             return [], "unprotected_hicache_host_lookup", protected_nodes
-        entries.append((identity_hash, node, page_idx))
+        entries.append((router_hash, node, page_idx))
 
     pages = [
         ResolvedHostPageLocation(
-            block_hash=identity_hash,
+            block_hash=router_hash,
             host_index=host_index,
         )
-        for (identity_hash, _, _), host_index in zip(
+        for (router_hash, _, _), host_index in zip(
             entries,
             _host_page_start_indices(entries, tree_cache.page_size),
         )
@@ -404,7 +406,7 @@ def parse_source_transfer_request(
         plan = SharedHiCachePlan.from_dict(payload["plan"])
         start_block = _coerce_int(payload.get("start_block", 0), "start_block")
         max_blocks = _coerce_int(
-            payload.get("max_blocks", len(plan.block_hashes)), "max_blocks"
+            payload.get("max_blocks", len(plan.router_block_hashes)), "max_blocks"
         )
     except (KeyError, ValueError) as err:
         return None, {

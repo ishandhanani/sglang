@@ -8,7 +8,6 @@ from sglang.srt.environ import envs
 
 
 class SharedHiCacheTransferBackendType(str, Enum):
-    AUTO = "auto"
     NIXL = "nixl"
 
 
@@ -31,10 +30,11 @@ class SharedHiCacheConfig:
         object.__setattr__(self, "transfer_backend", backend)
 
 
-def shared_hicache_transfer_backend_name(server_args, default: str = "auto") -> str:
-    return str(
-        getattr(server_args, "shared_hicache_transfer_backend", None) or default
-    ).lower()
+def shared_hicache_transfer_backend_name(server_args) -> str:
+    backend = getattr(server_args, "shared_hicache_transfer_backend", None)
+    if backend is None:
+        return ""
+    return str(backend).strip().lower()
 
 
 def shared_hicache_timeout_secs() -> float:
@@ -72,7 +72,7 @@ def normalize_shared_hicache_server_config(
     worker_id: Optional[str],
     host: str,
     bootstrap_port: Optional[int],
-    transfer_backend: str,
+    transfer_backend: Optional[str],
     enable_hierarchical_cache: bool,
 ) -> tuple[bool, Optional[str], Optional[SharedHiCacheConfig]]:
     if not enable_shared_hicache:
@@ -88,7 +88,11 @@ def normalize_shared_hicache_server_config(
         bootstrap_port, "shared_hicache_bootstrap_port"
     )
 
-    transfer_backend_name = str(transfer_backend or "auto").lower()
+    if transfer_backend is None or not str(transfer_backend).strip():
+        raise ValueError(
+            "--enable-shared-hicache requires --shared-hicache-transfer-backend nixl"
+        )
+    transfer_backend_name = str(transfer_backend).strip().lower()
     if transfer_backend_name not in SHARED_HICACHE_TRANSFER_BACKEND_CHOICES:
         raise ValueError(
             "shared_hicache_transfer_backend must be one of "
