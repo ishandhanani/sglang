@@ -714,7 +714,6 @@ class ServerArgs:
     enable_shared_hicache: bool = False
     shared_hicache_worker_id: Optional[str] = None
     shared_hicache_bootstrap_port: Optional[int] = None
-    shared_hicache_timeout_secs: float = 1.0
     shared_hicache_transfer_backend: str = "auto"
     shared_hicache_config: Optional[SharedHiCacheConfig] = None
 
@@ -4070,7 +4069,6 @@ class ServerArgs:
             worker_id=self.shared_hicache_worker_id,
             host=self.host,
             bootstrap_port=self.shared_hicache_bootstrap_port,
-            timeout_secs=self.shared_hicache_timeout_secs,
             transfer_backend=self.shared_hicache_transfer_backend,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
         )

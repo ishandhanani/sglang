@@ -1765,7 +1765,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
-            _release_shared_hicache_request=self._release_shared_hicache_request,
+            release_shared_hicache_request=self.release_shared_hicache_request,
         )
 
     def init_req_max_new_tokens(self, req):
@@ -2253,7 +2253,7 @@ class Scheduler(
                     self.tree_cache.release_aborted_request(candidate_req.rid)
                 elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
-                self._release_shared_hicache_request(candidate_req.rid)
+                self.release_shared_hicache_request(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -2271,7 +2271,7 @@ class Scheduler(
         )
         if req_to_abort.time_stats is not None:
             req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
-        self._release_shared_hicache_request(req_to_abort.rid)
+        self.release_shared_hicache_request(req_to_abort.rid)
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
@@ -2286,7 +2286,7 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
-                self._release_shared_hicache_request(req.rid)
+                self.release_shared_hicache_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -3667,7 +3667,7 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self._release_shared_hicache_request(req.rid)
+            self.release_shared_hicache_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
