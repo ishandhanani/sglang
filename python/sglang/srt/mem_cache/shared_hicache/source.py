@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional
 
 import numpy as np
-import torch
 
 from sglang.srt.mem_cache.shared_hicache.transfer import (
     SharedHiCacheTransferBackend,
@@ -26,14 +25,11 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class ResolvedHostPage:
     block_hash: int
-    hash_value: str
-    data: bytes
 
 
 @dataclass(frozen=True)
 class ResolvedHostPageLocation:
     block_hash: int
-    hash_value: str
     host_index: int
 
 
@@ -51,11 +47,6 @@ class SourceTransferRequest:
     target_tp_rank: Optional[int]
     target_tp_size: Optional[int]
     target_page_indices: list[int]
-
-
-def _tensor_to_bytes(tensor: torch.Tensor) -> bytes:
-    tensor = tensor.detach().cpu().contiguous()
-    return tensor.view(torch.uint8).numpy().tobytes()
 
 
 def _lookup_hicache_host_blocks(
@@ -80,11 +71,11 @@ def _host_block_entry(
 
 
 def _host_page_start_indices(
-    entries: list[tuple[int, str, TreeNode, int]], page_size: int
+    entries: list[tuple[int, TreeNode, int]], page_size: int
 ) -> list[int]:
     host_indices = [0] * len(entries)
     grouped_entries: dict[int, tuple[TreeNode, list[tuple[int, int]]]] = {}
-    for output_idx, (_, _, node, page_idx) in enumerate(entries):
+    for output_idx, (_, node, page_idx) in enumerate(entries):
         group = grouped_entries.get(node.id)
         if group is None:
             grouped_entries[node.id] = (node, [(output_idx, page_idx)])
@@ -98,39 +89,6 @@ def _host_page_start_indices(
             host_indices[output_idx] = int(host_index)
 
     return host_indices
-
-
-def resolve_host_pages(
-    tree_cache,
-    plan: SharedHiCachePlan,
-    *,
-    start_block: int,
-    max_blocks: int,
-    worker_id: Optional[str],
-) -> tuple[list[ResolvedHostPage], str]:
-    pages, reason, protected_nodes = resolve_host_page_locations(
-        tree_cache,
-        plan,
-        start_block=start_block,
-        max_blocks=max_blocks,
-        worker_id=worker_id,
-    )
-    try:
-        resolved = [
-            ResolvedHostPage(
-                block_hash=page.block_hash,
-                hash_value=page.hash_value,
-                data=_tensor_to_bytes(
-                    tree_cache.cache_controller.mem_pool_host.get_data_page(
-                        page.host_index, flat=True
-                    )
-                ),
-            )
-            for page in pages
-        ]
-        return resolved, reason
-    finally:
-        release_protected_host_nodes(protected_nodes)
 
 
 def resolve_host_page_locations(
@@ -183,7 +141,7 @@ def resolve_host_page_locations(
 
     requested_identity_hashes = identity_hashes[start_block : start_block + max_blocks]
     requested_kv_hashes = kv_hashes[start_block : start_block + max_blocks]
-    entries: list[tuple[int, str, TreeNode, int]] = []
+    entries: list[tuple[int, TreeNode, int]] = []
     block_index, protected_nodes, lookup_error = _lookup_hicache_host_blocks(
         tree_cache, set(requested_kv_hashes)
     )
@@ -197,18 +155,17 @@ def resolve_host_page_locations(
         if entry is None:
             reason = "partial" if entries else "missing_first_block"
             break
-        node, page_idx, hash_value = entry
+        node, page_idx, _ = entry
         if node.id not in protected_ids:
             return [], "unprotected_hicache_host_lookup", protected_nodes
-        entries.append((identity_hash, hash_value, node, page_idx))
+        entries.append((identity_hash, node, page_idx))
 
     pages = [
         ResolvedHostPageLocation(
             block_hash=identity_hash,
-            hash_value=hash_value,
             host_index=host_index,
         )
-        for (identity_hash, hash_value, _, _), host_index in zip(
+        for (identity_hash, _, _), host_index in zip(
             entries,
             _host_page_start_indices(entries, tree_cache.page_size),
         )

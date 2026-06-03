@@ -95,4 +95,4 @@ def transfer_bytes_for_pages(
     bytes_per_page = int(getattr(pending, "bytes_per_page", 0) or 0)
     if bytes_per_page > 0:
         return len(pages) * bytes_per_page
-    return sum(len(page.data) for page in pages)
+    return 0

@@ -23,10 +23,8 @@ from sglang.srt.mem_cache.shared_hicache.scheduler_mixin import (
     SharedHiCachePrepareStatus,
 )
 from sglang.srt.mem_cache.shared_hicache.source import (
-    ResolvedHostPage,
     execute_source_transfer_request,
     parse_source_transfer_request,
-    resolve_host_pages,
 )
 from sglang.srt.mem_cache.shared_hicache.transfer import (
     NixlSharedHiCacheTransferBackend,
@@ -75,15 +73,6 @@ class FakeDeviceAllocator:
         return 1_000_000
 
 
-class FakeHostPool:
-    def __init__(self):
-        self.pages = {}
-
-    def get_data_page(self, index, flat=True):
-        assert flat
-        return self.pages[int(index)]
-
-
 class FakeDoneEvent:
     def query(self):
         return True
@@ -118,7 +107,6 @@ class FakeTree:
         self.root_node.key = RadixKey(array("q"))
         self.device_allocator = FakeDeviceAllocator()
         self.cache_controller = SimpleNamespace(
-            mem_pool_host=FakeHostPool(),
             mem_pool_device_allocator=self.device_allocator,
         )
         self.token_to_kv_pool_allocator = self.device_allocator
@@ -474,71 +462,6 @@ class TestSharedHiCache(unittest.TestCase):
                 (prefix_hash, (5, 6)),
             ],
         )
-
-    def test_source_resolves_protected_hicache_host_pages(self):
-        kv_hash = hash_str_to_int64("aa" * 32)
-        identity_hash = 123
-        node = TreeNode()
-        node.host_value = torch.tensor([100, 102], dtype=torch.int64)
-        tree = FakeTree(page_size=2)
-        tree.cache_controller.mem_pool_host.pages[100] = torch.tensor(
-            [1, 2, 3, 4], dtype=torch.uint8
-        )
-
-        def lookup(wanted_hashes, *, protect=False):
-            self.assertEqual(set(wanted_hashes), {kv_hash})
-            self.assertTrue(protect)
-            node.protect_host()
-            return {kv_hash: (node, 0, "aa" * 32)}, [node]
-
-        tree.lookup_hicache_host_blocks = lookup
-        plan = SharedHiCachePlan.from_dict(
-            _make_plan([identity_hash], kv_block_hashes=[kv_hash])
-        )
-
-        pages, reason = resolve_host_pages(
-            tree,
-            plan,
-            start_block=0,
-            max_blocks=1,
-            worker_id="source-worker",
-        )
-
-        self.assertEqual(reason, "ok")
-        self.assertEqual(
-            pages, [ResolvedHostPage(identity_hash, "aa" * 32, bytes([1, 2, 3, 4]))]
-        )
-        self.assertEqual(node.host_ref_counter, 0)
-
-    def test_source_rejects_unprotected_hicache_host_lookup(self):
-        kv_hash = hash_str_to_int64("aa" * 32)
-        identity_hash = 123
-        node = TreeNode()
-        node.host_value = torch.tensor([100, 102], dtype=torch.int64)
-        node.hash_value = ["aa" * 32]
-        tree = FakeTree(page_size=2)
-
-        def lookup(wanted_hashes, *, protect=False):
-            self.assertEqual(set(wanted_hashes), {kv_hash})
-            self.assertTrue(protect)
-            return {kv_hash: (node, 0, "aa" * 32)}, []
-
-        tree.lookup_hicache_host_blocks = lookup
-        plan = SharedHiCachePlan.from_dict(
-            _make_plan([identity_hash], kv_block_hashes=[kv_hash])
-        )
-
-        pages, reason = resolve_host_pages(
-            tree,
-            plan,
-            start_block=0,
-            max_blocks=1,
-            worker_id="source-worker",
-        )
-
-        self.assertEqual(pages, [])
-        self.assertEqual(reason, "unprotected_hicache_host_lookup")
-        self.assertEqual(node.host_ref_counter, 0)
 
     def test_source_transfer_rejects_wrong_tp_rank_metadata(self):
         plan = SharedHiCachePlan.from_dict(
