@@ -9,10 +9,23 @@ from sglang.srt.disaggregation.kv_events import StorageMedium
 SHARED_HICACHE_PLAN_VERSION = 1
 SHARED_HICACHE_DIRECT_TIMEOUT_REASON = "source_transfer_timeout_maybe_inflight"
 SHARED_HICACHE_SOURCE_MEDIUM = StorageMedium.CPU.value
+_SIGNED_INT64_MAX = 2**63 - 1
+_UINT64_MAX = 2**64 - 1
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _engine_hash_for_source_lookup(value: Any) -> int:
+    value = int(value)
+    if value > _SIGNED_INT64_MAX:
+        if value > _UINT64_MAX:
+            raise ValueError("engine_block_hashes must fit in uint64")
+        # SGLang KV events and the source host index use signed int64 hashes.
+        # Dynamo can still serialize that same bit pattern as u64 over JSON.
+        value -= 2**64
+    return value
 
 
 @dataclass(frozen=True)
@@ -57,7 +70,10 @@ class SharedHiCachePlan:
         # (same representation, algorithm, and parent-chaining semantics), this
         # source-lookup field can collapse into router_block_hashes.
         try:
-            engine_block_hashes = tuple(int(item) for item in data["engine_block_hashes"])
+            engine_block_hashes = tuple(
+                _engine_hash_for_source_lookup(item)
+                for item in data["engine_block_hashes"]
+            )
         except KeyError as err:
             raise ValueError("SharedHiCache plan missing engine_block_hashes") from err
         except (TypeError, ValueError) as err:
