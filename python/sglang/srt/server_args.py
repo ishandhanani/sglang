@@ -59,6 +59,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     parse_cuda_graph_config_arg,
 )
 from sglang.srt.mem_cache.shared_hicache.config import (
+    SHARED_HICACHE_TRANSFER_BACKEND_CHOICES,
     SharedHiCacheConfig,
     normalize_shared_hicache_server_config,
 )
@@ -711,8 +712,11 @@ class ServerArgs:
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
     enable_shared_hicache: bool = False
-    shared_hicache_worker_id: Optional[int] = None
-    shared_hicache_config: Optional[Union[str, Dict[str, Any], SharedHiCacheConfig]] = None
+    shared_hicache_worker_id: Optional[str] = None
+    shared_hicache_bootstrap_port: Optional[int] = None
+    shared_hicache_timeout_secs: float = 1.0
+    shared_hicache_transfer_backend: str = "auto"
+    shared_hicache_config: Optional[SharedHiCacheConfig] = None
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -4063,8 +4067,11 @@ class ServerArgs:
             self.shared_hicache_config,
         ) = normalize_shared_hicache_server_config(
             enable_shared_hicache=self.enable_shared_hicache,
-            raw_config=self.shared_hicache_config,
             worker_id=self.shared_hicache_worker_id,
+            host=self.host,
+            bootstrap_port=self.shared_hicache_bootstrap_port,
+            timeout_secs=self.shared_hicache_timeout_secs,
+            transfer_backend=self.shared_hicache_transfer_backend,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
         )
         self.shared_hicache_worker_id = worker_id

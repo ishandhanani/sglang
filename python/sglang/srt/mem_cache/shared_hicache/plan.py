@@ -43,6 +43,12 @@ def _coerce_int(value: Any, field_name: str) -> int:
     raise ValueError(f"{field_name} must be an integer, got {value!r}")
 
 
+def _coerce_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value.strip()
+
+
 def _coerce_optional_int(value: Any, field_name: str) -> Optional[int]:
     if value is None:
         return None
@@ -54,6 +60,13 @@ def _coerce_positive_int(value: Any, field_name: str) -> int:
     if value <= 0:
         raise ValueError(f"{field_name} must be positive")
     return value
+
+
+def _coerce_port(value: Any, field_name: str) -> int:
+    port = _coerce_int(value, field_name)
+    if port <= 0 or port > 65535:
+        raise ValueError(f"{field_name} must be in [1, 65535]")
+    return port
 
 
 def _coerce_array(value: Any, field_name: str) -> list[Any]:
@@ -80,8 +93,10 @@ def expand_block_hash_aliases(values: Iterable[int]) -> set[int]:
 class SharedHiCachePlan:
     plan_id: str
     request_id: str
-    target_worker_id: int
-    source_worker_id: int
+    target_worker_id: str
+    source_worker_id: str
+    source_host: str
+    source_bootstrap_port: int
     source_medium: str
     block_hashes: tuple[int, ...]
     planned_prefix_blocks: int
@@ -102,7 +117,9 @@ class SharedHiCachePlan:
             raise ValueError("SharedHiCache plan must be a mapping")
 
         if "source_endpoint" in data:
-            raise ValueError("source_endpoint is not supported; use route registry")
+            raise ValueError(
+                "source_endpoint is not supported; use source_host/source_bootstrap_port"
+            )
 
         if "block_hashes" not in data:
             raise ValueError("SharedHiCache plan missing block_hashes")
@@ -139,11 +156,16 @@ class SharedHiCachePlan:
             plan = cls(
                 plan_id=str(data.get("plan_id", "")),
                 request_id=str(data.get("request_id", "")),
-                target_worker_id=_coerce_int(
+                target_worker_id=_coerce_string(
                     data["target_worker_id"], "target_worker_id"
                 ),
-                source_worker_id=_coerce_int(
+                source_worker_id=_coerce_string(
                     data["source_worker_id"], "source_worker_id"
+                ),
+                source_host=_coerce_string(data["source_host"], "source_host"),
+                source_bootstrap_port=_coerce_port(
+                    data["source_bootstrap_port"],
+                    "source_bootstrap_port",
                 ),
                 source_medium=_canonical_source_medium(data["source_medium"]),
                 block_hashes=block_hashes,

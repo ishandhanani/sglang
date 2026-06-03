@@ -460,8 +460,10 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-return-hidden-states` | Enable returning hidden states with responses. | `False` | bool flag (set to enable) |
 | `--enable-return-routed-experts` | Enable returning routed experts of each layer with responses. | `False` | bool flag (set to enable) |
 | `--enable-shared-hicache` | Enable Shared HiCache CPU-pinned KV cache sharing between workers. | `False` | bool flag (set to enable) |
-| `--shared-hicache-worker-id` | Explicit Shared HiCache worker id for prefix-warmup plans. | `None` | Type: int |
-| `--shared-hicache-config` | JSON object or JSON file path for Shared HiCache peer-worker CPU_PINNED->GPU KV reuse. Required keys: control.host, control.base_port, registry.endpoint. Optional keys: registry.serve, transfer, timeout_secs, transfer_backend. Runtime parallelism is controlled by SGLANG_SHARED_HICACHE_* env vars. | `None` | Type: str |
+| `--shared-hicache-worker-id` | Explicit Shared HiCache worker id for standalone launches. Dynamo sets this from its endpoint connection id. | `None` | Type: str |
+| `--shared-hicache-bootstrap-port` | Base port for this worker's Shared HiCache ZMQ control endpoints; TP rank adds its rank to this port. | `None` | Type: int |
+| `--shared-hicache-timeout-secs` | Timeout in seconds for Shared HiCache control-plane requests. | `1.0` | Type: float |
+| `--shared-hicache-transfer-backend` | Shared HiCache direct transfer backend. | `auto` | `auto`, `nixl` |
 | `--scheduler-recv-interval` | The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this. | `1` | Type: int |
 | `--numa-node` | Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess. | `None` | List[int] |
 | `--enable-deterministic-inference` | Enable deterministic inference mode with batch invariant ops. | `False` | bool flag (set to enable) |
