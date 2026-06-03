@@ -273,8 +273,6 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         self.agent_name = agent_name
         self.backend_name = backend_name
         self.tree_cache = tree_cache
-        self._source_worker_states: dict[int, _NixlSourceWorkerState] = {}
-        self._source_worker_lock = threading.Lock()
         self._target_notification_lock = threading.Lock()
         self._target_notifications: dict[str, tuple[int, str]] = {}
         self._retired_target_notifications: set[str] = set()
@@ -390,25 +388,10 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             backend_name=backend_name,
         )
 
-    def _source_worker_state(self) -> _NixlSourceWorkerState:
-        thread_id = threading.get_ident()
-        with self._source_worker_lock:
-            state = self._source_worker_states.get(thread_id)
-        if state is not None:
-            return state
-
-        state = self._create_source_worker_state()
-        with self._source_worker_lock:
-            existing = self._source_worker_states.get(thread_id)
-            if existing is not None:
-                return existing
-            self._source_worker_states[thread_id] = state
-            return state
-
-    def prepare_source_worker(self) -> None:
+    def create_source_worker(self):
         if self._shutdown:
             raise RuntimeError("NIXL direct KV transfer backend is not enabled")
-        self._source_worker_state()
+        return _NixlSourceTransferWorker(self, self._create_source_worker_state())
 
     def _add_remote_target(
         self,
@@ -504,8 +487,34 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
     ) -> None:
         if self._shutdown:
             raise RuntimeError("NIXL direct KV transfer backend is not enabled")
+        self._transfer_pages_from_state(
+            self._create_source_worker_state(),
+            transfer_id=transfer_id,
+            transferred_blocks=transferred_blocks,
+            completion_reason=completion_reason,
+            source_page_indices=source_page_indices,
+            target_page_indices=target_page_indices,
+            target_kv_ptrs=target_kv_ptrs,
+            target_kv_item_lens=target_kv_item_lens,
+            target_metadata=target_metadata,
+        )
+
+    def _transfer_pages_from_state(
+        self,
+        source_state: _NixlSourceWorkerState,
+        *,
+        transfer_id: str,
+        transferred_blocks: int,
+        completion_reason: str,
+        source_page_indices: np.ndarray,
+        target_page_indices: np.ndarray,
+        target_kv_ptrs: list[int],
+        target_kv_item_lens: list[int],
+        target_metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        if self._shutdown:
+            raise RuntimeError("NIXL direct KV transfer backend is not enabled")
         setup_start = time.perf_counter()
-        source_state = self._source_worker_state()
         target_agent_name, target_gpu_id = self._add_remote_target(
             source_state, target_metadata
         )
@@ -563,7 +572,40 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         if self._shutdown:
             return
         self._shutdown = True
-        self._source_worker_states = {}
         self._target_notifications = {}
         self._retired_target_notifications = set()
         self._retired_target_notification_order = deque()
+
+
+class _NixlSourceTransferWorker:
+    def __init__(
+        self,
+        owner: NixlSharedHiCacheTransferBackend,
+        state: _NixlSourceWorkerState,
+    ):
+        self._owner = owner
+        self._state = state
+
+    def transfer_pages(
+        self,
+        *,
+        transfer_id: str,
+        transferred_blocks: int,
+        completion_reason: str,
+        source_page_indices: np.ndarray,
+        target_page_indices: np.ndarray,
+        target_kv_ptrs: list[int],
+        target_kv_item_lens: list[int],
+        target_metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self._owner._transfer_pages_from_state(
+            self._state,
+            transfer_id=transfer_id,
+            transferred_blocks=transferred_blocks,
+            completion_reason=completion_reason,
+            source_page_indices=source_page_indices,
+            target_page_indices=target_page_indices,
+            target_kv_ptrs=target_kv_ptrs,
+            target_kv_item_lens=target_kv_item_lens,
+            target_metadata=target_metadata,
+        )

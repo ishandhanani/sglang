@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
 from sglang.srt.mem_cache.shared_hicache.source import (
+    SourceTransferRequest,
     execute_source_transfer_request,
     parse_source_transfer_request,
 )
@@ -16,6 +18,13 @@ from sglang.srt.mem_cache.shared_hicache.transfer.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _SourceTransferJob:
+    transfer_id: str
+    target_endpoint: str
+    request: SourceTransferRequest
 
 
 class SharedHiCacheSourceTransferQueue:
@@ -38,39 +47,127 @@ class SharedHiCacheSourceTransferQueue:
         self.topology = topology
 
         worker_limit = max(1, int(worker_limit))
-        self._executor = ThreadPoolExecutor(
-            max_workers=worker_limit,
-            thread_name_prefix=f"shared_hicache-source-xfer-tp{self.topology.tp_rank}",
-        )
+        self._jobs: queue.Queue[Optional[_SourceTransferJob]] = queue.Queue()
         self._capacity = threading.BoundedSemaphore(max(8, worker_limit * 2))
         self._lock = threading.Lock()
-        self._transfers: dict[str, Optional[Future]] = {}
-        self._prewarm_workers(worker_limit)
+        self._transfers: set[str] = set()
+        self._shutdown = False
+        self._workers: list[threading.Thread] = []
 
-    def _prewarm_workers(self, worker_limit: int) -> None:
-        barrier = threading.Barrier(worker_limit) if worker_limit > 1 else None
+        ready: queue.Queue[Optional[BaseException]] = queue.Queue()
+        for index in range(worker_limit):
+            thread = threading.Thread(
+                target=self._worker_loop,
+                args=(index, ready),
+                daemon=True,
+                name=(
+                    "shared_hicache-source-xfer-"
+                    f"tp{self.topology.tp_rank}-{index}"
+                ),
+            )
+            thread.start()
+            self._workers.append(thread)
 
-        def _prepare() -> None:
-            if barrier is not None:
-                barrier.wait(timeout=30.0)
-            # NIXL source-worker registration can exceed the target transfer
-            # timeout; do it before requests can enter the transfer queue.
-            self.transfer_backend.prepare_source_worker()
+        for _ in self._workers:
+            error = ready.get()
+            if error is not None:
+                self.shutdown(wait=False, cancel_futures=True)
+                raise RuntimeError(
+                    "SharedHiCache source transfer worker failed to initialize"
+                ) from error
 
-        futures = [self._executor.submit(_prepare) for _ in range(worker_limit)]
-        for future in futures:
-            future.result(timeout=30.0)
+    def _worker_loop(
+        self,
+        index: int,
+        ready: queue.Queue[Optional[BaseException]],
+    ) -> None:
+        try:
+            # NIXL source contexts are thread-owned; initialize before serving jobs.
+            source_worker = self.transfer_backend.create_source_worker()
+        except BaseException as err:
+            ready.put(err)
+            return
+
+        logger.info(
+            "SharedHiCache source transfer worker ready tp_rank=%d worker_index=%d",
+            self.topology.tp_rank,
+            index,
+        )
+        ready.put(None)
+
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                self._jobs.task_done()
+                return
+            self._run_job(job, source_worker)
+            self._jobs.task_done()
+
+    def _run_job(self, job: _SourceTransferJob, source_worker) -> None:
+        response: Mapping[str, Any]
+        try:
+            response = dict(
+                execute_source_transfer_request(
+                    request=job.request,
+                    transfer_backend=source_worker,
+                    tree_cache=self.tree_cache,
+                    worker_id=self.worker_id,
+                    topology=self.topology,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "SharedHiCache source transfer job failed transfer_id=%s",
+                job.transfer_id,
+            )
+            response = {
+                "ok": False,
+                "reason": "source_transfer_exception",
+                "transferred_blocks": 0,
+                "block_size_tokens": self.tree_cache.page_size,
+            }
+        response = dict(response)
+        response["transfer_id"] = job.transfer_id
+        try:
+            self.send_transfer_done(
+                job.target_endpoint or job.request.target_control_endpoint, response
+            )
+        except Exception:
+            logger.exception(
+                "SharedHiCache source transfer completion send failed transfer_id=%s",
+                job.transfer_id,
+            )
+        finally:
+            self._capacity.release()
+            with self._lock:
+                self._transfers.discard(job.transfer_id)
 
     def active_count(self) -> int:
         with self._lock:
-            return sum(
-                1
-                for future in self._transfers.values()
-                if future is not None and not future.done()
-            )
+            return len(self._transfers)
 
     def shutdown(self, *, wait: bool = False, cancel_futures: bool = True) -> None:
-        self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+        with self._lock:
+            self._shutdown = True
+
+        if cancel_futures:
+            while True:
+                try:
+                    job = self._jobs.get_nowait()
+                except queue.Empty:
+                    break
+                if job is not None:
+                    with self._lock:
+                        self._transfers.discard(job.transfer_id)
+                    self._capacity.release()
+                self._jobs.task_done()
+
+        for _ in self._workers:
+            self._jobs.put(None)
+
+        if wait:
+            for worker in self._workers:
+                worker.join()
 
     def handle(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         transfer_id = str(payload.get("transfer_id") or uuid.uuid4().hex)
@@ -99,6 +196,15 @@ class SharedHiCacheSourceTransferQueue:
                 "block_size_tokens": self.tree_cache.page_size,
             }
         with self._lock:
+            if self._shutdown:
+                self._capacity.release()
+                return {
+                    "ok": False,
+                    "reason": "source_transfer_queue_shutdown",
+                    "transfer_id": transfer_id,
+                    "transferred_blocks": 0,
+                    "block_size_tokens": self.tree_cache.page_size,
+                }
             if transfer_id in self._transfers:
                 self._capacity.release()
                 return {
@@ -108,51 +214,15 @@ class SharedHiCacheSourceTransferQueue:
                     "transferred_blocks": 0,
                     "block_size_tokens": self.tree_cache.page_size,
                 }
-            self._transfers[transfer_id] = None
-        try:
-            future = self._executor.submit(
-                execute_source_transfer_request,
+            self._transfers.add(transfer_id)
+
+        self._jobs.put(
+            _SourceTransferJob(
+                transfer_id=transfer_id,
+                target_endpoint=target_endpoint,
                 request=request,
-                transfer_backend=self.transfer_backend,
-                tree_cache=self.tree_cache,
-                worker_id=self.worker_id,
-                topology=self.topology,
             )
-        except Exception:
-            with self._lock:
-                if self._transfers.get(transfer_id) is None:
-                    self._transfers.pop(transfer_id, None)
-            self._capacity.release()
-            raise
-
-        def _complete_source_transfer(done_future: Future) -> None:
-            response: Mapping[str, Any]
-            try:
-                response = dict(done_future.result())
-            except Exception:
-                logger.exception(
-                    "SharedHiCache source transfer job failed transfer_id=%s",
-                    transfer_id,
-                )
-                response = {
-                    "ok": False,
-                    "reason": "source_transfer_exception",
-                    "transferred_blocks": 0,
-                    "block_size_tokens": self.tree_cache.page_size,
-                }
-            response = dict(response)
-            response["transfer_id"] = transfer_id
-            self.send_transfer_done(
-                target_endpoint or request.target_control_endpoint, response
-            )
-            self._capacity.release()
-            with self._lock:
-                if self._transfers.get(transfer_id) is done_future:
-                    self._transfers.pop(transfer_id, None)
-
-        with self._lock:
-            self._transfers[transfer_id] = future
-        future.add_done_callback(_complete_source_transfer)
+        )
 
         return {
             "ok": True,
