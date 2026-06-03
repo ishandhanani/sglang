@@ -96,7 +96,7 @@ class SharedHiCacheSchedulerMixin:
         ):
             if reduced_status == SharedHiCachePrepareStatus.Failed:
                 req.shared_hicache_plan = None
-                self._release_shared_hicache_request(req.rid)
+                self.release_shared_hicache_request(req.rid)
                 continue
             if reduced_status == SharedHiCachePrepareStatus.Skip:
                 if local_status == SharedHiCachePrepareStatus.Ready:
@@ -106,7 +106,7 @@ class SharedHiCacheSchedulerMixin:
                         req.rid,
                     )
                 req.shared_hicache_plan = None
-                self._release_shared_hicache_request(req.rid)
+                self.release_shared_hicache_request(req.rid)
                 continue
             local_reqs.append((req, local_prefix_len))
 
@@ -155,7 +155,7 @@ class SharedHiCacheSchedulerMixin:
         ):
             if reduced_status == SharedHiCachePrepareStatus.Failed:
                 req.shared_hicache_plan = None
-                self._release_shared_hicache_request(req.rid)
+                self.release_shared_hicache_request(req.rid)
                 continue
             if reduced_status == SharedHiCachePrepareStatus.Pending:
                 pending_rids.add(str(req.rid))
@@ -210,7 +210,7 @@ class SharedHiCacheSchedulerMixin:
         req.init_next_round_input(self.tree_cache)
         req.shared_hicache_max_prefix_len = None
 
-    def _release_shared_hicache_request(self, rid: str) -> None:
+    def release_shared_hicache_request(self, rid: str) -> None:
         shared_hicache_manager = getattr(self, "shared_hicache_manager", None)
         if shared_hicache_manager is not None:
             shared_hicache_manager.release_request(rid)

@@ -67,9 +67,9 @@ constructing the SGLang engine. For raw SGLang launches, set it manually.
 Useful envs:
 
 ```bash
-SGLANG_SHARED_HICACHE_FETCH_WORKERS=4
+SGLANG_SHARED_HICACHE_FETCH_WORKERS=8
+SGLANG_SHARED_HICACHE_TIMEOUT_SECS=1.0
 SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM=8
-SGLANG_SHARED_HICACHE_NIXL_TELEMETRY=false
 ```
 
 Every rank binds `tcp://<server_args.host>:<shared_hicache_bootstrap_port + tp_rank>`.

@@ -94,7 +94,11 @@ class SharedHiCacheManager:
         self.tree_cache = tree_cache
         self.worker_id = worker_id
         self._set_parallel_metadata(parallel_metadata)
-        self.timeout_secs = shared_hicache_timeout_secs(server_args)
+        raw_config = getattr(server_args, "shared_hicache_config", None)
+        config = raw_config if isinstance(raw_config, SharedHiCacheConfig) else None
+        self.timeout_secs = (
+            config.timeout_secs if config is not None else shared_hicache_timeout_secs()
+        )
         self.prefetch_stop_policy = getattr(
             server_args, "hicache_storage_prefetch_policy", "timeout"
         )
@@ -105,8 +109,6 @@ class SharedHiCacheManager:
                 "SharedHiCache is enabled but no direct transfer backend is available; "
                 "SharedHiCache plans will be treated as cache misses."
             )
-        raw_config = getattr(server_args, "shared_hicache_config", None)
-        config = raw_config if isinstance(raw_config, SharedHiCacheConfig) else None
         self.endpoint = self._local_control_endpoint(config)
         self.source_service: Optional[SharedHiCacheSourceService] = None
         self._shutdown = False

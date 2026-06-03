@@ -219,14 +219,6 @@ class SharedHiCachePlan:
         except KeyError as err:
             raise ValueError(f"SharedHiCache plan missing {err.args[0]}") from err
 
-    @classmethod
-    def coerce(cls, data: Optional[Any]) -> Optional["SharedHiCachePlan"]:
-        if data is None:
-            return None
-        if isinstance(data, cls):
-            return data
-        return cls.from_dict(data)
-
     def to_dict(self) -> Dict[str, Any]:
         value = asdict(self)
         value["block_hashes"] = list(self.block_hashes)

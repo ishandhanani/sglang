@@ -218,7 +218,6 @@ def _create_nixl_agent(*, transfer_parallelism: int):
     backend_params = _nixl_backend_params(backend, transfer_parallelism)
     agent_config = nixl_agent_config(
         backends=[],
-        capture_telemetry=envs.SGLANG_SHARED_HICACHE_NIXL_TELEMETRY.get(),
         num_threads=max(0, int(transfer_parallelism)),
     )
     agent_name = f"shared_hicache_nixl_{uuid.uuid4()}"
@@ -431,7 +430,6 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         if transfer_parallelism is None:
             transfer_parallelism = default_shared_hicache_transfer_parallelism()
         self._transfer_parallelism = max(1, int(transfer_parallelism))
-        self._capture_telemetry = envs.SGLANG_SHARED_HICACHE_NIXL_TELEMETRY.get()
         self._shutdown = False
 
     @classmethod
@@ -630,7 +628,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             state.remote_agents.add(target_agent_name)
         return target_agent_name, int(target_metadata.get("gpu_id", 0))
 
-    def _wait_for_transfer(self, agent, handle) -> Optional[tuple[int, int, int, int]]:
+    def _wait_for_transfer(self, agent, handle) -> None:
         release = getattr(agent, "release_xfer_handle", None)
         try:
             transfer_state = agent.transfer(handle)
@@ -641,7 +639,6 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
                     break
                 time.sleep(0)
                 transfer_state = agent.check_xfer_state(handle)
-            return self._get_xfer_telemetry(agent, handle)
         finally:
             if callable(release):
                 try:
@@ -695,26 +692,6 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             while len(self._retired_target_notification_order) > 4096:
                 expired = self._retired_target_notification_order.popleft()
                 self._retired_target_notifications.discard(expired)
-
-    def _get_xfer_telemetry(self, agent, handle) -> Optional[tuple[int, int, int, int]]:
-        if not self._capture_telemetry:
-            return None
-        get_telemetry = getattr(agent, "get_xfer_telemetry", None)
-        if not callable(get_telemetry):
-            return None
-        try:
-            telemetry = get_telemetry(handle)
-            return (
-                int(getattr(telemetry, "postDuration")),
-                int(getattr(telemetry, "xferDuration")),
-                int(getattr(telemetry, "totalBytes")),
-                int(getattr(telemetry, "descCount")),
-            )
-        except Exception:
-            logger.debug(
-                "SharedHiCache NIXL transfer telemetry unavailable", exc_info=True
-            )
-            return None
 
     def _source_host_buf_infos(self) -> tuple[list[int], list[int]]:
         return _source_host_buf_infos(self.tree_cache)
@@ -770,36 +747,18 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             raise RuntimeError("NIXL direct KV transfer initialization failed")
         setup_ms = (time.perf_counter() - setup_start) * 1000
         start = time.perf_counter()
-        telemetry = self._wait_for_transfer(source_state.agent, handle)
+        self._wait_for_transfer(source_state.agent, handle)
         transfer_ms = (time.perf_counter() - start) * 1000
-        if telemetry is None:
-            logger.info(
-                "SharedHiCache NIXL transferred blocks=%d slices=%d bytes=%d "
-                "ms=%.3f setup_ms=%.3f source_agent=%s",
-                num_blocks,
-                len(src_addrs),
-                int(lengths.sum()),
-                transfer_ms,
-                setup_ms,
-                source_state.agent_name,
-            )
-        else:
-            post_us, xfer_us, nixl_bytes, desc_count = telemetry
-            logger.info(
-                "SharedHiCache NIXL transferred blocks=%d slices=%d bytes=%d "
-                "ms=%.3f setup_ms=%.3f source_agent=%s "
-                "nixl_post_us=%d nixl_xfer_us=%d nixl_bytes=%d nixl_descs=%d",
-                num_blocks,
-                len(src_addrs),
-                int(lengths.sum()),
-                transfer_ms,
-                setup_ms,
-                source_state.agent_name,
-                post_us,
-                xfer_us,
-                nixl_bytes,
-                desc_count,
-            )
+        logger.info(
+            "SharedHiCache NIXL transferred blocks=%d slices=%d bytes=%d "
+            "ms=%.3f setup_ms=%.3f source_agent=%s",
+            num_blocks,
+            len(src_addrs),
+            int(lengths.sum()),
+            transfer_ms,
+            setup_ms,
+            source_state.agent_name,
+        )
 
     def shutdown(self) -> None:
         if self._shutdown:

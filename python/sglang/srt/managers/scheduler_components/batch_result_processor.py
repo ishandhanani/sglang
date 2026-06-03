@@ -78,7 +78,7 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: "SchedulerLogprobResultProcessor"
     output_streamer: "SchedulerOutputStreamer"
     abort_request: Callable
-    _release_shared_hicache_request: Callable[[str], None]
+    release_shared_hicache_request: Callable[[str], None]
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -93,7 +93,7 @@ class SchedulerBatchResultProcessor:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
-                self._release_shared_hicache_request(req.rid)
+                self.release_shared_hicache_request(req.rid)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -235,7 +235,7 @@ class SchedulerBatchResultProcessor:
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
-                        self._release_shared_hicache_request(req.rid)
+                        self.release_shared_hicache_request(req.rid)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
@@ -320,7 +320,7 @@ class SchedulerBatchResultProcessor:
 
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
-                        self._release_shared_hicache_request(req.rid)
+                        self.release_shared_hicache_request(req.rid)
                         req.time_stats.set_completion_time()
                     else:
                         maybe_cache_unfinished_req(req, self.tree_cache)
@@ -849,7 +849,7 @@ class SchedulerBatchResultProcessor:
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
-            self._release_shared_hicache_request(req.rid)
+            self.release_shared_hicache_request(req.rid)
             req.time_stats.set_completion_time()
 
         self._maybe_collect_customized_info(i, req, logits_output)

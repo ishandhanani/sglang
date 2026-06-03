@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+from sglang.srt.environ import envs
+
 
 class SharedHiCacheTransferBackendType(str, Enum):
     AUTO = "auto"
@@ -35,8 +37,11 @@ def shared_hicache_transfer_backend_name(server_args, default: str = "auto") -> 
     ).lower()
 
 
-def shared_hicache_timeout_secs(server_args, default: float = 1.0) -> float:
-    return float(getattr(server_args, "shared_hicache_timeout_secs", None) or default)
+def shared_hicache_timeout_secs() -> float:
+    timeout_secs = float(envs.SGLANG_SHARED_HICACHE_TIMEOUT_SECS.get())
+    if timeout_secs <= 0:
+        raise ValueError("SGLANG_SHARED_HICACHE_TIMEOUT_SECS must be > 0")
+    return timeout_secs
 
 
 def _normalize_control_host(value: object, field_name: str) -> str:
@@ -67,7 +72,6 @@ def normalize_shared_hicache_server_config(
     worker_id: Optional[str],
     host: str,
     bootstrap_port: Optional[int],
-    timeout_secs: float,
     transfer_backend: str,
     enable_hierarchical_cache: bool,
 ) -> tuple[bool, Optional[str], Optional[SharedHiCacheConfig]]:
@@ -92,12 +96,6 @@ def normalize_shared_hicache_server_config(
         )
     transfer_backend = SharedHiCacheTransferBackendType(transfer_backend_name)
 
-    if not isinstance(timeout_secs, (int, float)) or isinstance(timeout_secs, bool):
-        raise ValueError("shared_hicache_timeout_secs must be a positive number")
-    timeout_secs = float(timeout_secs)
-    if timeout_secs <= 0:
-        raise ValueError("shared_hicache_timeout_secs must be > 0")
-
     return (
         True,
         worker_id,
@@ -107,7 +105,7 @@ def normalize_shared_hicache_server_config(
                 "host",
             ),
             bootstrap_port=bootstrap_port,
-            timeout_secs=timeout_secs,
+            timeout_secs=shared_hicache_timeout_secs(),
             transfer_backend=transfer_backend,
         ),
     )

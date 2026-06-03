@@ -398,7 +398,7 @@ def _parse_target_kv_metadata(
     if expected_item_lens is not None:
         try:
             expected_item_lens = [int(length) for length in expected_item_lens]
-        except (TypeError, ValueError) as err:
+        except (TypeError, ValueError):
             return None, None, None, "local_target_kv_item_lens_invalid"
         if len(expected_item_lens) != len(target_kv_item_lens):
             return (

@@ -136,15 +136,18 @@ MultimodalDataInputFormat = Union[
 CacheHintsInput = Union[Dict[str, Any], List[Optional[Dict[str, Any]]]]
 
 
-def _shared_hicache_hint_from_cache_hints(
+def _shared_hicache_plan_from_cache_hints(
     cache_hints: Optional[Any],
     field_name: str = "cache_hints",
-) -> Optional[Any]:
+) -> Optional[SharedHiCachePlan]:
     if cache_hints is None:
         return None
     if not isinstance(cache_hints, dict):
         raise ValueError(f"{field_name} must be a dict.")
-    return cache_hints.get("shared_hicache")
+    hint = cache_hints.get("shared_hicache")
+    if hint is None:
+        return None
+    return SharedHiCachePlan.from_dict(hint)
 
 
 def _cache_hints_has_shared_hicache(
@@ -155,10 +158,11 @@ def _cache_hints_has_shared_hicache(
         return False
     if isinstance(cache_hints, list):
         return any(
-            _cache_hints_has_shared_hicache(item, f"{field_name}[{i}]")
+            _shared_hicache_plan_from_cache_hints(item, f"{field_name}[{i}]")
+            is not None
             for i, item in enumerate(cache_hints)
         )
-    return _shared_hicache_hint_from_cache_hints(cache_hints, field_name) is not None
+    return _shared_hicache_plan_from_cache_hints(cache_hints, field_name) is not None
 
 
 @dataclass
@@ -442,8 +446,8 @@ class GenerateReqInput(BaseReq):
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
-        self.shared_hicache_plan = SharedHiCachePlan.coerce(
-            _shared_hicache_hint_from_cache_hints(self.cache_hints)
+        self.shared_hicache_plan = _shared_hicache_plan_from_cache_hints(
+            self.cache_hints
         )
 
     def _normalize_batch_inputs(self):
@@ -678,10 +682,8 @@ class GenerateReqInput(BaseReq):
                     "The length of cache_hints should be equal to the batch size."
                 )
             plans = [
-                SharedHiCachePlan.coerce(
-                    _shared_hicache_hint_from_cache_hints(
-                        hints, f"cache_hints[{i}]"
-                    )
+                _shared_hicache_plan_from_cache_hints(
+                    hints, f"cache_hints[{i}]"
                 )
                 for i, hints in enumerate(self.cache_hints)
             ]
@@ -691,9 +693,7 @@ class GenerateReqInput(BaseReq):
                 raise ValueError(
                     "cache_hints must be a list when batch size is greater than 1."
                 )
-            plan = SharedHiCachePlan.coerce(
-                _shared_hicache_hint_from_cache_hints(self.cache_hints)
-            )
+            plan = _shared_hicache_plan_from_cache_hints(self.cache_hints)
             self.shared_hicache_plan = [plan] * num
 
     def _validate_session_params(self):
