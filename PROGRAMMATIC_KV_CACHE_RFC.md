@@ -21,6 +21,9 @@ identity and block hashes; concrete transport routes are runtime configuration,
 not request payload. This implementation provides the API surface needed for
 future hints because the machinery to move KV natively between workers will be
 present.
+For Shared HiCache specifically, Dynamo publishes worker runtime metadata
+(`source_host` and `source_bootstrap_port`) and request hints carry those logical
+bootstrap coordinates, not concrete transport endpoints.
 
 ## Motivation
 

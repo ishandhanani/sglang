@@ -52,8 +52,10 @@ Dynamo sends Shared HiCache through the generic `cache_hints` envelope:
       "plan_version": 1,
       "plan_id": "router-generated-id",
       "request_id": "request-id",
-      "target_worker_id": 2,
-      "source_worker_id": 1,
+      "target_worker_id": "target-worker-uuid",
+      "source_worker_id": "source-worker-uuid",
+      "source_host": "10.0.0.11",
+      "source_bootstrap_port": 41000,
       "source_medium": "CPU_PINNED",
       "block_hashes": [123, 456, 789],
       "kv_block_hashes": [123, 456, 789],
@@ -72,10 +74,15 @@ Dynamo sends Shared HiCache through the generic `cache_hints` envelope:
 ```
 
 SGLang normalizes this into `SharedHiCachePlan`. The plan intentionally does
-not carry concrete source endpoints. Source endpoints are discovered through a
-runtime route registry keyed by `(worker_id, tp_rank)`, matching the
-disaggregation architecture where routing metadata is owned by engine runtime
-configuration rather than by request hints.
+not carry concrete source endpoints. Targets derive the source TP-rank control
+endpoint from:
+
+```text
+tcp://<source_host>:<source_bootstrap_port + source_tp_rank>
+```
+
+This mirrors disaggregation: runtime metadata advertises a worker host plus a
+bootstrap port, and each engine rank owns its rank-offset port.
 
 Strict validation:
 
@@ -83,7 +90,9 @@ Strict validation:
 - batched requests must provide one hint object per request;
 - `parallel_sample_num > 1` is rejected;
 - integer fields must be actual integers;
-- stale `source_endpoint` payloads are rejected;
+- worker id fields must be non-empty strings;
+- stale `source_endpoint` payloads are rejected; use
+  `source_host/source_bootstrap_port`;
 - `source_medium` must be `CPU_PINNED`;
 - target worker id must match local worker id;
 - source and target workers must differ;
@@ -99,8 +108,8 @@ Strict validation:
 5. A later request arrives.
 6. Dynamo chooses worker B as target and attaches cache_hints.shared_hicache.
 7. Worker B validates the plan and probes local prefix coverage.
-8. Worker B resolves Worker A's source TP route from the Shared HiCache route
-   registry.
+8. Worker B derives Worker A's source TP endpoint from `source_host`,
+   `source_bootstrap_port`, and `source_tp_rank`.
 9. Worker B allocates page-aligned target GPU KV staging pages.
 10. Worker B sends a ZMQ transfer request to Worker A.
 11. Worker A resolves block hashes to live HiCache host pages.
@@ -184,32 +193,37 @@ quarantines those pages instead of returning them directly to the allocator.
 SGLang flags:
 
 ```bash
+--enable-hierarchical-cache
 --enable-shared-hicache
---shared-hicache-config /path/to/shared_hicache_config.json
-```
-
-Config shape:
-
-```json
-{
-  "worker_id": 1,
-  "control": {"host": "10.0.0.11", "base_port": 41000},
-  "registry": {"endpoint": "http://10.0.0.11:40999", "serve": true},
-  "transfer": {"backend": "nixl"},
-  "timeout_secs": 1.0
-}
+--shared-hicache-transfer-backend nixl
+--shared-hicache-worker-id <worker-id>           # standalone/manual launch
+--shared-hicache-bootstrap-port <base-port>      # standalone/manual launch
 ```
 
 Rules:
 
 - Shared HiCache requires `--enable-hierarchical-cache`.
-- Worker id is explicit.
-- Every rank binds `tcp://<control.host>:<control.base_port + tp_rank>`.
-- Every rank registers `(worker_id, tp_rank) -> endpoint` in the route registry.
-- Set `registry.serve=true` on exactly one worker config in the process group,
-  normally source rank 0.
+- Worker id is an arbitrary non-empty string. Dynamo sets it from the Dynamo
+  endpoint connection id; standalone launches must pass
+  `--shared-hicache-worker-id`.
+- Every rank binds
+  `tcp://<server_args.host>:<shared_hicache_bootstrap_port + tp_rank>`.
+- For cross-process or cross-host reuse, launch SGLang/Dynamo with a bind host
+  reachable by the advertised `source_host`, normally `--host 0.0.0.0`.
+- Plans carry `source_host` and `source_bootstrap_port`; there is no Shared
+  HiCache route registry and no request-carried `source_endpoint`.
+- Dynamo publishes Shared HiCache runtime metadata under
+  `sglang_shared_hicache` as JSON containing `source_host` and
+  `source_bootstrap_port`.
+- If `--shared-hicache-bootstrap-port` is omitted under Dynamo, Dynamo derives
+  the base port as `DYN_SYSTEM_PORT + 20000`; if `DYN_SYSTEM_PORT` is absent, it
+  falls back to the disaggregation bootstrap port reserved for that worker.
+- Same-host multi-worker tests must space `DYN_SYSTEM_PORT` by at least TP width
+  so the rank-offset port ranges do not overlap.
 - The supported source medium is `CPU_PINNED`.
-- Runtime parallelism is controlled by `SGLANG_SHARED_HICACHE_*` env vars.
+- Runtime parallelism and timeout are controlled by `SGLANG_SHARED_HICACHE_*`
+  env vars. Current defaults are `SGLANG_SHARED_HICACHE_FETCH_WORKERS=8` and
+  `SGLANG_SHARED_HICACHE_TIMEOUT_SECS=1.0`.
 - High source-transfer worker counts such as
   `SGLANG_SHARED_HICACHE_FETCH_WORKERS=8` require sufficient memlock for NIXL/UCX
   registration. The validated 4K fetch8 gate used inherited unlimited memlock.
@@ -255,30 +269,39 @@ Setup:
 - zero direct-transfer failures, source-transfer timeouts, staging allocation
   failures, transfer timeouts, or tracebacks.
 
-### Route Registry Hard Cut
+### Host/Bootstrap Hard Cut
 
-SGLang PR branch `97888421d`, Dynamo `650ea95c8` plus adapter-side
-`source_endpoint` removal:
+SGLang PR branch `5a8b8d367`, Dynamo `a7a2f98d8`:
 
-- removed request-carried `source_endpoint` and `{tp_rank}` endpoint templating;
-- route lookup now uses `(worker_id, tp_rank)` through the Shared HiCache
-  registry;
-- focused SGLang pytest: `23 passed`;
+- removed request-carried `source_endpoint`, `{tp_rank}` endpoint templating,
+  and the intermediate Shared HiCache route registry;
+- route lookup now derives the source rank endpoint from
+  `source_host/source_bootstrap_port/source_tp_rank`;
+- Dynamo auto-populates worker id and shared bootstrap metadata; the 4K harness
+  launched `dynamo.sglang` with `--host 0.0.0.0` and no manual
+  `--shared-hicache-bootstrap-port`;
+- focused SGLang pytest: `17 passed`;
 - MiniMax-M2.7 TP4 exact-4096 gate on TRY-67676:
-  - cold target: `12/12` HTTP 200, avg `5760.02 ms`, p95 `7381.59 ms`;
-  - source populate: `12/12` HTTP 200;
-  - source write: `12/12` HTTP 200;
-  - remote target: `12/12` HTTP 200, avg `2980.13 ms`, p95 `3437.19 ms`;
+  - artifact:
+    `/tmp/dynamo_shared_hicache_host_bootstrap_4k_prlimit_20260603T110010Z`;
+  - cold target: `12/12` HTTP 200, avg `5909.44 ms`, p95 `7627.32 ms`;
+  - source populate: `12/12` HTTP 200, avg `3956.52 ms`, p95 `4098.07 ms`;
+  - source write: `12/12` HTTP 200, avg `908.46 ms`, p95 `912.91 ms`;
+  - remote target: `12/12` HTTP 200, avg `3794.96 ms`, p95 `4565.18 ms`;
   - remote target cache-read: `46080`;
-  - remote-vs-cold speedup: `48.26%` avg latency, `53.44%` p95 latency;
+  - remote-vs-cold speedup: `35.78%` avg latency, `40.15%` p95 latency;
+  - final target metrics: `112` Shared HiCache requests, `44` OK hits,
+    `134336` Shared HiCache tokens, `10.63 GB` transfer bytes, and `33584`
+    `shared_hicache` cached tokens;
   - `56` NIXL transfer logs, `48` direct staged inserts;
   - zero direct-transfer failures, source-transfer timeouts, transfer timeouts,
     queue-full logs, or tracebacks.
 
-The failed 2026-06-02 rerun was traced to benchmark environment drift: fetch8
-without inherited unlimited memlock. With
-`sudo prlimit --pid <shell-pid> --memlock=unlimited:unlimited`, the same
-route-registry hard cut passed.
+The failed no-registry rerun immediately before this was not caused by port
+derivation itself. Dynamo advertised the node IP, while SGLang had been bound to
+loopback. The validated run made the launch contract explicit with
+`--host 0.0.0.0` and inherited unlimited memlock via
+`sudo prlimit --pid <shell-pid> --memlock=unlimited:unlimited`.
 
 ## Current PR Shape
 
@@ -294,7 +317,7 @@ Major implementation surfaces:
   `python/sglang/srt/mem_cache/shared_hicache/source.py`;
 - NIXL transfer:
   `python/sglang/srt/mem_cache/shared_hicache/transfer.py`;
-- control plane and route registry:
+- ZMQ control plane and endpoint derivation:
   `python/sglang/srt/mem_cache/shared_hicache/service.py`;
 - manager/orchestration:
   `python/sglang/srt/mem_cache/shared_hicache/manager.py`;
