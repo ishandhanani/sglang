@@ -37,6 +37,8 @@ from sglang.srt.mem_cache.shared_hicache.plan import (
     SharedHiCachePlan,
 )
 from sglang.srt.mem_cache.shared_hicache.service import (
+    SharedHiCacheRegistryClient,
+    SharedHiCacheRegistryServer,
     SharedHiCacheSourceService,
 )
 from sglang.srt.mem_cache.shared_hicache.source_queue import (
@@ -109,11 +111,18 @@ class SharedHiCacheManager:
                 "SharedHiCache is enabled but no direct transfer backend is available; "
                 "SharedHiCache plans will be treated as cache misses."
             )
-        config = getattr(server_args, "shared_hicache_config", None)
-        endpoint_spec = (
-            config.control_endpoint if isinstance(config, SharedHiCacheConfig) else None
+        raw_config = getattr(server_args, "shared_hicache_config", None)
+        config = raw_config if isinstance(raw_config, SharedHiCacheConfig) else None
+        self.endpoint = self._local_control_endpoint(config)
+        self.registry_client: Optional[SharedHiCacheRegistryClient] = (
+            SharedHiCacheRegistryClient(
+                config.registry_endpoint,
+                timeout_secs=self.timeout_secs,
+            )
+            if config is not None
+            else None
         )
-        self.endpoint = self._format_local_control_endpoint(endpoint_spec)
+        self.registry_server: Optional[SharedHiCacheRegistryServer] = None
         self.source_service: Optional[SharedHiCacheSourceService] = None
         self._shutdown = False
         fetch_worker_limit = max(
@@ -137,6 +146,10 @@ class SharedHiCacheManager:
         self._direct_transfer_shutdown_deferred = False
         self._direct_transfer_shutdown_lock = threading.Lock()
 
+        if config is not None and config.registry_serve and self.tp_rank == 0:
+            self.registry_server = SharedHiCacheRegistryServer(config.registry_endpoint)
+            self.registry_server.start()
+
         if self.endpoint is not None:
             self.source_transfer_queue = SharedHiCacheSourceTransferQueue(
                 tree_cache=tree_cache,
@@ -157,6 +170,7 @@ class SharedHiCacheManager:
                 handle_control_message=self._handle_control_message,
             )
             self.source_service.start()
+            self._register_local_control_endpoint()
         atexit.register(self.shutdown)
 
     def _set_parallel_metadata(
@@ -167,11 +181,41 @@ class SharedHiCacheManager:
         for key, value in self.topology.to_dict().items():
             setattr(self, key, value)
 
-    def _endpoint_format_values(self) -> dict[str, int]:
-        return self.topology.endpoint_format_values()
+    def _local_control_endpoint(
+        self,
+        config: Optional[SharedHiCacheConfig],
+    ) -> Optional[str]:
+        if config is None:
+            return None
+        port = int(config.control_base_port) + int(self.tp_rank)
+        if port > 65535:
+            raise ValueError(
+                "shared_hicache_config.control.base_port + tp_rank exceeds 65535"
+            )
+        return f"tcp://{config.control_host}:{port}"
 
-    def _format_local_control_endpoint(self, endpoint_spec: object) -> Optional[str]:
-        return self.topology.format_local_control_endpoint(endpoint_spec)
+    def _register_local_control_endpoint(self) -> None:
+        registry_client = getattr(self, "registry_client", None)
+        if registry_client is None or self.endpoint is None or self.worker_id is None:
+            return
+        last_error: Optional[Exception] = None
+        for attempt in range(20):
+            try:
+                registry_client.register(
+                    worker_id=int(self.worker_id),
+                    tp_rank=int(self.tp_rank),
+                    tp_size=int(self.tp_size),
+                    endpoint=self.endpoint,
+                )
+                return
+            except Exception as err:
+                last_error = err
+                if attempt == 19:
+                    break
+                time.sleep(0.25)
+        raise RuntimeError(
+            "failed to register Shared HiCache control endpoint"
+        ) from last_error
 
     @classmethod
     def from_scheduler(cls, scheduler) -> Optional["SharedHiCacheManager"]:
@@ -357,6 +401,11 @@ class SharedHiCacheManager:
         if source_service is not None:
             source_service.shutdown()
 
+        registry_server = getattr(self, "registry_server", None)
+        self.registry_server = None
+        if registry_server is not None:
+            registry_server.shutdown()
+
         for pending in self._pending_fetches.values():
             self._release_pending_fetch(pending)
         self._pending_fetches.clear()
@@ -382,8 +431,33 @@ class SharedHiCacheManager:
         self.target_cache.release_quarantined_device_indices()
         self._shutdown_direct_transfer_backend()
 
-    def _candidate_endpoints_for_plan(self, plan: SharedHiCachePlan) -> list[str]:
-        return self.topology.candidate_endpoints_for_plan(plan)
+    def _source_route_endpoint_for_plan(
+        self,
+        plan: SharedHiCachePlan,
+    ) -> Optional[str]:
+        registry_client = getattr(self, "registry_client", None)
+        if registry_client is None:
+            return None
+        source_tp_rank = (
+            int(plan.source_tp_rank)
+            if plan.source_tp_rank is not None
+            else int(self.tp_rank)
+        )
+        try:
+            endpoint = registry_client.resolve(
+                worker_id=int(plan.source_worker_id),
+                tp_rank=source_tp_rank,
+            )
+        except Exception:
+            logger.warning(
+                "Shared HiCache source route lookup failed plan_id=%s source_worker=%s source_tp_rank=%s",
+                plan.plan_id,
+                plan.source_worker_id,
+                source_tp_rank,
+                exc_info=True,
+            )
+            return None
+        return endpoint
 
     def _send_control_message(self, endpoint: str, payload: Mapping[str, Any]) -> None:
         source_service = getattr(self, "source_service", None)
@@ -536,9 +610,9 @@ class SharedHiCacheManager:
         direct_transfer = getattr(self, "direct_transfer", None)
         if not self._direct_transfer_enabled():
             return SharedHiCacheDirectSubmitResult(reason="direct_transfer_unavailable")
-        endpoints = self._candidate_endpoints_for_plan(plan)
-        if not endpoints:
-            return SharedHiCacheDirectSubmitResult(reason="source_endpoint_unavailable")
+        route_endpoint = self._source_route_endpoint_for_plan(plan)
+        if not route_endpoint:
+            return SharedHiCacheDirectSubmitResult(reason="source_route_unavailable")
         if not self._try_acquire_fetch_worker():
             return SharedHiCacheDirectSubmitResult(reason="fetch_worker_unavailable")
 
@@ -601,7 +675,7 @@ class SharedHiCacheManager:
         self._start_target_transfer(transfer_id)
         try:
             self._send_control_message(
-                endpoints[0],
+                route_endpoint,
                 {
                     "kind": SHARED_HICACHE_TRANSFER_REQUEST,
                     "transfer_id": transfer_id,
@@ -625,7 +699,7 @@ class SharedHiCacheManager:
                 "Shared HiCache direct transfer control send failed plan_id=%s source_worker=%s endpoint=%s",
                 plan.plan_id,
                 plan.source_worker_id,
-                endpoints[0],
+                route_endpoint,
                 exc_info=True,
             )
             return SharedHiCacheDirectSubmitResult(

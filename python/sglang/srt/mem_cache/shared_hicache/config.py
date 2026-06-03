@@ -5,8 +5,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Mapping, Optional, Union
-
-from sglang.srt.mem_cache.shared_hicache.plan import normalize_endpoint
+from urllib.parse import urlparse
 
 
 class SharedHiCacheTransferBackendType(str, Enum):
@@ -22,7 +21,10 @@ SHARED_HICACHE_TRANSFER_BACKEND_CHOICES = [
 @dataclass(frozen=True)
 class SharedHiCacheConfig:
     worker_id: int
-    control_endpoint: Optional[str]
+    control_host: str
+    control_base_port: int
+    registry_endpoint: str
+    registry_serve: bool
     timeout_secs: float
     transfer_backend: SharedHiCacheTransferBackendType
 
@@ -41,7 +43,12 @@ def shared_hicache_transfer_backend_name(server_args, default: str = "auto") -> 
     if isinstance(config, SharedHiCacheConfig):
         return config.transfer_backend.value
     if isinstance(config, Mapping):
-        return str(config.get("transfer_backend", default)).lower()
+        transfer = config.get("transfer") or {}
+        if not isinstance(transfer, Mapping):
+            transfer = {}
+        return str(
+            config.get("transfer_backend", transfer.get("backend", default))
+        ).lower()
     return default
 
 
@@ -50,7 +57,18 @@ def shared_hicache_timeout_secs(server_args, default: float = 1.0) -> float:
     if isinstance(config, SharedHiCacheConfig):
         return float(config.timeout_secs)
     if isinstance(config, Mapping):
-        return float(config.get("timeout_secs", default))
+        control = config.get("control") or {}
+        transfer = config.get("transfer") or {}
+        if not isinstance(control, Mapping):
+            control = {}
+        if not isinstance(transfer, Mapping):
+            transfer = {}
+        return float(
+            config.get(
+                "timeout_secs",
+                transfer.get("timeout_secs", control.get("timeout_secs", default)),
+            )
+        )
     return float(default)
 
 
@@ -81,14 +99,36 @@ def _load_json_object_config(
     return data
 
 
-def _normalize_endpoint(value: object, field_name: str) -> Optional[str]:
+def _normalize_control_host(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value.strip()
+
+
+def _normalize_port(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be an integer port")
+    if value <= 0 or value > 65535:
+        raise ValueError(f"{field_name} must be in [1, 65535]")
+    return int(value)
+
+
+def _normalize_bool(value: object, field_name: str) -> bool:
     if value is None:
-        return None
-    if isinstance(value, str):
-        if not value.strip():
-            raise ValueError(f"{field_name} must be non-empty")
-        return normalize_endpoint(value)
-    raise ValueError(f"{field_name} must be a non-empty string")
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a boolean")
+    return bool(value)
+
+
+def _normalize_registry_endpoint(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    endpoint = value.strip().rstrip("/")
+    parsed = urlparse(endpoint)
+    if parsed.scheme != "http" or parsed.hostname is None or parsed.port is None:
+        raise ValueError(f"{field_name} must be http://host:port")
+    return endpoint
 
 
 def normalize_shared_hicache_server_config(
@@ -114,6 +154,10 @@ def normalize_shared_hicache_server_config(
     control_config = config.get("control") or {}
     if not isinstance(control_config, dict):
         raise ValueError("shared_hicache_config.control must be a JSON object")
+
+    registry_config = config.get("registry") or {}
+    if not isinstance(registry_config, dict):
+        raise ValueError("shared_hicache_config.registry must be a JSON object")
 
     transfer_config = config.get("transfer") or {}
     if not isinstance(transfer_config, dict):
@@ -146,12 +190,28 @@ def normalize_shared_hicache_server_config(
     if timeout_secs <= 0:
         raise ValueError("shared_hicache_config.timeout_secs must be > 0")
 
-    return True, worker_id, SharedHiCacheConfig(
-        worker_id=worker_id,
-        control_endpoint=_normalize_endpoint(
-            control_config.get("endpoint", config.get("control_endpoint")),
-            "shared_hicache_config.control.endpoint",
+    return (
+        True,
+        worker_id,
+        SharedHiCacheConfig(
+            worker_id=worker_id,
+            control_host=_normalize_control_host(
+                control_config.get("host"),
+                "shared_hicache_config.control.host",
+            ),
+            control_base_port=_normalize_port(
+                control_config.get("base_port"),
+                "shared_hicache_config.control.base_port",
+            ),
+            registry_endpoint=_normalize_registry_endpoint(
+                registry_config.get("endpoint"),
+                "shared_hicache_config.registry.endpoint",
+            ),
+            registry_serve=_normalize_bool(
+                registry_config.get("serve", False),
+                "shared_hicache_config.registry.serve",
+            ),
+            timeout_secs=timeout_secs,
+            transfer_backend=transfer_backend,
         ),
-        timeout_secs=timeout_secs,
-        transfer_backend=transfer_backend,
     )

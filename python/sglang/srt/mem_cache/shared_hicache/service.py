@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from string import Formatter
+import asyncio
 from typing import Any, Callable, Mapping, Optional
+from urllib.parse import urlparse
 
+import requests
 import zmq
+from aiohttp import web
 
 from sglang.srt.mem_cache.shared_hicache.control import endpoint_to_zmq
 from sglang.srt.mem_cache.shared_hicache.plan import normalize_endpoint
@@ -30,35 +33,162 @@ def _decode_control_payload(frames: list[bytes]) -> Mapping[str, Any]:
     return payload
 
 
-def endpoint_format_fields(endpoint_spec: object) -> set[str]:
-    if not isinstance(endpoint_spec, str):
-        return set()
-    fields: set[str] = set()
-    for _, field_name, _, _ in Formatter().parse(endpoint_spec):
-        if field_name:
-            fields.add(field_name.split(".", 1)[0].split("[", 1)[0])
-    return fields
+def normalize_registry_endpoint(endpoint: str) -> str:
+    endpoint = endpoint.strip()
+    if not endpoint:
+        return endpoint
+    parsed = urlparse(endpoint)
+    if parsed.scheme != "http" or parsed.hostname is None or parsed.port is None:
+        raise ValueError("shared HiCache registry endpoint must be http://host:port")
+    return endpoint.rstrip("/")
 
 
-def format_control_endpoint(
-    endpoint_spec: object,
-    values: Optional[Mapping[str, Any]] = None,
-    **extra_values,
-) -> Optional[str]:
-    if not endpoint_spec:
-        return None
-    if not isinstance(endpoint_spec, str):
-        raise ValueError("shared_hicache_config.control.endpoint must be a string")
-    spec = endpoint_spec.strip()
-    if not spec:
-        return None
-    format_values = {}
-    if values is not None:
-        format_values.update({key: int(value) for key, value in values.items()})
-    format_values.update({key: int(value) for key, value in extra_values.items()})
-    if "{" in spec:
-        spec = spec.format(**format_values)
-    return normalize_endpoint(spec)
+def _registry_route_url(registry_endpoint: str) -> str:
+    return f"{normalize_registry_endpoint(registry_endpoint)}/route"
+
+
+def _registry_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an integer")
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, str) and value.strip():
+        return int(value)
+    raise ValueError(f"{field_name} must be an integer")
+
+
+class SharedHiCacheRegistryClient:
+    """Disagg-style HTTP route lookup for concrete source rank endpoints."""
+
+    def __init__(self, endpoint: str, *, timeout_secs: float = 1.0):
+        self.endpoint = normalize_registry_endpoint(endpoint)
+        self.timeout_secs = float(timeout_secs)
+
+    def register(
+        self,
+        *,
+        worker_id: int,
+        tp_rank: int,
+        tp_size: int,
+        endpoint: str,
+    ) -> None:
+        response = requests.put(
+            _registry_route_url(self.endpoint),
+            json={
+                "worker_id": int(worker_id),
+                "tp_rank": int(tp_rank),
+                "tp_size": int(tp_size),
+                "endpoint": normalize_endpoint(endpoint),
+            },
+            timeout=self.timeout_secs,
+        )
+        response.raise_for_status()
+
+    def resolve(self, *, worker_id: int, tp_rank: int) -> Optional[str]:
+        response = requests.get(
+            _registry_route_url(self.endpoint),
+            params={"worker_id": int(worker_id), "tp_rank": int(tp_rank)},
+            timeout=self.timeout_secs,
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        payload = response.json()
+        endpoint = payload.get("endpoint") if isinstance(payload, Mapping) else None
+        if not isinstance(endpoint, str) or not endpoint.strip():
+            return None
+        return normalize_endpoint(endpoint)
+
+
+class SharedHiCacheRegistryServer:
+    """Minimal `/route` registry matching disagg's concrete endpoint discovery."""
+
+    def __init__(self, endpoint: str):
+        self.endpoint = normalize_registry_endpoint(endpoint)
+        parsed = urlparse(self.endpoint)
+        self.host = parsed.hostname
+        self.port = parsed.port
+        self._routes: dict[tuple[int, int], dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._runner: Optional[web.AppRunner] = None
+        self.app = web.Application()
+        self.app.router.add_route("*", "/route", self._handle_route)
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run_server,
+            name=f"shared_hicache-registry-{self.endpoint}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    async def _handle_route(self, request: web.Request):
+        if request.method == "PUT":
+            return await self._handle_route_put(request)
+        if request.method == "GET":
+            return await self._handle_route_get(request)
+        return web.Response(text="Method not allowed", status=405)
+
+    async def _handle_route_put(self, request: web.Request):
+        data = await request.json()
+        worker_id = _registry_int(data.get("worker_id"), "worker_id")
+        tp_rank = _registry_int(data.get("tp_rank"), "tp_rank")
+        tp_size = _registry_int(data.get("tp_size", 1), "tp_size")
+        endpoint = normalize_endpoint(str(data.get("endpoint", "")))
+        if tp_rank < 0 or tp_size <= 0 or tp_rank >= tp_size:
+            return web.Response(text="tp_rank must be in [0, tp_size)", status=400)
+        if not endpoint:
+            return web.Response(text="endpoint must be non-empty", status=400)
+        route = {
+            "worker_id": worker_id,
+            "tp_rank": tp_rank,
+            "tp_size": tp_size,
+            "endpoint": endpoint,
+        }
+        async with self._lock:
+            self._routes[(worker_id, tp_rank)] = route
+        return web.json_response(route)
+
+    async def _handle_route_get(self, request: web.Request):
+        worker_id = _registry_int(request.query.get("worker_id"), "worker_id")
+        tp_rank = _registry_int(request.query.get("tp_rank"), "tp_rank")
+        async with self._lock:
+            route = self._routes.get((worker_id, tp_rank))
+        if route is None:
+            return web.Response(text="route not found", status=404)
+        return web.json_response(route)
+
+    def _run_server(self) -> None:
+        try:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._runner = web.AppRunner(self.app, access_log=None)
+            self._loop.run_until_complete(self._runner.setup())
+            site = web.TCPSite(self._runner, host=self.host, port=self.port)
+            self._loop.run_until_complete(site.start())
+            logger.info("Shared HiCache registry listening on %s", self.endpoint)
+            self._loop.run_forever()
+        except Exception:
+            logger.exception("Shared HiCache registry failed")
+        finally:
+            if self._runner is not None and self._loop is not None:
+                self._loop.run_until_complete(self._runner.cleanup())
+            if self._loop is not None:
+                self._loop.close()
+
+    def shutdown(self) -> None:
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            try:
+                thread.join(timeout=1)
+            except Exception:
+                logger.debug("Shared HiCache registry join failed", exc_info=True)
 
 
 class SharedHiCacheSourceService:

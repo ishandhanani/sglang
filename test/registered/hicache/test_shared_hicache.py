@@ -1,5 +1,6 @@
 import time
 import unittest
+import socket
 from array import array
 from types import SimpleNamespace
 
@@ -12,12 +13,19 @@ from sglang.srt.mem_cache.hicache_host_index import HiCacheHostBlockIndex
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 from sglang.srt.mem_cache.shared_hicache.manager import SharedHiCacheManager
+from sglang.srt.mem_cache.shared_hicache.config import (
+    SharedHiCacheConfig,
+    SharedHiCacheTransferBackendType,
+    normalize_shared_hicache_server_config,
+)
 from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
 from sglang.srt.mem_cache.shared_hicache.scheduler_mixin import (
     SharedHiCacheSchedulerMixin,
     SharedHiCachePrepareStatus,
 )
 from sglang.srt.mem_cache.shared_hicache.service import (
+    SharedHiCacheRegistryClient,
+    SharedHiCacheRegistryServer,
     _decode_control_payload,
     _encode_control_payload,
 )
@@ -40,7 +48,6 @@ def _make_plan(block_hashes, **overrides):
         "request_id": "request-1",
         "target_worker_id": 42,
         "source_worker_id": 7,
-        "source_endpoint": "127.0.0.1:39007",
         "source_medium": StorageMedium.CPU.value,
         "block_hashes": block_hashes,
         "planned_prefix_blocks": len(block_hashes),
@@ -50,6 +57,12 @@ def _make_plan(block_hashes, **overrides):
     }
     plan.update(overrides)
     return plan
+
+
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 class FakeDeviceAllocator:
@@ -241,7 +254,9 @@ def _make_manager():
     manager = SharedHiCacheManager.__new__(SharedHiCacheManager)
     manager.worker_id = 42
     manager.tree_cache = FakeTree(page_size=2)
-    manager.source_endpoints = {}
+    manager.registry_client = SimpleNamespace(
+        resolve=lambda worker_id, tp_rank: "tcp://127.0.0.1:39007"
+    )
     manager._set_parallel_metadata(
         {
             "tp_rank": 1,
@@ -273,14 +288,94 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertNotIn(b"\x80", encoded[:1])
         self.assertEqual(_decode_control_payload([encoded]), payload)
 
+    def test_route_registry_resolves_concrete_rank_endpoint(self):
+        port = _free_port()
+        registry = SharedHiCacheRegistryServer(f"http://127.0.0.1:{port}")
+        self.addCleanup(registry.shutdown)
+        registry.start()
+        client = SharedHiCacheRegistryClient(
+            f"http://127.0.0.1:{port}",
+            timeout_secs=0.25,
+        )
+        for attempt in range(20):
+            try:
+                client.register(
+                    worker_id=7,
+                    tp_rank=1,
+                    tp_size=2,
+                    endpoint="127.0.0.1:39007",
+                )
+                break
+            except Exception:
+                if attempt == 19:
+                    raise
+                time.sleep(0.05)
+
+        self.assertEqual(
+            client.resolve(worker_id=7, tp_rank=1),
+            "tcp://127.0.0.1:39007",
+        )
+        self.assertIsNone(client.resolve(worker_id=7, tp_rank=0))
+
+    def test_server_config_uses_registry_and_rank_base_port(self):
+        enabled, worker_id, config = normalize_shared_hicache_server_config(
+            enable_shared_hicache=True,
+            raw_config={
+                "worker_id": 42,
+                "control": {"host": "127.0.0.1", "base_port": 39000},
+                "registry": {
+                    "endpoint": "http://127.0.0.1:38999",
+                    "serve": True,
+                },
+                "transfer": {"backend": "nixl"},
+            },
+            worker_id=None,
+            enable_hierarchical_cache=True,
+        )
+
+        self.assertTrue(enabled)
+        self.assertEqual(worker_id, 42)
+        self.assertIsInstance(config, SharedHiCacheConfig)
+        self.assertEqual(config.control_base_port, 39000)
+        self.assertEqual(config.registry_endpoint, "http://127.0.0.1:38999")
+        self.assertTrue(config.registry_serve)
+        self.assertEqual(
+            config.transfer_backend,
+            SharedHiCacheTransferBackendType.NIXL,
+        )
+
+        manager = SharedHiCacheManager.__new__(SharedHiCacheManager)
+        manager._set_parallel_metadata({"tp_rank": 3, "tp_size": 4})
+        self.assertEqual(
+            manager._local_control_endpoint(config),
+            "tcp://127.0.0.1:39003",
+        )
+
+        with self.assertRaisesRegex(ValueError, "control.host"):
+            normalize_shared_hicache_server_config(
+                enable_shared_hicache=True,
+                raw_config={
+                    "worker_id": 42,
+                    "control": {"endpoint": "tcp://127.0.0.1:39000"},
+                    "registry": {"endpoint": "http://127.0.0.1:38999"},
+                },
+                worker_id=None,
+                enable_hierarchical_cache=True,
+            )
+
     def test_plan_uses_canonical_schema_only(self):
         plan = SharedHiCachePlan.from_dict(
             _make_plan([11], source_tp_rank=0, source_tp_size=1)
         )
 
         self.assertEqual(plan.source_medium, StorageMedium.CPU.value)
-        self.assertEqual(plan.source_endpoint, "tcp://127.0.0.1:39007")
+        self.assertNotIn("source_endpoint", plan.to_dict())
         self.assertEqual(plan.block_hashes, (11,))
+
+        with self.assertRaisesRegex(ValueError, "source_endpoint is not supported"):
+            SharedHiCachePlan.from_dict(
+                _make_plan([11], source_endpoint="tcp://127.0.0.1:39007")
+            )
 
         with self.assertRaisesRegex(ValueError, "block_hash must be an integer"):
             SharedHiCachePlan.from_dict(_make_plan([{"block_hash": 11}]))
@@ -390,7 +485,7 @@ class TestSharedHiCache(unittest.TestCase):
         cache.protected_size_ = 0
         cache.evictable_leaves = set()
         cache.evictable_host_leaves = set()
-        cache.root_node = TreeNode(priority=-10**9)
+        cache.root_node = TreeNode(priority=-(10**9))
         cache.root_node.key = RadixKey(array("q"))
         cache.root_node.value = []
         cache.root_node.host_value = []
@@ -429,9 +524,7 @@ class TestSharedHiCache(unittest.TestCase):
         )
 
         cpu_events = [
-            event
-            for event in cache.kv_event_queue
-            if event.medium == StorageMedium.CPU
+            event for event in cache.kv_event_queue if event.medium == StorageMedium.CPU
         ]
         prefix_hash = cpu_events[0].block_hashes[0]
         self.assertEqual(
