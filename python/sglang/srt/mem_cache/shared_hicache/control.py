@@ -61,10 +61,7 @@ def pages_from_transfer_result(
         raise ValueError("transferred_blocks must be non-negative")
     transferred_blocks = min(transferred_blocks, max_blocks)
     block_hashes = plan.planned_hashes[start_block : start_block + transferred_blocks]
-    return [
-        ResolvedHostPage(block_hash=block_hash, hash_value="", data=b"")
-        for block_hash in block_hashes
-    ]
+    return [ResolvedHostPage(block_hash=block_hash) for block_hash in block_hashes]
 
 
 class SharedHiCacheTransferHandle:
