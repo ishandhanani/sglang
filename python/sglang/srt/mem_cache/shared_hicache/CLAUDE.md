@@ -19,7 +19,7 @@ hash at transfer time, and every failure must fall back to ordinary prefill.
 - `target.py`: target GPU staging allocation, eviction, quarantine, insert.
 - `source.py`: source request parse, hash lookup, host protection, transfer.
 - `source_queue.py`: bounded source transfer worker pool.
-- `control.py` / `service.py`: JSON ZMQ transfer path and `/route` registry.
+- `control.py` / `service.py`: JSON ZMQ transfer request and completion path.
 - `transfer.py`: NIXL backend and transfer-agent setup.
 
 Do not collapse the small files back into `manager.py`. If cleaning up, move
@@ -32,7 +32,7 @@ router
   -> request.cache_hints.shared_hicache
   -> io_struct.py: SharedHiCachePlan
   -> scheduler_mixin.py: normal local prefix first, TP MIN sync
-  -> manager.py: validate plan, resolve source route, allocate staging, submit
+  -> manager.py: validate plan, derive source endpoint, allocate staging, submit
   -> service.py/source_queue.py: source worker receives async ZMQ request
   -> source.py: validate rank/hash, protect host pages, call NIXL transfer
   -> transfer.py: source HostPinned pages -> target GPU KV pages
@@ -52,23 +52,17 @@ Requires hierarchical cache:
 --enable-hierarchical-cache
 ```
 
-Enable Shared HiCache:
+Enable Shared HiCache in standalone SGLang:
 
 ```bash
---shared-hicache-config /path/to/shared_hicache_config.json
+--enable-shared-hicache
+--shared-hicache-worker-id worker-a
+--shared-hicache-bootstrap-port 41000
+--shared-hicache-transfer-backend nixl
 ```
 
-Config shape:
-
-```json
-{
-  "worker_id": 1,
-  "control": {"host": "10.0.0.11", "base_port": 41000},
-  "registry": {"endpoint": "http://10.0.0.11:40999", "serve": true},
-  "transfer": {"backend": "nixl"},
-  "timeout_secs": 1.0
-}
-```
+Dynamo sets `--shared-hicache-worker-id` from its endpoint connection id before
+constructing the SGLang engine. For raw SGLang launches, set it manually.
 
 Useful envs:
 
@@ -78,9 +72,9 @@ SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM=8
 SGLANG_SHARED_HICACHE_NIXL_TELEMETRY=false
 ```
 
-Every rank binds `tcp://<control.host>:<control.base_port + tp_rank>` and
-registers `(worker_id, tp_rank) -> endpoint` in the registry. Set
-`registry.serve=true` on exactly one worker config, normally source rank 0.
+Every rank binds `tcp://<server_args.host>:<shared_hicache_bootstrap_port + tp_rank>`.
+Plans carry `source_host` and `source_bootstrap_port`, so targets derive the
+source rank endpoint the same way disaggregation derives bootstrap addresses.
 
 ## Plan Requirements
 
@@ -88,8 +82,10 @@ Minimum useful `cache_hints.shared_hicache` fields:
 
 ```json
 {
-  "target_worker_id": 2,
-  "source_worker_id": 1,
+  "target_worker_id": "worker-b",
+  "source_worker_id": "worker-a",
+  "source_host": "10.0.0.11",
+  "source_bootstrap_port": 41000,
   "source_medium": "CPU_PINNED",
   "block_hashes": [111, 222],
   "kv_block_hashes": [111, 222],
@@ -106,7 +102,8 @@ Minimum useful `cache_hints.shared_hicache` fields:
 Rules that matter in practice:
 
 - `source_medium` must be `CPU_PINNED`.
-- Source endpoints are never carried in plans; targets use the route registry.
+- Source endpoints are not carried in plans; targets derive them from
+  `source_host`, `source_bootstrap_port`, and source TP rank.
 - `block_size_tokens` must equal the local HiRadix page size.
 - `source_worker_id != target_worker_id`.
 - TP rank/size must match local topology.
@@ -204,8 +201,7 @@ No hits:
 
 Source request missing:
 
-- Did every source rank register with the route registry?
-- Is the registry endpoint reachable from target to source?
+- Does the plan have the right source host and bootstrap port?
 - Are ZMQ TCP ports reachable from target to source?
 
 Target falls back:

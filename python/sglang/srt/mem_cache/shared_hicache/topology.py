@@ -88,7 +88,7 @@ class SharedHiCacheTopology:
 def validate_shared_hicache_plan(
     plan: SharedHiCachePlan,
     *,
-    worker_id: Optional[int],
+    worker_id: Optional[str],
     page_size: int,
     topology: SharedHiCacheTopology,
 ) -> Optional[str]:

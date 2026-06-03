@@ -1,6 +1,5 @@
 import time
 import unittest
-import socket
 from array import array
 from types import SimpleNamespace
 
@@ -24,8 +23,6 @@ from sglang.srt.mem_cache.shared_hicache.scheduler_mixin import (
     SharedHiCachePrepareStatus,
 )
 from sglang.srt.mem_cache.shared_hicache.service import (
-    SharedHiCacheRegistryClient,
-    SharedHiCacheRegistryServer,
     _decode_control_payload,
     _encode_control_payload,
 )
@@ -46,8 +43,10 @@ def _make_plan(block_hashes, **overrides):
     plan = {
         "plan_id": "plan-1",
         "request_id": "request-1",
-        "target_worker_id": 42,
-        "source_worker_id": 7,
+        "target_worker_id": "target-worker",
+        "source_worker_id": "source-worker",
+        "source_host": "127.0.0.1",
+        "source_bootstrap_port": 39006,
         "source_medium": StorageMedium.CPU.value,
         "block_hashes": block_hashes,
         "planned_prefix_blocks": len(block_hashes),
@@ -57,13 +56,6 @@ def _make_plan(block_hashes, **overrides):
     }
     plan.update(overrides)
     return plan
-
-
-def _free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
 
 class FakeDeviceAllocator:
     def __init__(self):
@@ -252,11 +244,8 @@ class FakeConsensusScheduler(FakeScheduler):
 
 def _make_manager():
     manager = SharedHiCacheManager.__new__(SharedHiCacheManager)
-    manager.worker_id = 42
+    manager.worker_id = "target-worker"
     manager.tree_cache = FakeTree(page_size=2)
-    manager.registry_client = SimpleNamespace(
-        resolve=lambda worker_id, tp_rank: "tcp://127.0.0.1:39007"
-    )
     manager._set_parallel_metadata(
         {
             "tp_rank": 1,
@@ -288,57 +277,21 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertNotIn(b"\x80", encoded[:1])
         self.assertEqual(_decode_control_payload([encoded]), payload)
 
-    def test_route_registry_resolves_concrete_rank_endpoint(self):
-        port = _free_port()
-        registry = SharedHiCacheRegistryServer(f"http://127.0.0.1:{port}")
-        self.addCleanup(registry.shutdown)
-        registry.start()
-        client = SharedHiCacheRegistryClient(
-            f"http://127.0.0.1:{port}",
-            timeout_secs=0.25,
-        )
-        for attempt in range(20):
-            try:
-                client.register(
-                    worker_id=7,
-                    tp_rank=1,
-                    tp_size=2,
-                    endpoint="127.0.0.1:39007",
-                )
-                break
-            except Exception:
-                if attempt == 19:
-                    raise
-                time.sleep(0.05)
-
-        self.assertEqual(
-            client.resolve(worker_id=7, tp_rank=1),
-            "tcp://127.0.0.1:39007",
-        )
-        self.assertIsNone(client.resolve(worker_id=7, tp_rank=0))
-
-    def test_server_config_uses_registry_and_rank_base_port(self):
+    def test_server_config_uses_host_and_bootstrap_port(self):
         enabled, worker_id, config = normalize_shared_hicache_server_config(
             enable_shared_hicache=True,
-            raw_config={
-                "worker_id": 42,
-                "control": {"host": "127.0.0.1", "base_port": 39000},
-                "registry": {
-                    "endpoint": "http://127.0.0.1:38999",
-                    "serve": True,
-                },
-                "transfer": {"backend": "nixl"},
-            },
-            worker_id=None,
+            worker_id="target-worker",
+            host="127.0.0.1",
+            bootstrap_port=39000,
+            timeout_secs=1.0,
+            transfer_backend="nixl",
             enable_hierarchical_cache=True,
         )
 
         self.assertTrue(enabled)
-        self.assertEqual(worker_id, 42)
+        self.assertEqual(worker_id, "target-worker")
         self.assertIsInstance(config, SharedHiCacheConfig)
-        self.assertEqual(config.control_base_port, 39000)
-        self.assertEqual(config.registry_endpoint, "http://127.0.0.1:38999")
-        self.assertTrue(config.registry_serve)
+        self.assertEqual(config.bootstrap_port, 39000)
         self.assertEqual(
             config.transfer_backend,
             SharedHiCacheTransferBackendType.NIXL,
@@ -350,16 +303,23 @@ class TestSharedHiCache(unittest.TestCase):
             manager._local_control_endpoint(config),
             "tcp://127.0.0.1:39003",
         )
+        self.assertEqual(
+            manager._source_control_endpoint_for_plan(
+                SharedHiCachePlan.from_dict(
+                    _make_plan([11], source_tp_rank=3, source_tp_size=4)
+                )
+            ),
+            "tcp://127.0.0.1:39009",
+        )
 
-        with self.assertRaisesRegex(ValueError, "control.host"):
+        with self.assertRaisesRegex(ValueError, "host"):
             normalize_shared_hicache_server_config(
                 enable_shared_hicache=True,
-                raw_config={
-                    "worker_id": 42,
-                    "control": {"endpoint": "tcp://127.0.0.1:39000"},
-                    "registry": {"endpoint": "http://127.0.0.1:38999"},
-                },
-                worker_id=None,
+                worker_id="target-worker",
+                host="",
+                bootstrap_port=39000,
+                timeout_secs=1.0,
+                transfer_backend="auto",
                 enable_hierarchical_cache=True,
             )
 
@@ -370,6 +330,8 @@ class TestSharedHiCache(unittest.TestCase):
 
         self.assertEqual(plan.source_medium, StorageMedium.CPU.value)
         self.assertNotIn("source_endpoint", plan.to_dict())
+        self.assertEqual(plan.source_host, "127.0.0.1")
+        self.assertEqual(plan.source_bootstrap_port, 39006)
         self.assertEqual(plan.block_hashes, (11,))
 
         with self.assertRaisesRegex(ValueError, "source_endpoint is not supported"):
@@ -590,7 +552,7 @@ class TestSharedHiCache(unittest.TestCase):
             plan,
             start_block=0,
             max_blocks=1,
-            worker_id=7,
+            worker_id="source-worker",
         )
 
         self.assertEqual(reason, "ok")
@@ -622,7 +584,7 @@ class TestSharedHiCache(unittest.TestCase):
             plan,
             start_block=0,
             max_blocks=1,
-            worker_id=7,
+            worker_id="source-worker",
         )
 
         self.assertEqual(pages, [])
@@ -667,7 +629,7 @@ class TestSharedHiCache(unittest.TestCase):
             request=request,
             transfer_backend=FakeTransferBackend(),
             tree_cache=FakeTree(),
-            worker_id=7,
+            worker_id="source-worker",
             tp_rank=0,
             tp_size=2,
             attn_tp_size=2,

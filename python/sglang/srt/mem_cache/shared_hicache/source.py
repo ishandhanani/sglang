@@ -111,7 +111,7 @@ def resolve_host_pages(
     *,
     start_block: int,
     max_blocks: int,
-    worker_id: Optional[int],
+    worker_id: Optional[str],
 ) -> tuple[list[ResolvedHostPage], str]:
     pages, reason, protected_nodes = resolve_host_page_locations(
         tree_cache,
@@ -144,7 +144,7 @@ def resolve_host_page_locations(
     *,
     start_block: int,
     max_blocks: int,
-    worker_id: Optional[int],
+    worker_id: Optional[str],
     tp_rank: int = 0,
     tp_size: int = 1,
     pp_size: int = 1,
@@ -530,7 +530,7 @@ def execute_source_transfer_request(
     request: SourceTransferRequest,
     transfer_backend: SharedHiCacheTransferBackend,
     tree_cache,
-    worker_id: Optional[int],
+    worker_id: Optional[str],
     tp_rank: int = 0,
     tp_size: int = 1,
     pp_size: int = 1,

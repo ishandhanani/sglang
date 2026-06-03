@@ -24,7 +24,7 @@ class SharedHiCacheSourceTransferQueue:
         self,
         *,
         tree_cache,
-        worker_id: Optional[int],
+        worker_id: Optional[str],
         transfer_backend: Optional[SharedHiCacheTransferBackend],
         worker_limit: int,
         send_transfer_done: Callable[[str, Mapping[str, Any]], None],
