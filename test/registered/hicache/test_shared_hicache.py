@@ -114,7 +114,7 @@ class FakeTree:
     def is_chunk_cache(self):
         return False
 
-    def evict(self, params):
+    def evict(self, _params):
         return SimpleNamespace(num_tokens_evicted=0)
 
 
@@ -135,10 +135,10 @@ class FakeNixlAgent:
         self.check_error = check_error
         self.released = []
 
-    def transfer(self, handle):
+    def transfer(self, _handle):
         return self.initial_state
 
-    def check_xfer_state(self, handle):
+    def check_xfer_state(self, _handle):
         if self.check_error is not None:
             raise self.check_error
         return "DONE"
@@ -158,6 +158,7 @@ class FakeSharedHiCacheReq:
         self.init_calls = []
 
     def init_next_round_input(self, tree_cache=None, cow_mamba=None):
+        assert tree_cache is not None
         assert cow_mamba in (None, False)
         self.init_calls.append(self.shared_hicache_max_prefix_len)
         prefix_len = self.local_prefix_len
@@ -173,7 +174,7 @@ class FakeScheduleManager:
         self.prepared = []
         self.released = []
 
-    def has_reuse_plan(self, req):
+    def has_reuse_plan(self, _req):
         return True
 
     def prepare_reuse(self, req):
@@ -193,7 +194,7 @@ class FakeScheduler(SharedHiCacheSchedulerMixin):
         self.chunked_req = None
         self.enable_priority_preemption = False
 
-    def get_num_allocatable_reqs(self, running_bs):
+    def get_num_allocatable_reqs(self, _running_bs):
         return 1
 
 
@@ -418,11 +419,18 @@ class TestSharedHiCache(unittest.TestCase):
         cache.root_node.host_value = []
         cache.root_node.hash_value = []
         cache.root_node.lock_ref = 1
-        cache._update_leaf_status = lambda node: None
-        cache._update_host_leaf_status = lambda node: None
-        cache.inc_lock_ref = lambda node: None
-        cache.dec_lock_ref = lambda node: None
-        cache.evict_host = lambda num_tokens: 0
+        def ignore_node(node):
+            self.assertIsNotNone(node)
+
+        def evict_host(num_tokens):
+            self.assertGreaterEqual(num_tokens, 0)
+            return 0
+
+        cache._update_leaf_status = ignore_node
+        cache._update_host_leaf_status = ignore_node
+        cache.inc_lock_ref = ignore_node
+        cache.dec_lock_ref = ignore_node
+        cache.evict_host = evict_host
 
         cache.insert(
             InsertParams(

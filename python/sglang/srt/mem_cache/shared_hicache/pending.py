@@ -31,7 +31,7 @@ def format_optional_ms(value: Optional[float]) -> str:
 
 
 def pending_wait_ms(pending: SharedHiCachePendingFetch) -> Optional[float]:
-    submitted_at = getattr(pending, "submitted_at", 0.0)
+    submitted_at = pending.submitted_at
     if submitted_at <= 0:
         return None
     return (time.perf_counter() - submitted_at) * 1000
@@ -92,7 +92,7 @@ def pending_should_stop_waiting(
 def transfer_bytes_for_pages(
     pending: SharedHiCachePendingFetch, pages: list[ResolvedHostPage]
 ) -> int:
-    bytes_per_page = int(getattr(pending, "bytes_per_page", 0) or 0)
+    bytes_per_page = int(pending.bytes_per_page or 0)
     if bytes_per_page > 0:
         return len(pages) * bytes_per_page
     return 0

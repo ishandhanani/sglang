@@ -486,7 +486,7 @@ class SharedHiCacheManager:
         return last_node
 
     def _unlock_pending_prefix(self, pending: SharedHiCachePendingFetch) -> None:
-        locked_node = getattr(pending, "locked_node", None)
+        locked_node = pending.locked_node
         if locked_node is None:
             return
         pending.locked_node = None
@@ -500,7 +500,7 @@ class SharedHiCacheManager:
                 self.target_transfer_tracker.finish(transfer_id)
             self._release_fetch_worker()
             return
-        backend = getattr(pending, "backend", self._current_backend_label())
+        backend = pending.backend
         transfer = pending.transfer
         if transfer.done():
             _, reason = transfer.result()
@@ -534,9 +534,11 @@ class SharedHiCacheManager:
         direct_transfer = getattr(self, "direct_transfer", None)
         if not self._direct_transfer_enabled():
             return SharedHiCacheDirectSubmitResult(reason="direct_transfer_unavailable")
-        source_endpoint = self._source_control_endpoint_for_plan(plan)
-        if not source_endpoint:
-            return SharedHiCacheDirectSubmitResult(reason="source_endpoint_unavailable")
+        source_control_endpoint = self._source_control_endpoint_for_plan(plan)
+        if not source_control_endpoint:
+            return SharedHiCacheDirectSubmitResult(
+                reason="source_control_endpoint_unavailable"
+            )
         if not self._try_acquire_fetch_worker():
             return SharedHiCacheDirectSubmitResult(reason="fetch_worker_unavailable")
 
@@ -599,7 +601,7 @@ class SharedHiCacheManager:
         self.target_transfer_tracker.start(transfer_id)
         try:
             self._send_control_message(
-                source_endpoint,
+                source_control_endpoint,
                 {
                     "kind": SHARED_HICACHE_TRANSFER_REQUEST,
                     "transfer_id": transfer_id,
@@ -623,7 +625,7 @@ class SharedHiCacheManager:
                 "Shared HiCache direct transfer control send failed plan_id=%s source_worker=%s endpoint=%s",
                 plan.plan_id,
                 plan.source_worker_id,
-                source_endpoint,
+                source_control_endpoint,
                 exc_info=True,
             )
             return SharedHiCacheDirectSubmitResult(
@@ -990,9 +992,7 @@ class SharedHiCacheManager:
                     self.target_cache.quarantine_device_indices(
                         pending.device_indices,
                         reason,
-                        backend=getattr(
-                            pending, "backend", self._current_backend_label()
-                        ),
+                        backend=pending.backend,
                     )
                 else:
                     self.target_cache.free_device_indices(pending.device_indices)
