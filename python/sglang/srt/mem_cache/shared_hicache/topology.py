@@ -3,14 +3,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Optional
 
-from sglang.srt.mem_cache.shared_hicache.plan import (
-    SHARED_HICACHE_PLAN_VERSION,
-    SharedHiCachePlan,
-)
+from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
 
 
 @dataclass(frozen=True)
 class SharedHiCacheTopology:
+    """Local rank layout used to keep Shared HiCache transfers on matching TP ranks."""
+
     tp_rank: int = 0
     tp_size: int = 1
     pp_rank: int = 0
@@ -149,30 +148,3 @@ class SharedHiCacheTopology:
                 f"source={self.tp_rank}:target={target_tp_rank}"
             )
         return None
-
-
-def validate_shared_hicache_plan(
-    plan: SharedHiCachePlan,
-    *,
-    worker_id: Optional[str],
-    page_size: int,
-    topology: SharedHiCacheTopology,
-) -> Optional[str]:
-    if worker_id is None:
-        return "missing_worker_id"
-    if plan.target_worker_id != worker_id:
-        return "wrong_target_worker"
-    rank_rejection = topology.validate_target_rank(plan)
-    if rank_rejection is not None:
-        return rank_rejection
-    if plan.source_worker_id == plan.target_worker_id:
-        return "source_is_target"
-    if plan.plan_version != SHARED_HICACHE_PLAN_VERSION:
-        return "unsupported_plan_version"
-    if plan.is_expired():
-        return "plan_expired"
-    if not plan.is_shared_hicache():
-        return "unsupported_source_medium"
-    if plan.block_size_tokens != page_size:
-        return "incompatible_block_size"
-    return None

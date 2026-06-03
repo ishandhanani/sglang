@@ -13,8 +13,6 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 from sglang.srt.mem_cache.shared_hicache.manager import SharedHiCacheManager
 from sglang.srt.mem_cache.shared_hicache.config import (
-    SharedHiCacheConfig,
-    SharedHiCacheTransferBackendType,
     normalize_shared_hicache_server_config,
 )
 from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
@@ -238,28 +236,30 @@ def _make_manager():
 
 class TestSharedHiCache(unittest.TestCase):
     def test_server_config_uses_host_and_bootstrap_port(self):
-        enabled, worker_id, config = normalize_shared_hicache_server_config(
-            enable_shared_hicache=True,
-            worker_id="target-worker",
-            host="127.0.0.1",
-            bootstrap_port=39000,
-            transfer_backend="nixl",
-            enable_hierarchical_cache=True,
+        enabled, worker_id, bootstrap_port, transfer_backend = (
+            normalize_shared_hicache_server_config(
+                enable_shared_hicache=True,
+                worker_id="target-worker",
+                bootstrap_port=39000,
+                transfer_backend="nixl",
+                enable_hierarchical_cache=True,
+            )
         )
 
         self.assertTrue(enabled)
         self.assertEqual(worker_id, "target-worker")
-        self.assertIsInstance(config, SharedHiCacheConfig)
-        self.assertEqual(config.bootstrap_port, 39000)
-        self.assertEqual(
-            config.transfer_backend,
-            SharedHiCacheTransferBackendType.NIXL,
-        )
+        self.assertEqual(bootstrap_port, 39000)
+        self.assertEqual(transfer_backend, "nixl")
 
         manager = SharedHiCacheManager.__new__(SharedHiCacheManager)
         manager._set_topology(SharedHiCacheTopology(tp_rank=3, tp_size=4))
         self.assertEqual(
-            manager._local_control_endpoint(config),
+            manager._local_control_endpoint(
+                SimpleNamespace(
+                    host="127.0.0.1",
+                    shared_hicache_bootstrap_port=bootstrap_port,
+                )
+            ),
             "tcp://127.0.0.1:39003",
         )
         self.assertEqual(
@@ -272,13 +272,11 @@ class TestSharedHiCache(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "host"):
-            normalize_shared_hicache_server_config(
-                enable_shared_hicache=True,
-                worker_id="target-worker",
-                host="",
-                bootstrap_port=39000,
-                transfer_backend="nixl",
-                enable_hierarchical_cache=True,
+            manager._local_control_endpoint(
+                SimpleNamespace(
+                    host="",
+                    shared_hicache_bootstrap_port=bootstrap_port,
+                )
             )
 
         with self.assertRaisesRegex(
@@ -288,7 +286,6 @@ class TestSharedHiCache(unittest.TestCase):
             normalize_shared_hicache_server_config(
                 enable_shared_hicache=True,
                 worker_id="target-worker",
-                host="127.0.0.1",
                 bootstrap_port=39000,
                 transfer_backend=None,
                 enable_hierarchical_cache=True,
@@ -298,7 +295,6 @@ class TestSharedHiCache(unittest.TestCase):
             normalize_shared_hicache_server_config(
                 enable_shared_hicache=True,
                 worker_id="target-worker",
-                host="127.0.0.1",
                 bootstrap_port=39000,
                 transfer_backend="auto",
                 enable_hierarchical_cache=True,
@@ -315,7 +311,7 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertEqual(plan.router_block_hashes, (11,))
         self.assertEqual(plan.engine_block_hashes, (11,))
 
-        with self.assertRaisesRegex(ValueError, "router_block_hash must be an integer"):
+        with self.assertRaisesRegex(ValueError, "router_block_hashes"):
             SharedHiCachePlan.from_dict(_make_plan([{"block_hash": 11}]))
 
         missing_engine_hashes = _make_plan([11])
@@ -328,16 +324,16 @@ class TestSharedHiCache(unittest.TestCase):
                 _make_plan([11], engine_block_hashes=[11, 12])
             )
 
-    def test_plan_normalizes_uint64_hashes_to_signed_int64(self):
+    def test_plan_keeps_router_and_engine_hash_representations_separate(self):
         signed_hash = hash_str_to_int64("aa" * 32)
         unsigned_hash = signed_hash & (2**64 - 1)
 
         plan = SharedHiCachePlan.from_dict(
-            _make_plan([unsigned_hash], engine_block_hashes=[unsigned_hash])
+            _make_plan([unsigned_hash], engine_block_hashes=[signed_hash])
         )
 
         self.assertGreater(unsigned_hash, 2**63 - 1)
-        self.assertEqual(plan.router_block_hashes, (signed_hash,))
+        self.assertEqual(plan.router_block_hashes, (unsigned_hash,))
         self.assertEqual(plan.engine_block_hashes, (signed_hash,))
 
     def test_generate_req_input_reads_shared_plan_from_cache_hints(self):

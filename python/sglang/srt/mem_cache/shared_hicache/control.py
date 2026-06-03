@@ -4,68 +4,22 @@ import logging
 import threading
 import time
 from typing import Any, Callable, Mapping, Optional
-from urllib.parse import urlparse
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.mem_cache.shared_hicache.plan import (
     SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
     SharedHiCachePlan,
-    normalize_endpoint,
 )
 from sglang.srt.mem_cache.shared_hicache.source import ResolvedHostPage
 from sglang.srt.mem_cache.shared_hicache.transfer.common import (
     SharedHiCacheTransferBackend,
 )
-from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
 
 SHARED_HICACHE_TRANSFER_REQUEST = "shared_hicache_transfer_request"
 SHARED_HICACHE_TRANSFER_DONE = "shared_hicache_transfer_done"
-
-
-def endpoint_to_zmq(endpoint: str) -> str:
-    parsed = urlparse(normalize_endpoint(endpoint))
-    if parsed.scheme != "tcp":
-        raise ValueError(f"unsupported shared HiCache endpoint scheme: {parsed.scheme}")
-    if parsed.hostname is None or parsed.port is None:
-        raise ValueError(
-            f"shared HiCache endpoint must include host and port: {endpoint}"
-        )
-    return NetworkAddress(parsed.hostname, parsed.port).to_tcp()
-
-
-def is_indeterminate_direct_transfer_reason(reason: str) -> bool:
-    reason = str(reason)
-    return reason.startswith(SHARED_HICACHE_DIRECT_TIMEOUT_REASON)
-
-
-def _coerce_int(value: Any, field_name: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{field_name} must be an integer, got {value!r}")
-    if isinstance(value, int):
-        return int(value)
-    raise ValueError(f"{field_name} must be an integer, got {value!r}")
-
-
-def pages_from_transfer_result(
-    payload: Mapping[str, Any],
-    plan: SharedHiCachePlan,
-    *,
-    start_block: int,
-    max_blocks: int,
-) -> list[ResolvedHostPage]:
-    transferred_blocks = _coerce_int(
-        payload.get("transferred_blocks", 0), "transferred_blocks"
-    )
-    if transferred_blocks < 0:
-        raise ValueError("transferred_blocks must be non-negative")
-    transferred_blocks = min(transferred_blocks, max_blocks)
-    router_hashes = plan.planned_router_block_hashes[
-        start_block : start_block + transferred_blocks
-    ]
-    return [ResolvedHostPage(block_hash=block_hash) for block_hash in router_hashes]
 
 
 class SharedHiCacheTransferHandle:
@@ -96,6 +50,15 @@ class SharedHiCacheTransferHandle:
         self._reason = "source_transfer_pending"
         self._source_terminal_seen = False
 
+    def _pages_for_transferred_blocks(
+        self, transferred_blocks: int
+    ) -> list[ResolvedHostPage]:
+        transferred_blocks = min(max(0, int(transferred_blocks)), self.max_blocks)
+        router_hashes = self.plan.planned_router_block_hashes[
+            self.start_block : self.start_block + transferred_blocks
+        ]
+        return [ResolvedHostPage(block_hash=block_hash) for block_hash in router_hashes]
+
     def poll(self) -> KVPoll:
         if self._status in (KVPoll.Success, KVPoll.Failed):
             return self._status
@@ -113,12 +76,7 @@ class SharedHiCacheTransferHandle:
         notification = self._pop_target_transfer_notification()
         if notification is not None:
             transferred_blocks, reason = notification
-            pages = pages_from_transfer_result(
-                {"transferred_blocks": transferred_blocks},
-                self.plan,
-                start_block=self.start_block,
-                max_blocks=self.max_blocks,
-            )
+            pages = self._pages_for_transferred_blocks(transferred_blocks)
             logger.debug(
                 "Shared HiCache target NIXL notification completed transfer_id=%s pages=%d reason=%s source_terminal_seen=%s",
                 self.transfer_id,
@@ -137,20 +95,12 @@ class SharedHiCacheTransferHandle:
                 self._finish(KVPoll.Failed, [], reason)
                 return self._status
             try:
-                transferred_blocks = _coerce_int(
-                    completion.get("transferred_blocks", 0),
-                    "transferred_blocks",
-                )
-            except ValueError:
+                transferred_blocks = int(completion.get("transferred_blocks", 0))
+            except (TypeError, ValueError):
                 self._finish(KVPoll.Failed, [], "malformed_source_transfer_done")
                 return self._status
             if transferred_blocks <= 0:
-                pages = pages_from_transfer_result(
-                    completion,
-                    self.plan,
-                    start_block=self.start_block,
-                    max_blocks=self.max_blocks,
-                )
+                pages = self._pages_for_transferred_blocks(transferred_blocks)
                 self._finish(KVPoll.Success, pages, reason)
                 return self._status
             # Positive source completion is not a readiness signal. Match disagg:

@@ -13,39 +13,26 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.mem_cache.radix_cache import TreeNode
-from sglang.srt.mem_cache.shared_hicache.config import (
-    SharedHiCacheConfig,
-    shared_hicache_timeout_secs,
-)
+from sglang.srt.mem_cache.shared_hicache.config import shared_hicache_timeout_secs
 from sglang.srt.mem_cache.shared_hicache.control import (
     SHARED_HICACHE_TRANSFER_DONE,
     SHARED_HICACHE_TRANSFER_REQUEST,
     SharedHiCacheTargetTransferTracker,
     SharedHiCacheTransferHandle,
-    is_indeterminate_direct_transfer_reason,
 )
-from sglang.srt.mem_cache.shared_hicache.pending import (
-    SharedHiCachePendingFetch,
-    format_optional_ms,
-    pending_ready_wait_ms,
-    pending_should_stop_waiting,
-    pending_wait_ms,
-    transfer_bytes_for_pages,
-)
+from sglang.srt.mem_cache.shared_hicache.pending import SharedHiCachePendingFetch
 from sglang.srt.mem_cache.shared_hicache.plan import (
     SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
+    SHARED_HICACHE_PLAN_VERSION,
+    SHARED_HICACHE_SOURCE_MEDIUM,
     SharedHiCachePlan,
-    normalize_endpoint,
 )
 from sglang.srt.mem_cache.shared_hicache.service import SharedHiCacheSourceService
 from sglang.srt.mem_cache.shared_hicache.source_queue import (
     SharedHiCacheSourceTransferQueue,
 )
 from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
-from sglang.srt.mem_cache.shared_hicache.topology import (
-    SharedHiCacheTopology,
-    validate_shared_hicache_plan,
-)
+from sglang.srt.mem_cache.shared_hicache.topology import SharedHiCacheTopology
 from sglang.srt.mem_cache.shared_hicache.transfer import (
     make_shared_hicache_transfer_backend,
 )
@@ -95,17 +82,13 @@ class SharedHiCacheManager:
         self.tree_cache = tree_cache
         self.worker_id = worker_id
         self._set_topology(topology)
-        raw_config = getattr(server_args, "shared_hicache_config", None)
-        config = raw_config if isinstance(raw_config, SharedHiCacheConfig) else None
-        self.timeout_secs = (
-            config.timeout_secs if config is not None else shared_hicache_timeout_secs()
-        )
+        self.timeout_secs = shared_hicache_timeout_secs()
         self.prefetch_stop_policy = getattr(
             server_args, "hicache_storage_prefetch_policy", "timeout"
         )
         self.direct_transfer = direct_transfer
         self.metrics_collector = metrics_collector
-        self.endpoint = self._local_control_endpoint(config)
+        self.endpoint = self._local_control_endpoint(server_args)
         self.source_service: Optional[SharedHiCacheSourceService] = None
         self._shutdown = False
         fetch_worker_limit = max(
@@ -156,16 +139,20 @@ class SharedHiCacheManager:
 
     def _local_control_endpoint(
         self,
-        config: Optional[SharedHiCacheConfig],
+        server_args: ServerArgs,
     ) -> Optional[str]:
-        if config is None:
+        bootstrap_port = getattr(server_args, "shared_hicache_bootstrap_port", None)
+        if bootstrap_port is None:
             return None
-        port = int(config.bootstrap_port) + int(self.tp_rank)
+        port = int(bootstrap_port) + int(self.tp_rank)
         if port > 65535:
             raise ValueError(
                 "shared_hicache_bootstrap_port + tp_rank exceeds 65535"
             )
-        return f"tcp://{config.control_host}:{port}"
+        host = str(getattr(server_args, "host", "")).strip()
+        if not host:
+            raise ValueError("host must be non-empty when SharedHiCache is enabled")
+        return f"tcp://{host}:{port}"
 
     @classmethod
     def from_scheduler(cls, scheduler) -> Optional["SharedHiCacheManager"]:
@@ -373,7 +360,7 @@ class SharedHiCacheManager:
                 plan.source_bootstrap_port,
             )
             return None
-        return normalize_endpoint(f"{plan.source_host}:{port}")
+        return f"tcp://{plan.source_host}:{port}"
 
     def _send_control_message(self, endpoint: str, payload: Mapping[str, Any]) -> None:
         source_service = getattr(self, "source_service", None)
@@ -428,15 +415,61 @@ class SharedHiCacheManager:
         return max_prefix_len // self.tree_cache.page_size
 
     def _validate_plan(self, plan: SharedHiCachePlan) -> Optional[str]:
-        return validate_shared_hicache_plan(
-            plan,
-            worker_id=self.worker_id,
-            page_size=self.tree_cache.page_size,
-            topology=self.topology,
-        )
+        if self.worker_id is None:
+            return "missing_worker_id"
+        if plan.target_worker_id != self.worker_id:
+            return "wrong_target_worker"
+        rank_rejection = self.topology.validate_target_rank(plan)
+        if rank_rejection is not None:
+            return rank_rejection
+        if plan.source_worker_id == plan.target_worker_id:
+            return "source_is_target"
+        if plan.plan_version != SHARED_HICACHE_PLAN_VERSION:
+            return "unsupported_plan_version"
+        if plan.is_expired():
+            return "plan_expired"
+        if plan.source_medium != SHARED_HICACHE_SOURCE_MEDIUM:
+            return "unsupported_source_medium"
+        if plan.block_size_tokens != self.tree_cache.page_size:
+            return "incompatible_block_size"
+        return None
 
     def _plan_key(self, req: Req, plan: SharedHiCachePlan) -> tuple[str, str]:
         return str(req.rid), plan.plan_id
+
+    def _pending_wait_ms(self, pending: SharedHiCachePendingFetch) -> Optional[float]:
+        if pending.submitted_at <= 0:
+            return None
+        return (time.perf_counter() - pending.submitted_at) * 1000
+
+    def _pending_ready_wait_ms(
+        self, pending: SharedHiCachePendingFetch
+    ) -> Optional[float]:
+        done_at = pending.done_at or float(getattr(pending.transfer, "done_at", 0.0))
+        if done_at <= 0:
+            return None
+        return max(0.0, (time.perf_counter() - done_at) * 1000)
+
+    def _pending_should_stop_waiting(
+        self, pending: SharedHiCachePendingFetch
+    ) -> tuple[bool, str]:
+        policy = str(getattr(self, "prefetch_stop_policy", "timeout"))
+        if policy == "best_effort":
+            return True, "best_effort_incomplete"
+        if policy == "wait_complete":
+            return False, ""
+        if policy == "timeout":
+            elapsed = time.perf_counter() - pending.submitted_at
+            if self.timeout_secs >= 0 and elapsed > self.timeout_secs:
+                return True, "prefetch_timeout"
+            return False, ""
+        return True, "unknown_prefetch_policy"
+
+    def _pending_transfer_bytes(
+        self, pending: SharedHiCachePendingFetch, page_count: int
+    ) -> int:
+        bytes_per_page = int(pending.bytes_per_page or 0)
+        return int(page_count) * bytes_per_page if bytes_per_page > 0 else 0
 
     def has_pending(self) -> bool:
         source_transfer_queue = getattr(self, "source_transfer_queue", None)
@@ -484,7 +517,7 @@ class SharedHiCacheManager:
             transfer_id = getattr(transfer, "transfer_id", None)
             if transfer_id:
                 self.target_transfer_tracker.finish(transfer_id)
-            if is_indeterminate_direct_transfer_reason(reason):
+            if str(reason).startswith(SHARED_HICACHE_DIRECT_TIMEOUT_REASON):
                 self.target_cache.quarantine_device_indices(
                     pending.device_indices, reason, backend=backend
                 )
@@ -736,16 +769,7 @@ class SharedHiCacheManager:
                 self._pending_fetches.pop(str(req.rid), None)
                 self._release_pending_fetch(pending)
             elif pending.transfer.poll() not in (KVPoll.Success, KVPoll.Failed):
-                stop_waiting, reason = pending_should_stop_waiting(
-                    pending,
-                    policy=str(getattr(self, "prefetch_stop_policy", "timeout")),
-                    page_size=self.tree_cache.page_size,
-                    timeout_secs=float(getattr(self, "timeout_secs", 0.0)),
-                    # Shared remote transfers use the SharedHiCache timeout.
-                    # HiCache storage's canary timeout is tuned for local storage
-                    # prefetch and can race slower TP ranks.
-                    prefetch_timeout_config=None,
-                )
+                stop_waiting, reason = self._pending_should_stop_waiting(pending)
                 if stop_waiting:
                     self._pending_fetches.pop(str(req.rid), None)
                     self._release_pending_fetch(pending)
@@ -754,7 +778,7 @@ class SharedHiCacheManager:
                         backend=pending.backend,
                         outcome="miss",
                         reason=reason,
-                        wait_ms=pending_wait_ms(pending),
+                        wait_ms=self._pending_wait_ms(pending),
                     )
                     return SharedHiCacheResult()
                 return SharedHiCacheResult(pending=True)
@@ -923,7 +947,7 @@ class SharedHiCacheManager:
                 backend=pending.backend,
                 outcome="error",
                 reason="fetch_exception",
-                wait_ms=pending_wait_ms(pending),
+                wait_ms=self._pending_wait_ms(pending),
             )
             self._release_fetch_worker()
             return SharedHiCacheResult()
@@ -939,7 +963,9 @@ class SharedHiCacheManager:
                 reason,
             )
             self._unlock_pending_prefix(pending)
-            indeterminate_transfer = is_indeterminate_direct_transfer_reason(reason)
+            indeterminate_transfer = str(reason).startswith(
+                SHARED_HICACHE_DIRECT_TIMEOUT_REASON
+            )
             if pending.device_indices is not None:
                 if indeterminate_transfer:
                     self.target_cache.quarantine_device_indices(
@@ -954,7 +980,7 @@ class SharedHiCacheManager:
                 backend=pending.backend,
                 outcome="error" if indeterminate_transfer else "miss",
                 reason=reason,
-                wait_ms=pending_wait_ms(pending),
+                wait_ms=self._pending_wait_ms(pending),
             )
             self._release_fetch_worker()
             return SharedHiCacheResult()
@@ -975,8 +1001,8 @@ class SharedHiCacheManager:
                 backend=pending.backend,
                 outcome="error",
                 reason="too_many_pages",
-                wait_ms=pending_wait_ms(pending),
-                transfer_bytes=transfer_bytes_for_pages(pending, pages),
+                wait_ms=self._pending_wait_ms(pending),
+                transfer_bytes=self._pending_transfer_bytes(pending, len(pages)),
             )
             self._release_fetch_worker()
             return SharedHiCacheResult()
@@ -996,8 +1022,8 @@ class SharedHiCacheManager:
                 backend=pending.backend,
                 outcome="error",
                 reason="non_contiguous_pages",
-                wait_ms=pending_wait_ms(pending),
-                transfer_bytes=transfer_bytes_for_pages(pending, pages),
+                wait_ms=self._pending_wait_ms(pending),
+                transfer_bytes=self._pending_transfer_bytes(pending, len(pages)),
             )
             self._release_fetch_worker()
             return SharedHiCacheResult()
@@ -1013,7 +1039,7 @@ class SharedHiCacheManager:
                     backend=pending.backend,
                     outcome="error",
                     reason="missing_target_device_indices",
-                    wait_ms=pending_wait_ms(pending),
+                    wait_ms=self._pending_wait_ms(pending),
                 )
                 self._release_fetch_worker()
                 return SharedHiCacheResult()
@@ -1035,9 +1061,9 @@ class SharedHiCacheManager:
                 backend=pending.backend,
                 outcome="error",
                 reason="insert_exception",
-                wait_ms=pending_wait_ms(pending),
+                wait_ms=self._pending_wait_ms(pending),
                 insert_ms=insert_ms,
-                transfer_bytes=transfer_bytes_for_pages(pending, pages),
+                transfer_bytes=self._pending_transfer_bytes(pending, len(pages)),
             )
             self._release_fetch_worker()
             return SharedHiCacheResult()
@@ -1052,8 +1078,8 @@ class SharedHiCacheManager:
             req.shared_hicache_hit_length = (
                 getattr(req, "shared_hicache_hit_length", 0) + staged_tokens
             )
-            wait_ms = pending_wait_ms(pending)
-            ready_wait_ms = pending_ready_wait_ms(pending)
+            wait_ms = self._pending_wait_ms(pending)
+            ready_wait_ms = self._pending_ready_wait_ms(pending)
             logger.info(
                 "Shared HiCache staged %d tokens rid=%s plan_id=%s source_worker=%s fetched_tokens=%d prefix_len=%d wait_ms=%s ready_wait_ms=%s insert_ms=%.3f direct=%s",
                 staged_tokens,
@@ -1062,8 +1088,8 @@ class SharedHiCacheManager:
                 plan.source_worker_id,
                 fetched_tokens,
                 prefix_len,
-                format_optional_ms(wait_ms),
-                format_optional_ms(ready_wait_ms),
+                "n/a" if wait_ms is None else f"{wait_ms:.3f}",
+                "n/a" if ready_wait_ms is None else f"{ready_wait_ms:.3f}",
                 insert_ms,
                 pending.device_indices is not None,
             )
@@ -1076,9 +1102,9 @@ class SharedHiCacheManager:
             outcome=outcome,
             reason=reason if staged_tokens > 0 else "insert_returned_zero",
             tokens=staged_tokens,
-            wait_ms=pending_wait_ms(pending),
+            wait_ms=self._pending_wait_ms(pending),
             insert_ms=insert_ms,
-            transfer_bytes=transfer_bytes_for_pages(pending, pages),
+            transfer_bytes=self._pending_transfer_bytes(pending, len(pages)),
         )
         self._release_fetch_worker()
         return SharedHiCacheResult(staged_tokens=staged_tokens, prefix_len=prefix_len)

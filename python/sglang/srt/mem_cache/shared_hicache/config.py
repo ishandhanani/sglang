@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
@@ -16,20 +15,6 @@ SHARED_HICACHE_TRANSFER_BACKEND_CHOICES = [
 ]
 
 
-@dataclass(frozen=True)
-class SharedHiCacheConfig:
-    control_host: str
-    bootstrap_port: int
-    timeout_secs: float
-    transfer_backend: SharedHiCacheTransferBackendType
-
-    def __post_init__(self) -> None:
-        backend = self.transfer_backend
-        if not isinstance(backend, SharedHiCacheTransferBackendType):
-            backend = SharedHiCacheTransferBackendType(str(backend).lower())
-        object.__setattr__(self, "transfer_backend", backend)
-
-
 def shared_hicache_transfer_backend_name(server_args) -> str:
     backend = getattr(server_args, "shared_hicache_transfer_backend", None)
     if backend is None:
@@ -42,12 +27,6 @@ def shared_hicache_timeout_secs() -> float:
     if timeout_secs <= 0:
         raise ValueError("SGLANG_SHARED_HICACHE_TIMEOUT_SECS must be > 0")
     return timeout_secs
-
-
-def _normalize_control_host(value: object, field_name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{field_name} must be a non-empty string")
-    return value.strip()
 
 
 def _normalize_port(value: object, field_name: str) -> int:
@@ -70,13 +49,12 @@ def normalize_shared_hicache_server_config(
     *,
     enable_shared_hicache: bool,
     worker_id: Optional[str],
-    host: str,
     bootstrap_port: Optional[int],
     transfer_backend: Optional[str],
     enable_hierarchical_cache: bool,
-) -> tuple[bool, Optional[str], Optional[SharedHiCacheConfig]]:
+) -> tuple[bool, Optional[str], Optional[int], Optional[str]]:
     if not enable_shared_hicache:
-        return False, worker_id, None
+        return False, worker_id, bootstrap_port, transfer_backend
 
     if not enable_hierarchical_cache:
         raise ValueError("--enable-shared-hicache requires --enable-hierarchical-cache")
@@ -98,18 +76,10 @@ def normalize_shared_hicache_server_config(
             "shared_hicache_transfer_backend must be one of "
             f"{SHARED_HICACHE_TRANSFER_BACKEND_CHOICES}, got {transfer_backend_name!r}"
         )
-    transfer_backend = SharedHiCacheTransferBackendType(transfer_backend_name)
 
     return (
         True,
         worker_id,
-        SharedHiCacheConfig(
-            control_host=_normalize_control_host(
-                host,
-                "host",
-            ),
-            bootstrap_port=bootstrap_port,
-            timeout_secs=shared_hicache_timeout_secs(),
-            transfer_backend=transfer_backend,
-        ),
+        bootstrap_port,
+        SharedHiCacheTransferBackendType(transfer_backend_name).value,
     )
