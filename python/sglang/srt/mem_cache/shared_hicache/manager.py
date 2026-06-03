@@ -44,7 +44,6 @@ from sglang.srt.mem_cache.shared_hicache.source_queue import (
 from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
 from sglang.srt.mem_cache.shared_hicache.topology import (
     SharedHiCacheTopology,
-    scheduler_parallel_metadata,
     validate_shared_hicache_plan,
 )
 from sglang.srt.mem_cache.shared_hicache.transfer import (
@@ -89,13 +88,13 @@ class SharedHiCacheManager:
         server_args: ServerArgs,
         tree_cache,
         worker_id: Optional[str],
-        parallel_metadata: Optional[Mapping[str, int]] = None,
+        topology: SharedHiCacheTopology,
         direct_transfer: SharedHiCacheTransferBackend,
         metrics_collector=None,
     ):
         self.tree_cache = tree_cache
         self.worker_id = worker_id
-        self._set_parallel_metadata(parallel_metadata)
+        self._set_topology(topology)
         raw_config = getattr(server_args, "shared_hicache_config", None)
         config = raw_config if isinstance(raw_config, SharedHiCacheConfig) else None
         self.timeout_secs = (
@@ -137,12 +136,7 @@ class SharedHiCacheManager:
                 transfer_backend=direct_transfer,
                 worker_limit=source_worker_limit,
                 send_transfer_done=self._send_transfer_done,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                pp_size=self.pp_size,
-                attn_tp_size=self.attn_tp_size,
-                attn_cp_size=self.attn_cp_size,
-                attn_dp_size=self.attn_dp_size,
+                topology=self.topology,
             )
             self.source_service = SharedHiCacheSourceService(
                 endpoint=self.endpoint,
@@ -152,11 +146,11 @@ class SharedHiCacheManager:
             self.source_service.start()
         atexit.register(self.shutdown)
 
-    def _set_parallel_metadata(
+    def _set_topology(
         self,
-        parallel_metadata: Optional[Mapping[str, int]],
+        topology: SharedHiCacheTopology,
     ) -> None:
-        self.topology = SharedHiCacheTopology.from_mapping(parallel_metadata)
+        self.topology = topology
         for key, value in self.topology.to_dict().items():
             setattr(self, key, value)
 
@@ -206,8 +200,10 @@ class SharedHiCacheManager:
                 "set --shared-hicache-worker-id"
             )
             return None
-        direct_transfer = make_shared_hicache_transfer_backend(scheduler)
-        parallel_metadata = scheduler_parallel_metadata(scheduler)
+        topology = SharedHiCacheTopology.from_scheduler(scheduler)
+        direct_transfer = make_shared_hicache_transfer_backend(
+            scheduler, topology=topology
+        )
         metrics_reporter = getattr(scheduler, "metrics_reporter", None)
         metrics_collector = (
             scheduler.metrics_collector
@@ -218,7 +214,7 @@ class SharedHiCacheManager:
             server_args=server_args,
             tree_cache=scheduler.tree_cache,
             worker_id=worker_id,
-            parallel_metadata=parallel_metadata,
+            topology=topology,
             direct_transfer=direct_transfer,
             metrics_collector=metrics_collector,
         )

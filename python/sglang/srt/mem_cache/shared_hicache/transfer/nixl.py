@@ -17,7 +17,7 @@ from sglang.srt.environ import (
     default_shared_hicache_transfer_parallelism,
     envs,
 )
-from sglang.srt.mem_cache.shared_hicache.topology import scheduler_parallel_metadata
+from sglang.srt.mem_cache.shared_hicache.topology import SharedHiCacheTopology
 from sglang.srt.mem_cache.shared_hicache.transfer.common import (
     SharedHiCacheTransferBackend,
 )
@@ -263,14 +263,14 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         target_kv_ptrs,
         target_kv_item_lens,
         gpu_id: int,
-        parallel_metadata: Optional[Mapping[str, int]] = None,
-        transfer_parallelism: Optional[int] = None,
+        topology: SharedHiCacheTopology,
+        transfer_parallelism: int,
     ):
         super().__init__(
             target_session_id=agent_name,
             target_kv_ptrs=target_kv_ptrs,
             target_kv_item_lens=target_kv_item_lens,
-            parallel_metadata=parallel_metadata,
+            topology=topology,
         )
         self.agent = agent
         self.agent_name = agent_name
@@ -283,13 +283,13 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         self._retired_target_notifications: set[str] = set()
         self._retired_target_notification_order: deque[str] = deque()
         self._gpu_id = int(gpu_id)
-        if transfer_parallelism is None:
-            transfer_parallelism = default_shared_hicache_transfer_parallelism()
-        self._transfer_parallelism = max(1, int(transfer_parallelism))
+        self._transfer_parallelism = int(transfer_parallelism)
         self._shutdown = False
 
     @classmethod
-    def from_scheduler(cls, scheduler) -> "NixlSharedHiCacheTransferBackend":
+    def from_scheduler(
+        cls, scheduler, *, topology: SharedHiCacheTopology
+    ) -> "NixlSharedHiCacheTransferBackend":
         transfer_parallelism = default_shared_hicache_transfer_parallelism()
         agent, agent_name, backend_name = _create_nixl_agent(
             transfer_parallelism=transfer_parallelism
@@ -316,7 +316,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             target_kv_ptrs=target_kv_ptrs,
             target_kv_item_lens=target_kv_item_lens,
             gpu_id=gpu_id,
-            parallel_metadata=scheduler_parallel_metadata(scheduler),
+            topology=topology,
             transfer_parallelism=transfer_parallelism,
         )
         transfer._validate_source_host_pool()

@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.shared_hicache.source import (
     execute_source_transfer_request,
     parse_source_transfer_request,
 )
+from sglang.srt.mem_cache.shared_hicache.topology import SharedHiCacheTopology
 from sglang.srt.mem_cache.shared_hicache.transfer.common import (
     SharedHiCacheTransferBackend,
 )
@@ -28,28 +29,18 @@ class SharedHiCacheSourceTransferQueue:
         transfer_backend: SharedHiCacheTransferBackend,
         worker_limit: int,
         send_transfer_done: Callable[[str, Mapping[str, Any]], None],
-        tp_rank: int = 0,
-        tp_size: int = 1,
-        pp_size: int = 1,
-        attn_tp_size: int = 1,
-        attn_cp_size: int = 1,
-        attn_dp_size: int = 1,
+        topology: SharedHiCacheTopology,
     ):
         self.tree_cache = tree_cache
         self.worker_id = worker_id
         self.transfer_backend = transfer_backend
         self.send_transfer_done = send_transfer_done
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
-        self.pp_size = pp_size
-        self.attn_tp_size = attn_tp_size
-        self.attn_cp_size = attn_cp_size
-        self.attn_dp_size = attn_dp_size
+        self.topology = topology
 
         worker_limit = max(1, int(worker_limit))
         self._executor = ThreadPoolExecutor(
             max_workers=worker_limit,
-            thread_name_prefix=f"shared_hicache-source-xfer-tp{self.tp_rank}",
+            thread_name_prefix=f"shared_hicache-source-xfer-tp{self.topology.tp_rank}",
         )
         self._capacity = threading.BoundedSemaphore(max(8, worker_limit * 2))
         self._lock = threading.Lock()
@@ -130,12 +121,7 @@ class SharedHiCacheSourceTransferQueue:
                 transfer_backend=self.transfer_backend,
                 tree_cache=self.tree_cache,
                 worker_id=self.worker_id,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                pp_size=self.pp_size,
-                attn_tp_size=self.attn_tp_size,
-                attn_cp_size=self.attn_cp_size,
-                attn_dp_size=self.attn_dp_size,
+                topology=self.topology,
             )
         except Exception:
             with self._lock:

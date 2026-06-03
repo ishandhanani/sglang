@@ -8,6 +8,7 @@ import numpy as np
 from sglang.srt.mem_cache.shared_hicache.config import (
     shared_hicache_transfer_backend_name,
 )
+from sglang.srt.mem_cache.shared_hicache.topology import SharedHiCacheTopology
 
 
 class SharedHiCacheTransferBackend(ABC):
@@ -19,22 +20,20 @@ class SharedHiCacheTransferBackend(ABC):
         target_session_id: str,
         target_kv_ptrs,
         target_kv_item_lens,
-        parallel_metadata: Optional[Mapping[str, int]] = None,
+        topology: SharedHiCacheTopology,
     ):
         if not getattr(self, "name", None):
             raise ValueError("SharedHiCache transfer backend must define a name")
         self.target_session_id = str(target_session_id)
         self.target_kv_ptrs = [int(ptr) for ptr in target_kv_ptrs]
         self.target_kv_item_lens = [int(length) for length in target_kv_item_lens]
-        self.parallel_metadata = {
-            key: int(value) for key, value in (parallel_metadata or {}).items()
-        }
+        self.topology = topology
 
     def target_descriptor(self) -> dict[str, Any]:
         return {
             "backend": self.name,
             "session_id": self.target_session_id,
-            **self.parallel_metadata,
+            **self.topology.to_dict(),
         }
 
     def prepare_source_worker(self) -> None:
@@ -60,6 +59,8 @@ class SharedHiCacheTransferBackend(ABC):
 
 def make_shared_hicache_transfer_backend(
     scheduler,
+    *,
+    topology: SharedHiCacheTopology,
 ) -> SharedHiCacheTransferBackend:
     backend = shared_hicache_transfer_backend_name(scheduler.server_args)
     if backend != "nixl":
@@ -71,12 +72,8 @@ def make_shared_hicache_transfer_backend(
     from sglang.srt.mem_cache.shared_hicache.transfer.nixl import (
         NixlSharedHiCacheTransferBackend,
     )
-    from sglang.srt.mem_cache.shared_hicache.topology import (
-        shared_hicache_topology_rejection_from_scheduler,
-    )
-
-    topology_rejection = shared_hicache_topology_rejection_from_scheduler(scheduler)
+    topology_rejection = topology.unsupported_reason()
     if topology_rejection is not None:
         raise RuntimeError(topology_rejection)
 
-    return NixlSharedHiCacheTransferBackend.from_scheduler(scheduler)
+    return NixlSharedHiCacheTransferBackend.from_scheduler(scheduler, topology=topology)

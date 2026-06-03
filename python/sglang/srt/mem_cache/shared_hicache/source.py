@@ -14,7 +14,7 @@ from sglang.srt.mem_cache.shared_hicache.plan import (
     SharedHiCachePlan,
 )
 from sglang.srt.mem_cache.shared_hicache.topology import (
-    shared_hicache_parallel_rejection,
+    SharedHiCacheTopology,
 )
 from sglang.srt.mem_cache.shared_hicache.transfer.common import (
     SharedHiCacheTransferBackend,
@@ -99,12 +99,7 @@ def resolve_host_page_locations(
     start_block: int,
     max_blocks: int,
     worker_id: Optional[str],
-    tp_rank: int = 0,
-    tp_size: int = 1,
-    pp_size: int = 1,
-    attn_tp_size: int = 1,
-    attn_cp_size: int = 1,
-    attn_dp_size: int = 1,
+    topology: SharedHiCacheTopology,
     target_tp_rank: Optional[int] = None,
     target_tp_size: Optional[int] = None,
 ) -> tuple[list[ResolvedHostPageLocation], str, list[TreeNode]]:
@@ -112,14 +107,8 @@ def resolve_host_page_locations(
         return [], "missing_source_worker_id", []
     if plan.source_worker_id != worker_id:
         return [], "wrong_source_worker", []
-    rank_rejection = _source_rank_rejection(
+    rank_rejection = topology.validate_source_rank(
         plan,
-        tp_rank=tp_rank,
-        tp_size=tp_size,
-        pp_size=pp_size,
-        attn_tp_size=attn_tp_size,
-        attn_cp_size=attn_cp_size,
-        attn_dp_size=attn_dp_size,
         target_tp_rank=target_tp_rank,
         target_tp_size=target_tp_size,
     )
@@ -231,77 +220,6 @@ def _is_timeout_error(err: BaseException) -> bool:
     if isinstance(err, TimeoutError):
         return True
     return "timed out" in str(err).lower()
-
-
-def _source_rank_rejection(
-    plan: SharedHiCachePlan,
-    *,
-    tp_rank: int,
-    tp_size: int,
-    pp_size: int,
-    attn_tp_size: int,
-    attn_cp_size: int,
-    attn_dp_size: int,
-    target_tp_rank: Optional[int],
-    target_tp_size: Optional[int],
-) -> Optional[str]:
-    topology_rejection = shared_hicache_parallel_rejection(
-        pp_size=int(pp_size),
-        attn_cp_size=int(attn_cp_size),
-        attn_dp_size=int(attn_dp_size),
-        tp_size=int(tp_size),
-        attn_tp_size=int(attn_tp_size),
-    )
-    if topology_rejection is not None:
-        return f"unsupported_source_topology:{topology_rejection}"
-
-    local_tp_size = int(tp_size)
-    local_tp_rank = int(tp_rank)
-    if plan.source_tp_size != local_tp_size:
-        return (
-            "wrong_source_tp_size:" f"plan={plan.source_tp_size}:local={local_tp_size}"
-        )
-    source_tp_rank = (
-        int(plan.source_tp_rank)
-        if plan.source_tp_rank is not None
-        else local_tp_rank
-    )
-    if int(source_tp_rank) != local_tp_rank:
-        return "wrong_source_tp_rank:" f"plan={source_tp_rank}:local={local_tp_rank}"
-    if target_tp_size is None:
-        if local_tp_size > 1:
-            return "missing_target_tp_size"
-        target_tp_size = 1
-    if target_tp_rank is None:
-        if local_tp_size > 1:
-            return "missing_target_tp_rank"
-        target_tp_rank = 0
-
-    target_tp_size = int(target_tp_size)
-    target_tp_rank = int(target_tp_rank)
-    if plan.target_tp_size != target_tp_size:
-        return (
-            "wrong_target_tp_size:"
-            f"plan={plan.target_tp_size}:target={target_tp_size}"
-        )
-    plan_target_tp_rank = (
-        int(plan.target_tp_rank)
-        if plan.target_tp_rank is not None
-        else target_tp_rank
-    )
-    if int(plan_target_tp_rank) != target_tp_rank:
-        return (
-            "wrong_target_tp_rank:"
-            f"plan={plan_target_tp_rank}:target={target_tp_rank}"
-        )
-    if target_tp_size != local_tp_size:
-        return "incompatible_tp_size:" f"source={local_tp_size}:target={target_tp_size}"
-    if target_tp_rank != local_tp_rank:
-        return (
-            "wrong_source_tp_rank_for_target:"
-            f"source={local_tp_rank}:target={target_tp_rank}"
-        )
-    return None
 
 
 def _parse_target_kv_metadata(
@@ -478,12 +396,7 @@ def execute_source_transfer_request(
     transfer_backend: SharedHiCacheTransferBackend,
     tree_cache,
     worker_id: Optional[str],
-    tp_rank: int = 0,
-    tp_size: int = 1,
-    pp_size: int = 1,
-    attn_tp_size: int = 1,
-    attn_cp_size: int = 1,
-    attn_dp_size: int = 1,
+    topology: SharedHiCacheTopology,
 ) -> Mapping[str, Any]:
     total_start = time.perf_counter()
     resolve_start = total_start
@@ -493,12 +406,7 @@ def execute_source_transfer_request(
         start_block=request.start_block,
         max_blocks=request.max_blocks,
         worker_id=worker_id,
-        tp_rank=tp_rank,
-        tp_size=tp_size,
-        pp_size=pp_size,
-        attn_tp_size=attn_tp_size,
-        attn_cp_size=attn_cp_size,
-        attn_dp_size=attn_dp_size,
+        topology=topology,
         target_tp_rank=request.target_tp_rank,
         target_tp_size=request.target_tp_size,
     )
