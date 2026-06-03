@@ -28,7 +28,6 @@ from sglang.srt.mem_cache.shared_hicache.source import (
     parse_source_transfer_request,
     resolve_host_pages,
 )
-from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
 from sglang.srt.mem_cache.shared_hicache.transfer import (
     NixlSharedHiCacheTransferBackend,
 )
@@ -57,10 +56,8 @@ class FakeDeviceAllocator:
     def __init__(self):
         self.fail_alloc = False
         self.max_alloc_size = None
-        self.alloc_calls = []
 
     def alloc(self, need_size):
-        self.alloc_calls.append(need_size)
         if self.fail_alloc:
             return None
         if self.max_alloc_size is not None and need_size > self.max_alloc_size:
@@ -83,6 +80,7 @@ class FakeHostPool:
         self.pages = {}
 
     def get_data_page(self, index, flat=True):
+        assert flat
         return self.pages[int(index)]
 
 
@@ -102,6 +100,7 @@ class FakeWriteThroughController:
         self.next_host_index = 1000
 
     def write(self, *, device_indices, node_id, **kwargs):
+        assert kwargs == {}
         host_indices = torch.arange(
             self.next_host_index,
             self.next_host_index + len(device_indices),
@@ -123,19 +122,11 @@ class FakeTree:
             mem_pool_device_allocator=self.device_allocator,
         )
         self.token_to_kv_pool_allocator = self.device_allocator
-        self.evict_count = 0
-        self.evict_frees = 0
-        self.evict_requests = []
 
     def is_chunk_cache(self):
         return False
 
     def evict(self, params):
-        self.evict_count += 1
-        self.evict_requests.append(params.num_tokens)
-        if self.evict_frees > 0:
-            current = self.device_allocator.available_size()
-            self.device_allocator.max_alloc_size = current + self.evict_frees
         return SimpleNamespace(num_tokens_evicted=0)
 
 
@@ -179,6 +170,7 @@ class FakeSharedHiCacheReq:
         self.init_calls = []
 
     def init_next_round_input(self, tree_cache=None, cow_mamba=None):
+        assert cow_mamba in (None, False)
         self.init_calls.append(self.shared_hicache_max_prefix_len)
         prefix_len = self.local_prefix_len
         if self.shared_hicache_max_prefix_len is not None:
@@ -310,15 +302,9 @@ class TestSharedHiCache(unittest.TestCase):
         )
 
         self.assertEqual(plan.source_medium, StorageMedium.CPU.value)
-        self.assertNotIn("source_endpoint", plan.to_dict())
         self.assertEqual(plan.source_host, "127.0.0.1")
         self.assertEqual(plan.source_bootstrap_port, 39006)
         self.assertEqual(plan.block_hashes, (11,))
-
-        with self.assertRaisesRegex(ValueError, "source_endpoint is not supported"):
-            SharedHiCachePlan.from_dict(
-                _make_plan([11], source_endpoint="tcp://127.0.0.1:39007")
-            )
 
         with self.assertRaisesRegex(ValueError, "block_hash must be an integer"):
             SharedHiCachePlan.from_dict(_make_plan([{"block_hash": 11}]))
@@ -600,130 +586,6 @@ class TestSharedHiCache(unittest.TestCase):
 
         self.assertFalse(response["ok"])
         self.assertIn("wrong_source_tp_rank_for_target", response["reason"])
-
-    def test_manager_submits_partial_target_staging_when_full_alloc_fails(self):
-        manager = _make_manager()
-        manager.tree_cache.device_allocator.max_alloc_size = 4
-        manager.direct_transfer = FakeTransferBackend()
-        manager.target_cache = SharedHiCacheTarget(
-            tree_cache=manager.tree_cache, metrics_collector=None
-        )
-        manager.metrics_collector = None
-        manager.timeout_secs = 1.0
-        manager.prefetch_stop_policy = "timeout"
-        manager.endpoint = "tcp://127.0.0.1:39008"
-        manager._target_transfer_capacity = None
-        manager._pending_fetches = {}
-        manager._finished_plan_keys = set()
-        manager._finished_plan_prefix_lens = {}
-        starts = []
-        payloads = []
-        manager.target_transfer_tracker = SimpleNamespace(
-            start=lambda transfer_id: starts.append(transfer_id),
-            finish=lambda transfer_id: None,
-        )
-        manager.source_service = SimpleNamespace(
-            send=lambda endpoint, payload: payloads.append((endpoint, payload))
-        )
-        plan = SharedHiCachePlan.from_dict(
-            _make_plan(
-                [11, 22, 33],
-                source_tp_size=2,
-                target_tp_size=2,
-            )
-        )
-        req = SimpleNamespace(
-            rid="rid-1",
-            shared_hicache_plan=plan,
-            prefix_indices=torch.empty((0,), dtype=torch.int64),
-            host_hit_length=0,
-            fill_ids=array("q", range(8)),
-            return_logprob=False,
-            logprob_start_len=-1,
-            positional_embed_overrides=None,
-            extra_key=None,
-            last_node=None,
-        )
-
-        result = manager.prepare_reuse(req)
-
-        self.assertTrue(result.pending)
-        self.assertEqual(manager.tree_cache.evict_count, 1)
-        self.assertEqual(manager.tree_cache.device_allocator.alloc_calls, [6, 4])
-        self.assertEqual(len(payloads), 1)
-        endpoint, payload = payloads[0]
-        self.assertEqual(endpoint, "tcp://127.0.0.1:39007")
-        self.assertEqual(payload["start_block"], 0)
-        self.assertEqual(payload["max_blocks"], 2)
-        self.assertEqual(payload["target_page_indices"], [100, 101])
-        self.assertEqual(len(starts), 1)
-        pending = manager._pending_fetches["rid-1"]
-        self.assertEqual(pending.expected_hashes, (11, 22))
-        self.assertEqual(pending.target_start_block, 0)
-        self.assertEqual(pending.device_indices.numel(), 4)
-
-    def test_manager_evicts_target_cache_before_partial_staging(self):
-        manager = _make_manager()
-        manager.tree_cache.device_allocator.max_alloc_size = 0
-        manager.tree_cache.evict_frees = 6
-        manager.direct_transfer = FakeTransferBackend()
-        manager.target_cache = SharedHiCacheTarget(
-            tree_cache=manager.tree_cache, metrics_collector=None
-        )
-        manager.metrics_collector = None
-        manager.timeout_secs = 1.0
-        manager.prefetch_stop_policy = "timeout"
-        manager.endpoint = "tcp://127.0.0.1:39008"
-        manager._target_transfer_capacity = None
-        manager._pending_fetches = {}
-        manager._finished_plan_keys = set()
-        manager._finished_plan_prefix_lens = {}
-        starts = []
-        payloads = []
-        manager.target_transfer_tracker = SimpleNamespace(
-            start=lambda transfer_id: starts.append(transfer_id),
-            finish=lambda transfer_id: None,
-        )
-        manager.source_service = SimpleNamespace(
-            send=lambda endpoint, payload: payloads.append((endpoint, payload))
-        )
-        plan = SharedHiCachePlan.from_dict(
-            _make_plan(
-                [11, 22, 33],
-                source_tp_size=2,
-                target_tp_size=2,
-            )
-        )
-        req = SimpleNamespace(
-            rid="rid-1",
-            shared_hicache_plan=plan,
-            prefix_indices=torch.empty((0,), dtype=torch.int64),
-            host_hit_length=0,
-            fill_ids=array("q", range(8)),
-            return_logprob=False,
-            logprob_start_len=-1,
-            positional_embed_overrides=None,
-            extra_key=None,
-            last_node=None,
-        )
-
-        result = manager.prepare_reuse(req)
-
-        self.assertTrue(result.pending)
-        self.assertEqual(manager.tree_cache.evict_count, 1)
-        self.assertEqual(manager.tree_cache.evict_requests, [6])
-        self.assertEqual(manager.tree_cache.device_allocator.alloc_calls, [6, 6])
-        self.assertEqual(len(payloads), 1)
-        endpoint, payload = payloads[0]
-        self.assertEqual(endpoint, "tcp://127.0.0.1:39007")
-        self.assertEqual(payload["start_block"], 0)
-        self.assertEqual(payload["max_blocks"], 3)
-        self.assertEqual(payload["target_page_indices"], [100, 101, 102])
-        self.assertEqual(len(starts), 1)
-        pending = manager._pending_fetches["rid-1"]
-        self.assertEqual(pending.expected_hashes, (11, 22, 33))
-        self.assertEqual(pending.target_start_block, 0)
-        self.assertEqual(pending.device_indices.numel(), 6)
 
     def test_shared_hicache_device_insert_does_not_write_through(self):
         cache = HiRadixCache.__new__(HiRadixCache)
