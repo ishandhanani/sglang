@@ -11,8 +11,8 @@ Examples of some hints include:
 - **Demote / Offload:** move KV to a colder tier during idle gaps.
 - **Priority:** bias block-level offload/onboard policy.
 - **Pin / Retain:** preserve high-value prompt KV for a bounded window.
-- **Session Lifecycle:** tag subagent/session KV and handle close-time cleanup
-  or demotion.
+- **Session Lifecycle:** tag subagent/session KV (session-aware radix cache) and
+  handle close-time cleanup or demotion.
 
 The first concrete implementation is Shared HiCache. The Dynamo router sends
 `cache_hints.shared_hicache`, and SGLang uses native HiCache/radix machinery to
@@ -175,7 +175,9 @@ depending on deadline and pressure.
 ### Session Lifecycle
 
 Tag KV by session or subagent lifecycle so SGLang can apply lifecycle-aware
-cache policy. This already exists via `SessionCache` and Dynamo uses it for subagent KV cache lifecyle
+cache policy. The router opens a session, every block produced under that session is
+tagged with the session id, and that tag lets the cache treat the whole session's KV as
+a unit - deprioritize it, evict it, or demote it when the session closes.
 
 Use cases:
 
@@ -185,11 +187,16 @@ Use cases:
 - compaction made old blocks lower value;
 - user session paused or closed.
 
-This already exists via `SessionCache` and Dynamo uses it for subagent KV cache lifecyle
-When a subagent ends, the router asks SGLang to mark its KV for cleanup and/or demote reusable blocks to HiCache
-instead of leaving everything in GPU until local pressure eventually finds it.
+When a subagent ends, the router asks SGLang to mark its KV for cleanup and/or demote
+reusable blocks to HiCache instead of leaving everything in GPU until local pressure
+eventually finds it.
 
 ![Evict cache after subagent closes](kv2.png)
+
+We call this a **session-aware radix cache**: the radix cache stays the owner of the KV
+and each node simply remembers which session produced it. That membership tag is enough
+to express the lifecycle hint - the router never touches KV internals, it only signals
+when a session opens and closes, and SGLang's own cache policy does the rest.
 
 ### Demote / Offload
 
