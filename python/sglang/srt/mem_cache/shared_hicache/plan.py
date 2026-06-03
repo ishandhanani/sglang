@@ -119,11 +119,6 @@ class SharedHiCachePlan:
         if not isinstance(data, Mapping):
             raise ValueError("SharedHiCache plan must be a mapping")
 
-        if "source_endpoint" in data:
-            raise ValueError(
-                "source_endpoint is not supported; use source_host/source_bootstrap_port"
-            )
-
         if "block_hashes" not in data:
             raise ValueError("SharedHiCache plan missing block_hashes")
         block_hashes = tuple(

@@ -300,9 +300,6 @@ class SharedHiCacheManager:
                 "SharedHiCache fetch worker semaphore release ignored", exc_info=True
             )
 
-    def _finish_target_transfer_capacity(self) -> None:
-        self._release_fetch_worker()
-
     def _shutdown_direct_transfer_backend(self) -> None:
         direct_transfer = getattr(self, "direct_transfer", None)
         shutdown = getattr(direct_transfer, "shutdown", None)
@@ -427,7 +424,7 @@ class SharedHiCacheManager:
                     self._send_transfer_done(target_endpoint, response)
             return
         if kind == SHARED_HICACHE_TRANSFER_DONE:
-            self._handle_target_transfer_done(payload)
+            self.target_transfer_tracker.handle_done(payload)
             return
         logger.warning("Ignoring unknown SharedHiCache control message kind=%s", kind)
 
@@ -444,20 +441,6 @@ class SharedHiCacheManager:
                 message.get("transfer_id"),
                 exc_info=True,
             )
-
-    def _handle_target_transfer_done(self, payload: Mapping[str, Any]) -> None:
-        self.target_transfer_tracker.handle_done(payload)
-
-    def _pop_target_transfer_completion(
-        self, transfer_id: str
-    ) -> Optional[Mapping[str, Any]]:
-        return self.target_transfer_tracker.pop_completion(transfer_id)
-
-    def _start_target_transfer(self, transfer_id: str) -> None:
-        self.target_transfer_tracker.start(transfer_id)
-
-    def _finish_target_transfer(self, transfer_id: str) -> None:
-        self.target_transfer_tracker.finish(transfer_id)
 
     def _max_cacheable_blocks(self, req: Req) -> int:
         max_prefix_len = max(len(req.fill_ids) - 1, 0)
@@ -514,8 +497,8 @@ class SharedHiCacheManager:
         if pending.device_indices is None:
             transfer_id = getattr(pending.transfer, "transfer_id", None)
             if transfer_id:
-                self._finish_target_transfer(transfer_id)
-            self._finish_target_transfer_capacity()
+                self.target_transfer_tracker.finish(transfer_id)
+            self._release_fetch_worker()
             return
         backend = getattr(pending, "backend", self._current_backend_label())
         transfer = pending.transfer
@@ -523,7 +506,7 @@ class SharedHiCacheManager:
             _, reason = transfer.result()
             transfer_id = getattr(transfer, "transfer_id", None)
             if transfer_id:
-                self._finish_target_transfer(transfer_id)
+                self.target_transfer_tracker.finish(transfer_id)
             if is_indeterminate_direct_transfer_reason(reason):
                 self.target_cache.quarantine_device_indices(
                     pending.device_indices, reason, backend=backend
@@ -533,13 +516,13 @@ class SharedHiCacheManager:
         else:
             transfer_id = getattr(transfer, "transfer_id", None)
             if transfer_id:
-                self._finish_target_transfer(transfer_id)
+                self.target_transfer_tracker.finish(transfer_id)
             self.target_cache.quarantine_device_indices(
                 pending.device_indices,
                 SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
                 backend=backend,
             )
-        self._finish_target_transfer_capacity()
+        self._release_fetch_worker()
 
     def _submit_direct_transfer(
         self,
@@ -602,7 +585,7 @@ class SharedHiCacheManager:
             start_block=start_block,
             max_blocks=submitted_blocks,
             timeout_secs=self.timeout_secs,
-            pop_source_completion=self._pop_target_transfer_completion,
+            pop_source_completion=self.target_transfer_tracker.pop_completion,
         )
         target_descriptor = direct_transfer.target_descriptor()
         target_page_indices_payload = [
@@ -613,7 +596,7 @@ class SharedHiCacheManager:
                 else list(target_page_indices)
             )
         ]
-        self._start_target_transfer(transfer_id)
+        self.target_transfer_tracker.start(transfer_id)
         try:
             self._send_control_message(
                 source_endpoint,
@@ -633,7 +616,7 @@ class SharedHiCacheManager:
                 },
             )
         except Exception:
-            self._finish_target_transfer(transfer_id)
+            self.target_transfer_tracker.finish(transfer_id)
             self.target_cache.free_device_indices(device_indices)
             self._release_fetch_worker()
             logger.warning(
@@ -819,8 +802,7 @@ class SharedHiCacheManager:
         device_indices = None
         direct_submit_reason = None
         available_tokens_before = None
-        direct_transfer_enabled = self._direct_transfer_enabled()
-        if not direct_transfer_enabled:
+        if not self._direct_transfer_enabled():
             logger.debug(
                 "Skipping shared HiCache plan rid=%s plan_id=%s reason=direct_transfer_unavailable",
                 req.rid,
@@ -833,7 +815,7 @@ class SharedHiCacheManager:
                 reason="direct_transfer_unavailable",
             )
             return SharedHiCacheResult()
-        if direct_transfer_enabled and req.host_hit_length > 0:
+        if req.host_hit_length > 0:
             self._finished_plan_keys.add(plan_key)
             self._observe_reuse(
                 backend=self._current_backend_label(),
@@ -842,103 +824,99 @@ class SharedHiCacheManager:
             )
             return SharedHiCacheResult()
         locked_node = None
-        if req.host_hit_length == 0:
-            backend = self._current_backend_label()
-            self._observe_staging(
-                backend=backend,
-                outcome="planned",
-                reason="remote_suffix_requested",
-                tokens=token_count,
+        backend = self._current_backend_label()
+        self._observe_staging(
+            backend=backend,
+            outcome="planned",
+            reason="remote_suffix_requested",
+            tokens=token_count,
+        )
+        locked_node = self._lock_request_prefix(req)
+        try:
+            direct_submit = self._submit_direct_transfer(
+                plan,
+                start_block=plan_offset,
+                token_count=token_count,
             )
-            if direct_transfer_enabled:
-                locked_node = self._lock_request_prefix(req)
-            try:
-                direct_submit = self._submit_direct_transfer(
-                    plan,
-                    start_block=plan_offset,
-                    token_count=token_count,
-                )
-            except Exception:
-                if locked_node is not None:
-                    self.tree_cache.dec_lock_ref(locked_node)
-                raise
-            transfer = direct_submit.transfer
-            device_indices = direct_submit.device_indices
-            direct_submit_reason = direct_submit.reason
-            available_tokens_before = direct_submit.available_tokens_before
-            submitted_blocks = int(direct_submit.submitted_blocks)
-            submitted_tokens = int(direct_submit.submitted_tokens)
-            if direct_transfer_enabled and transfer is None:
-                if locked_node is not None:
-                    self.tree_cache.dec_lock_ref(locked_node)
-                self._finished_plan_keys.add(plan_key)
-                direct_submit_reason = (
-                    direct_submit_reason or "direct_submit_unavailable"
-                )
-                if direct_submit_reason == "target_staging_alloc_failed":
-                    self._observe_staging(
-                        backend=backend,
-                        outcome="failed",
-                        reason="target_staging_alloc_failed",
-                        tokens=token_count,
-                    )
-                logger.info(
-                    "Shared HiCache direct submit unavailable "
-                    "rid=%s plan_id=%s reason=%s source_worker=%s start_block=%d "
-                    "max_blocks=%d token_count=%d host_hit_length=%d "
-                    "available_tokens_before=%s",
-                    req.rid,
-                    plan.plan_id,
-                    direct_submit_reason,
-                    plan.source_worker_id,
-                    plan_offset,
-                    max_blocks,
-                    token_count,
-                    req.host_hit_length,
-                    available_tokens_before,
-                )
-                self._observe_reuse(
-                    backend=self._current_backend_label(),
-                    outcome="miss",
-                    reason=direct_submit_reason,
-                )
-                return SharedHiCacheResult()
-            if submitted_blocks < max_blocks:
-                shortfall_tokens = token_count - submitted_tokens
-                logger.info(
-                    "Shared HiCache target staging partially granted "
-                    "rid=%s plan_id=%s source_worker=%s start_block=%d "
-                    "requested_blocks=%d granted_blocks=%d requested_tokens=%d "
-                    "granted_tokens=%d failed_tokens=%d available_tokens_before=%s",
-                    req.rid,
-                    plan.plan_id,
-                    plan.source_worker_id,
-                    plan_offset,
-                    max_blocks,
-                    submitted_blocks,
-                    token_count,
-                    submitted_tokens,
-                    shortfall_tokens,
-                    available_tokens_before,
-                )
+        except Exception:
+            if locked_node is not None:
+                self.tree_cache.dec_lock_ref(locked_node)
+            raise
+        transfer = direct_submit.transfer
+        device_indices = direct_submit.device_indices
+        direct_submit_reason = direct_submit.reason
+        available_tokens_before = direct_submit.available_tokens_before
+        submitted_blocks = int(direct_submit.submitted_blocks)
+        submitted_tokens = int(direct_submit.submitted_tokens)
+        if transfer is None:
+            if locked_node is not None:
+                self.tree_cache.dec_lock_ref(locked_node)
+            self._finished_plan_keys.add(plan_key)
+            direct_submit_reason = direct_submit_reason or "direct_submit_unavailable"
+            if direct_submit_reason == "target_staging_alloc_failed":
                 self._observe_staging(
                     backend=backend,
                     outcome="failed",
-                    reason="target_staging_alloc_shortfall",
-                    tokens=shortfall_tokens,
+                    reason="target_staging_alloc_failed",
+                    tokens=token_count,
                 )
+            logger.info(
+                "Shared HiCache direct submit unavailable "
+                "rid=%s plan_id=%s reason=%s source_worker=%s start_block=%d "
+                "max_blocks=%d token_count=%d host_hit_length=%d "
+                "available_tokens_before=%s",
+                req.rid,
+                plan.plan_id,
+                direct_submit_reason,
+                plan.source_worker_id,
+                plan_offset,
+                max_blocks,
+                token_count,
+                req.host_hit_length,
+                available_tokens_before,
+            )
+            self._observe_reuse(
+                backend=self._current_backend_label(),
+                outcome="miss",
+                reason=direct_submit_reason,
+            )
+            return SharedHiCacheResult()
+        if submitted_blocks < max_blocks:
+            shortfall_tokens = token_count - submitted_tokens
+            logger.info(
+                "Shared HiCache target staging partially granted "
+                "rid=%s plan_id=%s source_worker=%s start_block=%d "
+                "requested_blocks=%d granted_blocks=%d requested_tokens=%d "
+                "granted_tokens=%d failed_tokens=%d available_tokens_before=%s",
+                req.rid,
+                plan.plan_id,
+                plan.source_worker_id,
+                plan_offset,
+                max_blocks,
+                submitted_blocks,
+                token_count,
+                submitted_tokens,
+                shortfall_tokens,
+                available_tokens_before,
+            )
             self._observe_staging(
                 backend=backend,
-                outcome="granted",
-                reason="target_staging_alloc_granted",
-                tokens=submitted_tokens,
+                outcome="failed",
+                reason="target_staging_alloc_shortfall",
+                tokens=shortfall_tokens,
             )
-            max_blocks = submitted_blocks
-            token_count = submitted_tokens
-            expected_hashes = expected_hashes[:submitted_blocks]
+        self._observe_staging(
+            backend=backend,
+            outcome="granted",
+            reason="target_staging_alloc_granted",
+            tokens=submitted_tokens,
+        )
+        max_blocks = submitted_blocks
+        token_count = submitted_tokens
+        expected_hashes = expected_hashes[:submitted_blocks]
         backend = "none"
         bytes_per_page = 0
-        if device_indices is not None and direct_transfer_enabled:
+        if device_indices is not None:
             direct_transfer = getattr(self, "direct_transfer", None)
             backend = str(getattr(direct_transfer, "name", "direct"))
             try:
@@ -978,7 +956,7 @@ class SharedHiCacheManager:
         except Exception:
             transfer_id = getattr(pending.transfer, "transfer_id", None)
             if transfer_id:
-                self._finish_target_transfer(transfer_id)
+                self.target_transfer_tracker.finish(transfer_id)
             logger.exception(
                 "Shared HiCache fetch failed rid=%s plan_id=%s", req.rid, plan.plan_id
             )
@@ -992,11 +970,11 @@ class SharedHiCacheManager:
                 reason="fetch_exception",
                 wait_ms=pending_wait_ms(pending),
             )
-            self._finish_target_transfer_capacity()
+            self._release_fetch_worker()
             return SharedHiCacheResult()
         transfer_id = getattr(pending.transfer, "transfer_id", None)
         if transfer_id:
-            self._finish_target_transfer(transfer_id)
+            self.target_transfer_tracker.finish(transfer_id)
 
         if not pages:
             logger.debug(
@@ -1025,7 +1003,7 @@ class SharedHiCacheManager:
                 reason=reason,
                 wait_ms=pending_wait_ms(pending),
             )
-            self._finish_target_transfer_capacity()
+            self._release_fetch_worker()
             return SharedHiCacheResult()
 
         if len(pages) > len(pending.expected_hashes):
@@ -1047,7 +1025,7 @@ class SharedHiCacheManager:
                 wait_ms=pending_wait_ms(pending),
                 transfer_bytes=transfer_bytes_for_pages(pending, pages),
             )
-            self._finish_target_transfer_capacity()
+            self._release_fetch_worker()
             return SharedHiCacheResult()
 
         expected_hashes = pending.expected_hashes[: len(pages)]
@@ -1068,7 +1046,7 @@ class SharedHiCacheManager:
                 wait_ms=pending_wait_ms(pending),
                 transfer_bytes=transfer_bytes_for_pages(pending, pages),
             )
-            self._finish_target_transfer_capacity()
+            self._release_fetch_worker()
             return SharedHiCacheResult()
 
         insert_start = time.perf_counter()
@@ -1084,7 +1062,7 @@ class SharedHiCacheManager:
                     reason="missing_target_device_indices",
                     wait_ms=pending_wait_ms(pending),
                 )
-                self._finish_target_transfer_capacity()
+                self._release_fetch_worker()
                 return SharedHiCacheResult()
             staged_tokens = self.target_cache.insert_device_pages(
                 req,
@@ -1108,7 +1086,7 @@ class SharedHiCacheManager:
                 insert_ms=insert_ms,
                 transfer_bytes=transfer_bytes_for_pages(pending, pages),
             )
-            self._finish_target_transfer_capacity()
+            self._release_fetch_worker()
             return SharedHiCacheResult()
         finally:
             self._unlock_pending_prefix(pending)
@@ -1149,5 +1127,5 @@ class SharedHiCacheManager:
             insert_ms=insert_ms,
             transfer_bytes=transfer_bytes_for_pages(pending, pages),
         )
-        self._finish_target_transfer_capacity()
+        self._release_fetch_worker()
         return SharedHiCacheResult(staged_tokens=staged_tokens, prefix_len=prefix_len)
