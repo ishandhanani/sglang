@@ -101,14 +101,14 @@ class SharedHiCachePlan:
     source_host: str
     source_bootstrap_port: int
     source_medium: str
-    block_hashes: tuple[int, ...]
+    router_block_hashes: tuple[int, ...]
+    engine_block_hashes: tuple[int, ...]
     planned_prefix_blocks: int
     block_size_tokens: int
     created_at_ms: int
     expires_at_ms: int
     start_block_index: int = 0
     plan_version: int = SHARED_HICACHE_PLAN_VERSION
-    kv_block_hashes: tuple[int, ...] = ()
     source_tp_rank: Optional[int] = None
     source_tp_size: int = 1
     target_tp_rank: Optional[int] = None
@@ -119,26 +119,37 @@ class SharedHiCachePlan:
         if not isinstance(data, Mapping):
             raise ValueError("SharedHiCache plan must be a mapping")
 
-        if "block_hashes" not in data:
-            raise ValueError("SharedHiCache plan missing block_hashes")
-        block_hashes = tuple(
-            _coerce_block_hash(item)
-            for item in _coerce_array(data["block_hashes"], "block_hashes")
+        if "router_block_hashes" not in data:
+            raise ValueError("SharedHiCache plan missing router_block_hashes")
+        router_block_hashes = tuple(
+            _coerce_block_hash(item, "router_block_hash")
+            for item in _coerce_array(
+                data["router_block_hashes"], "router_block_hashes"
+            )
         )
-        kv_block_hashes_raw = data.get("kv_block_hashes", ())
-        if kv_block_hashes_raw is None:
-            kv_block_hashes_raw = ()
-        kv_block_hashes = tuple(
-            _coerce_block_hash(item, "kv_block_hash")
-            for item in _coerce_array(kv_block_hashes_raw, "kv_block_hashes")
+        if "engine_block_hashes" not in data:
+            raise ValueError("SharedHiCache plan missing engine_block_hashes")
+        # These arrays are parallel but intentionally separate today:
+        # - router_block_hashes are router/request block identities. They
+        #   preserve plan order and label the pages returned to the target.
+        # - engine_block_hashes are source-worker HostPinned lookup keys from
+        #   framework KV events. The source host index is keyed by these values.
+        # If Dynamo and SGLang later share one canonical block-hash contract
+        # (same representation, algorithm, and parent-chaining semantics), this
+        # source-lookup field can collapse into router_block_hashes.
+        engine_block_hashes = tuple(
+            _coerce_block_hash(item, "engine_block_hash")
+            for item in _coerce_array(
+                data["engine_block_hashes"], "engine_block_hashes"
+            )
         )
-        if kv_block_hashes and len(kv_block_hashes) != len(block_hashes):
+        if len(engine_block_hashes) != len(router_block_hashes):
             raise ValueError(
-                "kv_block_hashes length must match block_hashes when provided"
+                "engine_block_hashes length must match router_block_hashes"
             )
 
         planned_prefix_blocks = _coerce_int(
-            data.get("planned_prefix_blocks", len(block_hashes)),
+            data.get("planned_prefix_blocks", len(router_block_hashes)),
             "planned_prefix_blocks",
         )
         if planned_prefix_blocks < 0:
@@ -166,8 +177,11 @@ class SharedHiCachePlan:
                     "source_bootstrap_port",
                 ),
                 source_medium=_canonical_source_medium(data["source_medium"]),
-                block_hashes=block_hashes,
-                planned_prefix_blocks=min(planned_prefix_blocks, len(block_hashes)),
+                router_block_hashes=router_block_hashes,
+                engine_block_hashes=engine_block_hashes,
+                planned_prefix_blocks=min(
+                    planned_prefix_blocks, len(router_block_hashes)
+                ),
                 block_size_tokens=_coerce_int(
                     data["block_size_tokens"],
                     "block_size_tokens",
@@ -181,7 +195,6 @@ class SharedHiCachePlan:
                     data.get("plan_version", SHARED_HICACHE_PLAN_VERSION),
                     "plan_version",
                 ),
-                kv_block_hashes=kv_block_hashes,
                 source_tp_rank=_coerce_optional_int(
                     data.get("source_tp_rank"),
                     "source_tp_rank",
@@ -219,17 +232,17 @@ class SharedHiCachePlan:
 
     def to_dict(self) -> Dict[str, Any]:
         value = asdict(self)
-        value["block_hashes"] = list(self.block_hashes)
-        value["kv_block_hashes"] = list(self.kv_block_hashes)
+        value["router_block_hashes"] = list(self.router_block_hashes)
+        value["engine_block_hashes"] = list(self.engine_block_hashes)
         return value
 
     @property
-    def planned_hashes(self) -> tuple[int, ...]:
-        return self.block_hashes[: self.planned_prefix_blocks]
+    def planned_router_block_hashes(self) -> tuple[int, ...]:
+        return self.router_block_hashes[: self.planned_prefix_blocks]
 
     @property
-    def planned_kv_block_hashes(self) -> tuple[int, ...]:
-        return self.kv_block_hashes[: self.planned_prefix_blocks]
+    def planned_engine_block_hashes(self) -> tuple[int, ...]:
+        return self.engine_block_hashes[: self.planned_prefix_blocks]
 
     def is_shared_hicache(self) -> bool:
         return self.source_medium == SHARED_HICACHE_SOURCE_MEDIUM

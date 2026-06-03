@@ -102,13 +102,13 @@ class SharedHiCacheManager:
         self.prefetch_stop_policy = getattr(
             server_args, "hicache_storage_prefetch_policy", "timeout"
         )
+        if not getattr(direct_transfer, "enabled", False):
+            raise RuntimeError(
+                "SharedHiCache requires an enabled direct transfer backend; "
+                "specify --shared-hicache-transfer-backend nixl"
+            )
         self.direct_transfer = direct_transfer
         self.metrics_collector = metrics_collector
-        if not self._direct_transfer_enabled():
-            logger.warning(
-                "SharedHiCache is enabled but no direct transfer backend is available; "
-                "SharedHiCache plans will be treated as cache misses."
-            )
         self.endpoint = self._local_control_endpoint(config)
         self.source_service: Optional[SharedHiCacheSourceService] = None
         self._shutdown = False
@@ -227,10 +227,7 @@ class SharedHiCacheManager:
         )
 
     def _current_backend_label(self) -> str:
-        if self._direct_transfer_enabled():
-            direct_transfer = getattr(self, "direct_transfer", None)
-            return str(getattr(direct_transfer, "name", "direct"))
-        return "none"
+        return str(getattr(self.direct_transfer, "name", "direct"))
 
     def _observe_reuse(
         self,
@@ -275,12 +272,6 @@ class SharedHiCacheManager:
             outcome=outcome,
             reason=reason,
             tokens=max(0, int(tokens)),
-        )
-
-    def _direct_transfer_enabled(self) -> bool:
-        direct_transfer = getattr(self, "direct_transfer", None)
-        return direct_transfer is not None and bool(
-            getattr(direct_transfer, "enabled", False)
         )
 
     def _try_acquire_fetch_worker(self) -> bool:
@@ -531,9 +522,7 @@ class SharedHiCacheManager:
         start_block: int,
         token_count: int,
     ) -> SharedHiCacheDirectSubmitResult:
-        direct_transfer = getattr(self, "direct_transfer", None)
-        if not self._direct_transfer_enabled():
-            return SharedHiCacheDirectSubmitResult(reason="direct_transfer_unavailable")
+        direct_transfer = self.direct_transfer
         source_control_endpoint = self._source_control_endpoint_for_plan(plan)
         if not source_control_endpoint:
             return SharedHiCacheDirectSubmitResult(
@@ -646,9 +635,7 @@ class SharedHiCacheManager:
         plan = getattr(req, "shared_hicache_plan", None)
         if not isinstance(plan, SharedHiCachePlan):
             return False
-        if self._validate_plan(plan) is not None:
-            return False
-        return self._direct_transfer_enabled()
+        return self._validate_plan(plan) is None
 
     def release_request(self, rid: str) -> None:
         rid = str(rid)
@@ -799,24 +786,11 @@ class SharedHiCacheManager:
         )
         max_blocks = planned_blocks - plan_offset
         token_count = max_blocks * page_size
-        expected_hashes = plan.planned_hashes[plan_offset:planned_blocks]
+        expected_hashes = plan.planned_router_block_hashes[plan_offset:planned_blocks]
         transfer = None
         device_indices = None
         direct_submit_reason = None
         available_tokens_before = None
-        if not self._direct_transfer_enabled():
-            logger.debug(
-                "Skipping shared HiCache plan rid=%s plan_id=%s reason=direct_transfer_unavailable",
-                req.rid,
-                plan.plan_id,
-            )
-            self._finished_plan_keys.add(plan_key)
-            self._observe_reuse(
-                backend="none",
-                outcome="miss",
-                reason="direct_transfer_unavailable",
-            )
-            return SharedHiCacheResult()
         if req.host_hit_length > 0:
             self._finished_plan_keys.add(plan_key)
             self._observe_reuse(

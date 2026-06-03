@@ -701,7 +701,7 @@ class ServerArgs:
     enable_shared_hicache: bool = False
     shared_hicache_worker_id: Optional[str] = None
     shared_hicache_bootstrap_port: Optional[int] = None
-    shared_hicache_transfer_backend: str = "auto"
+    shared_hicache_transfer_backend: Optional[str] = None
     shared_hicache_config: Optional[SharedHiCacheConfig] = None
 
     # Hierarchical sparse attention

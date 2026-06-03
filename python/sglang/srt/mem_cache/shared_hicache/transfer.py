@@ -434,20 +434,14 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
     def from_scheduler(cls, scheduler) -> Optional["NixlSharedHiCacheTransferBackend"]:
         server_args = scheduler.server_args
         backend = shared_hicache_transfer_backend_name(server_args)
-        if backend not in {"auto", "nixl"}:
+        if backend != "nixl":
             return None
         topology_rejection = _direct_topology_rejection(scheduler)
         if topology_rejection is not None:
-            if backend == "nixl":
-                logger.warning(
-                    "SharedHiCache NIXL direct transfer disabled: %s",
-                    topology_rejection,
-                )
-            else:
-                logger.debug(
-                    "SharedHiCache NIXL direct transfer disabled: %s",
-                    topology_rejection,
-                )
+            logger.warning(
+                "SharedHiCache NIXL direct transfer disabled: %s",
+                topology_rejection,
+            )
             return None
 
         try:
@@ -491,15 +485,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             transfer.shutdown()
             return None
         except Exception:
-            if backend == "nixl":
-                logger.exception(
-                    "SharedHiCache NIXL direct transfer initialization failed"
-                )
-            else:
-                logger.debug(
-                    "SharedHiCache NIXL direct transfer unavailable; using fallback",
-                    exc_info=True,
-                )
+            logger.exception("SharedHiCache NIXL direct transfer initialization failed")
             return None
 
     @property
@@ -770,32 +756,20 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
 
 def make_shared_hicache_transfer_backend(
     scheduler,
-) -> Optional[SharedHiCacheTransferBackend]:
+) -> SharedHiCacheTransferBackend:
     backend = shared_hicache_transfer_backend_name(scheduler.server_args)
-    topology_rejection = _direct_topology_rejection(scheduler)
-    if topology_rejection is not None:
-        if backend == "nixl":
-            raise RuntimeError(topology_rejection)
-        logger.warning(
-            "SharedHiCache direct transfer unavailable: %s", topology_rejection
-        )
-        return None
-
-    if backend == "nixl":
-        transfer = NixlSharedHiCacheTransferBackend.from_scheduler(scheduler)
-        if transfer is None:
-            raise RuntimeError(
-                "SharedHiCache NIXL transfer backend was requested but unavailable"
-            )
-        return transfer
-
-    if backend != "auto":
+    if backend != "nixl":
         raise RuntimeError(
             f"SharedHiCache transfer backend {backend!r} is not supported; "
-            "this path supports only 'nixl'"
+            "specify --shared-hicache-transfer-backend nixl"
         )
+    topology_rejection = _direct_topology_rejection(scheduler)
+    if topology_rejection is not None:
+        raise RuntimeError(topology_rejection)
 
     transfer = NixlSharedHiCacheTransferBackend.from_scheduler(scheduler)
-    if transfer is not None:
-        return transfer
-    return None
+    if transfer is None:
+        raise RuntimeError(
+            "SharedHiCache NIXL transfer backend was requested but unavailable"
+        )
+    return transfer
