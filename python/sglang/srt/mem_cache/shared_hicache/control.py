@@ -95,30 +95,6 @@ class SharedHiCacheTransferHandle:
         self._reason = "source_transfer_pending"
         self._source_terminal_seen = False
 
-    @classmethod
-    def failed(
-        cls,
-        *,
-        transfer_backend: SharedHiCacheTransferBackend,
-        transfer_id: str,
-        plan: SharedHiCachePlan,
-        start_block: int,
-        max_blocks: int,
-        timeout_secs: float,
-        reason: str,
-    ) -> "SharedHiCacheTransferHandle":
-        handle = cls(
-            transfer_backend=transfer_backend,
-            transfer_id=transfer_id,
-            plan=plan,
-            start_block=start_block,
-            max_blocks=max_blocks,
-            timeout_secs=timeout_secs,
-            pop_source_completion=lambda _transfer_id: None,
-        )
-        handle._finish(KVPoll.Failed, [], reason)
-        return handle
-
     def poll(self) -> KVPoll:
         if self._status in (KVPoll.Success, KVPoll.Failed):
             return self._status

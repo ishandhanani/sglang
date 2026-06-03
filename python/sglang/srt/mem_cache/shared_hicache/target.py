@@ -17,11 +17,7 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class SharedHiCacheDeviceAllocation:
     device_indices: Optional[torch.Tensor]
-    requested_tokens: int
-    granted_tokens: int
     available_tokens_before: Optional[int]
-    available_tokens_after_evict: Optional[int] = None
-    evicted_tokens: int = 0
 
 
 class SharedHiCacheTarget:
@@ -73,8 +69,6 @@ class SharedHiCacheTarget:
         if requested_tokens <= 0:
             return SharedHiCacheDeviceAllocation(
                 device_indices=None,
-                requested_tokens=requested_tokens,
-                granted_tokens=0,
                 available_tokens_before=available_tokens_before,
             )
 
@@ -82,8 +76,6 @@ class SharedHiCacheTarget:
         if device_indices is not None:
             return SharedHiCacheDeviceAllocation(
                 device_indices=device_indices,
-                requested_tokens=requested_tokens,
-                granted_tokens=int(device_indices.numel()),
                 available_tokens_before=available_tokens_before,
             )
 
@@ -103,11 +95,7 @@ class SharedHiCacheTarget:
             if device_indices is not None:
                 return SharedHiCacheDeviceAllocation(
                     device_indices=device_indices,
-                    requested_tokens=requested_tokens,
-                    granted_tokens=int(device_indices.numel()),
                     available_tokens_before=available_tokens_before,
-                    available_tokens_after_evict=available_tokens_after_evict,
-                    evicted_tokens=evicted_tokens,
                 )
 
         available_tokens = (
@@ -118,11 +106,7 @@ class SharedHiCacheTarget:
         if available_tokens is None:
             return SharedHiCacheDeviceAllocation(
                 device_indices=None,
-                requested_tokens=requested_tokens,
-                granted_tokens=0,
                 available_tokens_before=available_tokens_before,
-                available_tokens_after_evict=available_tokens_after_evict,
-                evicted_tokens=evicted_tokens,
             )
 
         partial_tokens = min(requested_tokens, available_tokens)
@@ -130,30 +114,18 @@ class SharedHiCacheTarget:
         if partial_tokens < min_token_count:
             return SharedHiCacheDeviceAllocation(
                 device_indices=None,
-                requested_tokens=requested_tokens,
-                granted_tokens=0,
                 available_tokens_before=available_tokens_before,
-                available_tokens_after_evict=available_tokens_after_evict,
-                evicted_tokens=evicted_tokens,
             )
 
         device_indices = self.alloc_device_indices(partial_tokens)
         if device_indices is None:
             return SharedHiCacheDeviceAllocation(
                 device_indices=None,
-                requested_tokens=requested_tokens,
-                granted_tokens=0,
                 available_tokens_before=available_tokens_before,
-                available_tokens_after_evict=available_tokens_after_evict,
-                evicted_tokens=evicted_tokens,
             )
         return SharedHiCacheDeviceAllocation(
             device_indices=device_indices,
-            requested_tokens=requested_tokens,
-            granted_tokens=int(device_indices.numel()),
             available_tokens_before=available_tokens_before,
-            available_tokens_after_evict=available_tokens_after_evict,
-            evicted_tokens=evicted_tokens,
         )
 
     def _evict_device_tokens(

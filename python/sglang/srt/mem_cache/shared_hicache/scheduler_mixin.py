@@ -30,8 +30,8 @@ class SharedHiCacheSchedulerMixin:
         self.shared_hicache_manager = SharedHiCacheManager.from_scheduler(self)
 
     def _shared_hicache_schedule_candidates(
-        self, waiting_queue: list["Req"], running_bs: int
-    ) -> list["Req"]:
+        self, waiting_queue: list[Req], running_bs: int
+    ) -> list[Req]:
         if not waiting_queue:
             return []
 
@@ -52,7 +52,7 @@ class SharedHiCacheSchedulerMixin:
         limit = capacity + _SHARED_HICACHE_PREPARE_LOOKAHEAD_EXTRA_REQS
         return waiting_queue[: min(len(waiting_queue), limit)]
 
-    def _prepare_shared_hicache_for_schedule_batch(self, reqs: list["Req"]) -> set[str]:
+    def _prepare_shared_hicache_for_schedule_batch(self, reqs: list[Req]) -> set[str]:
         shared_hicache_manager = getattr(self, "shared_hicache_manager", None)
         if shared_hicache_manager is None or not reqs:
             return set()
@@ -87,7 +87,7 @@ class SharedHiCacheSchedulerMixin:
             probe_statuses.append(probe_status)
             local_prefix_lens.append(local_prefix_len)
 
-        local_reqs: list[tuple["Req", int]] = []
+        local_reqs: list[tuple[Req, int]] = []
         reduced_probe_statuses = self._sync_shared_hicache_status_min_batch(
             probe_statuses
         )
@@ -117,7 +117,7 @@ class SharedHiCacheSchedulerMixin:
             [local_prefix_len for _, local_prefix_len in local_reqs]
         )
 
-        prepared_reqs: list[tuple["Req", SharedHiCacheResult | None, int]] = []
+        prepared_reqs: list[tuple[Req, SharedHiCacheResult | None, int]] = []
         prepare_statuses: list[int] = []
 
         for (req, _), common_local_prefix_len in zip(
@@ -206,7 +206,7 @@ class SharedHiCacheSchedulerMixin:
             group = getattr(self, "tp_cpu_group", None)
         return group_size, group
 
-    def _init_next_round_input_with_shared_hicache_tp_sync(self, req: "Req") -> None:
+    def _init_next_round_input_with_shared_hicache_tp_sync(self, req: Req) -> None:
         req.init_next_round_input(self.tree_cache)
         req.shared_hicache_max_prefix_len = None
 

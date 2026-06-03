@@ -39,12 +39,12 @@ class SharedHiCacheSourceTransferQueue:
         self.worker_id = worker_id
         self.transfer_backend = transfer_backend
         self.send_transfer_done = send_transfer_done
-        self.tp_rank = int(tp_rank)
-        self.tp_size = int(tp_size)
-        self.pp_size = int(pp_size)
-        self.attn_tp_size = int(attn_tp_size)
-        self.attn_cp_size = int(attn_cp_size)
-        self.attn_dp_size = int(attn_dp_size)
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.pp_size = pp_size
+        self.attn_tp_size = attn_tp_size
+        self.attn_cp_size = attn_cp_size
+        self.attn_dp_size = attn_dp_size
 
         worker_limit = max(1, int(worker_limit))
         self._executor = ThreadPoolExecutor(

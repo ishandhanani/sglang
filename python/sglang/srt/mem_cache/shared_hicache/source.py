@@ -605,7 +605,6 @@ def execute_source_transfer_request(
                     reason=reason,
                 )
                 transfer_backend.transfer_pages(
-                    target_session_id=request.target_session_id,
                     source_page_indices=source_page_indices,
                     target_page_indices=target_page_indices,
                     target_kv_ptrs=request.target_kv_ptrs,

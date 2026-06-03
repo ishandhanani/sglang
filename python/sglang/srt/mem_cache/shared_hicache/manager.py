@@ -76,7 +76,7 @@ class SharedHiCacheDirectSubmitResult:
     available_tokens_before: Optional[int] = None
 
 
-def _shared_hicache_enabled(server_args: "ServerArgs") -> bool:
+def _shared_hicache_enabled(server_args: ServerArgs) -> bool:
     return bool(getattr(server_args, "enable_shared_hicache", False))
 
 
@@ -84,7 +84,7 @@ class SharedHiCacheManager:
     def __init__(
         self,
         *,
-        server_args: "ServerArgs",
+        server_args: ServerArgs,
         tree_cache,
         worker_id: Optional[str],
         parallel_metadata: Optional[Mapping[str, int]] = None,
@@ -343,7 +343,6 @@ class SharedHiCacheManager:
             name="shared_hicache-direct-transfer-shutdown",
             daemon=True,
         )
-        self._direct_transfer_shutdown_thread = thread
         thread.start()
 
     def shutdown(self) -> None:
@@ -460,7 +459,7 @@ class SharedHiCacheManager:
     def _finish_target_transfer(self, transfer_id: str) -> None:
         self.target_transfer_tracker.finish(transfer_id)
 
-    def _max_cacheable_blocks(self, req: "Req") -> int:
+    def _max_cacheable_blocks(self, req: Req) -> int:
         max_prefix_len = max(len(req.fill_ids) - 1, 0)
         if req.return_logprob and req.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, req.logprob_start_len)
@@ -476,7 +475,7 @@ class SharedHiCacheManager:
             topology=self.topology,
         )
 
-    def _plan_key(self, req: "Req", plan: SharedHiCachePlan) -> tuple[str, str]:
+    def _plan_key(self, req: Req, plan: SharedHiCachePlan) -> tuple[str, str]:
         return str(req.rid), plan.plan_id
 
     def has_pending(self) -> bool:
@@ -496,7 +495,7 @@ class SharedHiCacheManager:
             or active_source_count > 0
         )
 
-    def _lock_request_prefix(self, req: "Req") -> Optional[TreeNode]:
+    def _lock_request_prefix(self, req: Req) -> Optional[TreeNode]:
         last_node = getattr(req, "last_node", None)
         if last_node is None or last_node is self.tree_cache.root_node:
             return None
@@ -547,7 +546,6 @@ class SharedHiCacheManager:
         plan: SharedHiCachePlan,
         *,
         start_block: int,
-        max_blocks: int,
         token_count: int,
     ) -> SharedHiCacheDirectSubmitResult:
         direct_transfer = getattr(self, "direct_transfer", None)
@@ -659,7 +657,7 @@ class SharedHiCacheManager:
             available_tokens_before=allocation.available_tokens_before,
         )
 
-    def has_reuse_plan(self, req: "Req") -> bool:
+    def has_reuse_plan(self, req: Req) -> bool:
         plan = getattr(req, "shared_hicache_plan", None)
         if not isinstance(plan, SharedHiCachePlan):
             return False
@@ -683,7 +681,7 @@ class SharedHiCacheManager:
             if key[0] != rid
         }
 
-    def prepare_reuse(self, req: "Req") -> SharedHiCacheResult:
+    def prepare_reuse(self, req: Req) -> SharedHiCacheResult:
         plan = getattr(req, "shared_hicache_plan", None)
         if plan is None:
             return SharedHiCacheResult()
@@ -858,7 +856,6 @@ class SharedHiCacheManager:
                 direct_submit = self._submit_direct_transfer(
                     plan,
                     start_block=plan_offset,
-                    max_blocks=max_blocks,
                     token_count=token_count,
                 )
             except Exception:
@@ -967,7 +964,7 @@ class SharedHiCacheManager:
         return SharedHiCacheResult(pending=True)
 
     def _finish_pending_fetch(
-        self, req: "Req", pending: SharedHiCachePendingFetch
+        self, req: Req, pending: SharedHiCachePendingFetch
     ) -> SharedHiCacheResult:
         self._pending_fetches.pop(str(req.rid), None)
         plan = pending.plan

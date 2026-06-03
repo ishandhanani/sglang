@@ -65,7 +65,6 @@ class SharedHiCacheTransferBackend(ABC):
     def transfer_pages(
         self,
         *,
-        target_session_id: str,
         source_page_indices: np.ndarray,
         target_page_indices: np.ndarray,
         target_kv_ptrs: list[int],
@@ -419,7 +418,6 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         self.tree_cache = tree_cache
         self._target_registered = bool(target_registered)
         self._source_pool_ready = False
-        self._source_registered_ptrs: list[int] = []
         self._source_worker_states: dict[int, _NixlSourceWorkerState] = {}
         self._source_worker_lock = threading.Lock()
         self._target_notification_lock = threading.Lock()
@@ -556,7 +554,6 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             logger.info("SharedHiCache NIXL direct transfer disabled: %s", err)
             return
         self._source_pool_ready = True
-        self._source_registered_ptrs = [int(host_pool.kv_buffer.data_ptr())]
 
     def _create_source_worker_state(self) -> _NixlSourceWorkerState:
         host_pool = self.tree_cache.cache_controller.mem_pool_host
@@ -699,7 +696,6 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
     def transfer_pages(
         self,
         *,
-        target_session_id: str,
         source_page_indices: np.ndarray,
         target_page_indices: np.ndarray,
         target_kv_ptrs: list[int],
@@ -764,7 +760,6 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         if self._shutdown:
             return
         self._shutdown = True
-        self._source_registered_ptrs = []
         self._source_pool_ready = False
         self._source_worker_states = {}
         self._target_notifications = {}
