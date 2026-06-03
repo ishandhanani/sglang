@@ -405,6 +405,11 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             self._source_worker_states[thread_id] = state
             return state
 
+    def prepare_source_worker(self) -> None:
+        if self._shutdown:
+            raise RuntimeError("NIXL direct KV transfer backend is not enabled")
+        self._source_worker_state()
+
     def _add_remote_target(
         self,
         state: _NixlSourceWorkerState,
