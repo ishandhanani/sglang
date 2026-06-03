@@ -32,7 +32,7 @@ from sglang.srt.mem_cache.shared_hicache.target import SharedHiCacheTarget
 from sglang.srt.mem_cache.shared_hicache.transfer import (
     NixlSharedHiCacheTransferBackend,
 )
-from sglang.srt.mem_cache.utils import block_hash_aliases, hash_str_to_int64
+from sglang.srt.mem_cache.utils import hash_str_to_int64
 
 
 def _make_plan(block_hashes, **overrides):
@@ -323,6 +323,18 @@ class TestSharedHiCache(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "block_hash must be an integer"):
             SharedHiCachePlan.from_dict(_make_plan([{"block_hash": 11}]))
 
+    def test_plan_normalizes_uint64_hashes_to_signed_int64(self):
+        signed_hash = hash_str_to_int64("aa" * 32)
+        unsigned_hash = signed_hash & (2**64 - 1)
+
+        plan = SharedHiCachePlan.from_dict(
+            _make_plan([unsigned_hash], kv_block_hashes=[unsigned_hash])
+        )
+
+        self.assertGreater(unsigned_hash, 2**63 - 1)
+        self.assertEqual(plan.block_hashes, (signed_hash,))
+        self.assertEqual(plan.kv_block_hashes, (signed_hash,))
+
     def test_generate_req_input_reads_shared_plan_from_cache_hints(self):
         req = GenerateReqInput(
             text="hello",
@@ -401,8 +413,7 @@ class TestSharedHiCache(unittest.TestCase):
         matches, protected = cache.lookup_hicache_host_blocks(
             {block_hash}, protect=True
         )
-        for alias in block_hash_aliases(block_hash):
-            self.assertIn(alias, matches)
+        self.assertIn(block_hash, matches)
         self.assertEqual(protected, [node])
         self.assertEqual(node.host_ref_counter, 1)
         node.release_host()

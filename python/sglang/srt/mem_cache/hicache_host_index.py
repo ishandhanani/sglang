@@ -3,11 +3,7 @@ from __future__ import annotations
 import threading
 
 from sglang.srt.mem_cache.radix_cache import TreeNode
-from sglang.srt.mem_cache.utils import (
-    block_hash_aliases,
-    compute_node_hash_values,
-    hash_str_to_int64,
-)
+from sglang.srt.mem_cache.utils import compute_node_hash_values, hash_str_to_int64
 
 
 class HiCacheHostBlockIndex:
@@ -42,8 +38,7 @@ class HiCacheHostBlockIndex:
             for page_idx in range(num_pages):
                 hash_value = node.hash_value[page_idx]
                 block_hash = hash_str_to_int64(hash_value)
-                for alias in block_hash_aliases(block_hash):
-                    self.block_index[alias] = (node, page_idx, hash_value)
+                self.block_index[block_hash] = (node, page_idx, hash_value)
 
     def drop_node(self, node: TreeNode, *, locked: bool = False) -> None:
         if locked:
@@ -68,14 +63,10 @@ class HiCacheHostBlockIndex:
         matches: dict[int, tuple[TreeNode, int, str]] = {}
         protected_nodes: list[TreeNode] = []
         protected_ids: set[int] = set()
-        wanted_aliases: set[int] = set()
-        for block_hash in wanted_hashes:
-            wanted_aliases.update(block_hash_aliases(block_hash))
-
-        stale_aliases = []
+        stale_hashes = []
         with self.lock:
-            for alias in wanted_aliases:
-                entry = self.block_index.get(alias)
+            for block_hash in wanted_hashes:
+                entry = self.block_index.get(block_hash)
                 if entry is None:
                     continue
                 node, page_idx, hash_value = entry
@@ -87,16 +78,16 @@ class HiCacheHostBlockIndex:
                     and node.hash_value[page_idx] == hash_value
                 )
                 if valid:
-                    matches[alias] = entry
+                    matches[block_hash] = entry
                     if protect and node.id not in protected_ids:
                         node.protect_host()
                         protected_nodes.append(node)
                         protected_ids.add(node.id)
                 else:
-                    stale_aliases.append(alias)
+                    stale_hashes.append(block_hash)
 
-            for alias in stale_aliases:
-                self.block_index.pop(alias, None)
+            for block_hash in stale_hashes:
+                self.block_index.pop(block_hash, None)
         if protect:
             return matches, protected_nodes
         return matches

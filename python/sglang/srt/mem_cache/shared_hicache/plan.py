@@ -9,6 +9,9 @@ from sglang.srt.disaggregation.kv_events import StorageMedium
 SHARED_HICACHE_PLAN_VERSION = 1
 SHARED_HICACHE_DIRECT_TIMEOUT_REASON = "source_transfer_timeout_maybe_inflight"
 SHARED_HICACHE_SOURCE_MEDIUM = StorageMedium.CPU.value
+_SIGNED_INT64_MIN = -(2**63)
+_SIGNED_INT64_MAX = 2**63 - 1
+_UINT64_MAX = 2**64 - 1
 
 
 def _now_ms() -> int:
@@ -77,8 +80,16 @@ def _coerce_array(value: Any, field_name: str) -> list[Any]:
         raise ValueError(f"{field_name} must be an array") from err
 
 
-def _coerce_block_hash(value: Any) -> int:
-    return _coerce_int(value, "block_hash")
+def _coerce_block_hash(value: Any, field_name: str = "block_hash") -> int:
+    value = _coerce_int(value, field_name)
+    if _SIGNED_INT64_MIN <= value <= _SIGNED_INT64_MAX:
+        return value
+    if 0 <= value <= _UINT64_MAX:
+        # Shared HiCache plans cross a JSON boundary from routers that use u64
+        # internally, while SGLang KV events and host indexing use signed int64.
+        # Normalize once here so source-side cache lookup remains exact.
+        return value - 2**64
+    raise ValueError(f"{field_name} must fit in signed int64 or uint64")
 
 
 @dataclass(frozen=True)
@@ -123,7 +134,7 @@ class SharedHiCachePlan:
         if kv_block_hashes_raw is None:
             kv_block_hashes_raw = ()
         kv_block_hashes = tuple(
-            _coerce_block_hash(item)
+            _coerce_block_hash(item, "kv_block_hash")
             for item in _coerce_array(kv_block_hashes_raw, "kv_block_hashes")
         )
         if kv_block_hashes and len(kv_block_hashes) != len(block_hashes):

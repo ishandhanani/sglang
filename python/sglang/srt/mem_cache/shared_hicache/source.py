@@ -19,7 +19,6 @@ from sglang.srt.mem_cache.shared_hicache.plan import (
     SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
     SharedHiCachePlan,
 )
-from sglang.srt.mem_cache.utils import block_hash_aliases
 
 logger = logging.getLogger(__name__)
 
@@ -77,11 +76,7 @@ def _lookup_hicache_host_blocks(
 def _host_block_entry(
     block_index: Mapping[int, tuple[TreeNode, int, str]], block_hash: int
 ) -> Optional[tuple[TreeNode, int, str]]:
-    for alias in block_hash_aliases(block_hash):
-        entry = block_index.get(alias)
-        if entry is not None:
-            return entry
-    return None
+    return block_index.get(block_hash)
 
 
 def _host_page_start_indices(
