@@ -36,8 +36,8 @@ class SharedHiCacheTransferBackend(ABC):
             **self.topology.to_dict(),
         }
 
-    def prepare_source_worker(self) -> None:
-        pass
+    def create_source_worker(self):
+        return self
 
     @abstractmethod
     def transfer_pages(
