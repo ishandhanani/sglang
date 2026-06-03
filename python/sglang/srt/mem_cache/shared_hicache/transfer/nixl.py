@@ -13,10 +13,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional
 import numpy as np
 
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.environ import (
-    default_shared_hicache_transfer_parallelism,
-    envs,
-)
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.shared_hicache.topology import SharedHiCacheTopology
 from sglang.srt.mem_cache.shared_hicache.transfer.common import (
     SharedHiCacheTransferBackend,
@@ -290,7 +287,9 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
     def from_scheduler(
         cls, scheduler, *, topology: SharedHiCacheTopology
     ) -> "NixlSharedHiCacheTransferBackend":
-        transfer_parallelism = default_shared_hicache_transfer_parallelism()
+        transfer_parallelism = max(
+            1, int(envs.SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM.get())
+        )
         agent, agent_name, backend_name = _create_nixl_agent(
             transfer_parallelism=transfer_parallelism
         )
@@ -405,11 +404,6 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
                 return existing
             self._source_worker_states[thread_id] = state
             return state
-
-    def prepare_source_worker(self) -> None:
-        if self._shutdown:
-            raise RuntimeError("NIXL direct KV transfer backend is not enabled")
-        self._source_worker_state()
 
     def _add_remote_target(
         self,

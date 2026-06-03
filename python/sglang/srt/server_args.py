@@ -60,7 +60,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.mem_cache.shared_hicache.config import (
     SHARED_HICACHE_TRANSFER_BACKEND_CHOICES,
-    SharedHiCacheConfig,
     normalize_shared_hicache_server_config,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -715,7 +714,6 @@ class ServerArgs:
     shared_hicache_worker_id: Optional[str] = None
     shared_hicache_bootstrap_port: Optional[int] = None
     shared_hicache_transfer_backend: Optional[str] = None
-    shared_hicache_config: Optional[SharedHiCacheConfig] = None
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -4063,16 +4061,18 @@ class ServerArgs:
         (
             self.enable_shared_hicache,
             worker_id,
-            self.shared_hicache_config,
+            bootstrap_port,
+            transfer_backend,
         ) = normalize_shared_hicache_server_config(
             enable_shared_hicache=self.enable_shared_hicache,
             worker_id=self.shared_hicache_worker_id,
-            host=self.host,
             bootstrap_port=self.shared_hicache_bootstrap_port,
             transfer_backend=self.shared_hicache_transfer_backend,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
         )
         self.shared_hicache_worker_id = worker_id
+        self.shared_hicache_bootstrap_port = bootstrap_port
+        self.shared_hicache_transfer_backend = transfer_backend
 
     def _handle_load_format(self):
         if (

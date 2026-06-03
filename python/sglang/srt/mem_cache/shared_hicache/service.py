@@ -8,25 +8,9 @@ from typing import Any, Callable, Mapping, Optional
 
 import zmq
 
-from sglang.srt.mem_cache.shared_hicache.control import endpoint_to_zmq
 from sglang.srt.utils.network import config_socket
 
 logger = logging.getLogger(__name__)
-
-
-def _encode_control_payload(payload: Mapping[str, Any]) -> bytes:
-    return json.dumps(dict(payload), separators=(",", ":")).encode("utf-8")
-
-
-def _decode_control_payload(frames: list[bytes]) -> Mapping[str, Any]:
-    if len(frames) != 1:
-        raise ValueError(
-            f"expected one Shared HiCache control frame, got {len(frames)}"
-        )
-    payload = json.loads(frames[0].decode("utf-8"))
-    if not isinstance(payload, Mapping):
-        raise ValueError("Shared HiCache control payload must be a JSON object")
-    return payload
 
 
 class SharedHiCacheSourceService:
@@ -53,7 +37,7 @@ class SharedHiCacheSourceService:
         self._active_ops = 0
 
     def start(self) -> None:
-        endpoint = endpoint_to_zmq(self.endpoint)
+        endpoint = self.endpoint.rstrip("/")
         socket = self._context.socket(zmq.PULL)
         config_socket(socket, zmq.PULL)
         socket.bind(endpoint)
@@ -74,7 +58,7 @@ class SharedHiCacheSourceService:
         )
 
     def send(self, endpoint: str, payload: Mapping[str, Any]) -> None:
-        endpoint = endpoint_to_zmq(endpoint)
+        endpoint = endpoint.rstrip("/")
         with self._send_lock:
             socket = self._send_sockets.get(endpoint)
             if socket is None:
@@ -82,7 +66,9 @@ class SharedHiCacheSourceService:
                 config_socket(socket, zmq.PUSH)
                 socket.connect(endpoint)
                 self._send_sockets[endpoint] = socket
-            socket.send_multipart([_encode_control_payload(payload)])
+            socket.send_multipart(
+                [json.dumps(dict(payload), separators=(",", ":")).encode("utf-8")]
+            )
 
     def active_count(self) -> int:
         with self._activity_lock:
@@ -140,7 +126,16 @@ class SharedHiCacheSourceService:
             with self._activity_lock:
                 self._active_ops += 1
             try:
-                payload = _decode_control_payload(socket.recv_multipart())
+                frames = socket.recv_multipart()
+                if len(frames) != 1:
+                    raise ValueError(
+                        f"expected one Shared HiCache control frame, got {len(frames)}"
+                    )
+                payload = json.loads(frames[0].decode("utf-8"))
+                if not isinstance(payload, Mapping):
+                    raise ValueError(
+                        "Shared HiCache control payload must be a JSON object"
+                    )
                 self.handle_control_message(payload)
             except (TypeError, ValueError, json.JSONDecodeError):
                 logger.warning("Ignoring malformed Shared HiCache ZMQ payload")

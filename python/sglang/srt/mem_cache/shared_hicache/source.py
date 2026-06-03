@@ -11,6 +11,7 @@ import numpy as np
 from sglang.srt.mem_cache.radix_cache import TreeNode
 from sglang.srt.mem_cache.shared_hicache.plan import (
     SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
+    SHARED_HICACHE_SOURCE_MEDIUM,
     SharedHiCachePlan,
 )
 from sglang.srt.mem_cache.shared_hicache.topology import (
@@ -116,7 +117,7 @@ def resolve_host_page_locations(
         return [], rank_rejection, []
     if plan.is_expired():
         return [], "plan_expired", []
-    if not plan.is_shared_hicache():
+    if plan.source_medium != SHARED_HICACHE_SOURCE_MEDIUM:
         return [], "unsupported_source_medium", []
     if plan.block_size_tokens != tree_cache.page_size:
         return [], "incompatible_block_size", []

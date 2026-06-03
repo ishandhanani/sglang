@@ -883,10 +883,6 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
-def default_shared_hicache_transfer_parallelism() -> int:
-    return max(1, int(envs.SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM.get()))
-
-
 def _print_deprecated_env(old_name: str, new_name: Optional[str] = None):
     if old_name in os.environ:
         if new_name is None:
