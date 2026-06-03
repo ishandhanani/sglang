@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from contextlib import suppress
 from typing import Any, Callable, Mapping, Optional
 
 import zmq
@@ -92,10 +93,8 @@ class SharedHiCacheSourceService:
         poller = self._poller
         socket = self._pull_socket
         if poller is not None and socket is not None:
-            try:
+            with suppress(Exception):
                 poller.unregister(socket)
-            except Exception:
-                pass
         self._poller = None
         self._pull_socket = None
         if socket is not None:
