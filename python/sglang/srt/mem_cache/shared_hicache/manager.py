@@ -70,7 +70,7 @@ class SharedHiCacheManager:
         *,
         server_args: ServerArgs,
         tree_cache,
-        worker_id: Optional[str],
+        worker_id: str,
         topology: SharedHiCacheTopology,
         direct_transfer: SharedHiCacheTransferBackend,
         metrics_collector=None,
@@ -372,8 +372,6 @@ class SharedHiCacheManager:
         return max_prefix_len // self.tree_cache.page_size
 
     def _validate_plan(self, plan: SharedHiCachePlan) -> Optional[str]:
-        if self.worker_id is None:
-            return "missing_worker_id"
         if plan.target_worker_id != self.worker_id:
             return "wrong_target_worker"
         rank_rejection = self.topology.validate_target_rank(plan)
