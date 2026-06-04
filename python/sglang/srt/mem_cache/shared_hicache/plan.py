@@ -43,12 +43,12 @@ class SharedHiCachePlan:
     block_size_tokens: int
     created_at_ms: int
     expires_at_ms: int
-    start_block_index: int = 0
-    plan_version: int = SHARED_HICACHE_PLAN_VERSION
+    start_block_index: int
+    plan_version: int
+    source_tp_size: int
+    target_tp_size: int
     source_tp_rank: Optional[int] = None
-    source_tp_size: int = 1
     target_tp_rank: Optional[int] = None
-    target_tp_size: int = 1
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "SharedHiCachePlan":
@@ -83,21 +83,22 @@ class SharedHiCachePlan:
                 "engine_block_hashes length must match router_block_hashes"
             )
 
-        planned_prefix_blocks = int(
-            data.get("planned_prefix_blocks", len(router_block_hashes))
-        )
-        if planned_prefix_blocks < 0:
-            raise ValueError("planned_prefix_blocks must be non-negative")
-        start_block_index = int(data.get("start_block_index", 0))
-        if start_block_index < 0:
-            raise ValueError("start_block_index must be non-negative")
-        source_tp_rank = data.get("source_tp_rank")
-        target_tp_rank = data.get("target_tp_rank")
-
         try:
+            planned_prefix_blocks = int(data["planned_prefix_blocks"])
+            start_block_index = int(data["start_block_index"])
+            source_tp_rank = data.get("source_tp_rank")
+            target_tp_rank = data.get("target_tp_rank")
+            if planned_prefix_blocks < 0:
+                raise ValueError("planned_prefix_blocks must be non-negative")
+            if planned_prefix_blocks > len(router_block_hashes):
+                raise ValueError(
+                    "planned_prefix_blocks must not exceed router_block_hashes length"
+                )
+            if start_block_index < 0:
+                raise ValueError("start_block_index must be non-negative")
             return cls(
-                plan_id=str(data.get("plan_id", "")),
-                request_id=str(data.get("request_id", "")),
+                plan_id=str(data["plan_id"]),
+                request_id=str(data["request_id"]),
                 target_worker_id=str(data["target_worker_id"]),
                 source_worker_id=str(data["source_worker_id"]),
                 source_host=str(data["source_host"]),
@@ -105,18 +106,16 @@ class SharedHiCachePlan:
                 source_medium=str(data["source_medium"]),
                 router_block_hashes=router_block_hashes,
                 engine_block_hashes=engine_block_hashes,
-                planned_prefix_blocks=min(
-                    planned_prefix_blocks, len(router_block_hashes)
-                ),
+                planned_prefix_blocks=planned_prefix_blocks,
                 block_size_tokens=int(data["block_size_tokens"]),
-                created_at_ms=int(data.get("created_at_ms", 0)),
+                created_at_ms=int(data["created_at_ms"]),
                 expires_at_ms=int(data["expires_at_ms"]),
                 start_block_index=start_block_index,
-                plan_version=int(data.get("plan_version", SHARED_HICACHE_PLAN_VERSION)),
+                plan_version=int(data["plan_version"]),
                 source_tp_rank=None if source_tp_rank is None else int(source_tp_rank),
-                source_tp_size=int(data.get("source_tp_size", 1)),
+                source_tp_size=int(data["source_tp_size"]),
                 target_tp_rank=None if target_tp_rank is None else int(target_tp_rank),
-                target_tp_size=int(data.get("target_tp_size", 1)),
+                target_tp_size=int(data["target_tp_size"]),
             )
         except KeyError as err:
             raise ValueError(f"SharedHiCache plan missing {err.args[0]}") from err
