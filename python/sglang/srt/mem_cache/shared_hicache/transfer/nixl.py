@@ -458,7 +458,6 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         return target_agent_name
 
     def _wait_for_transfer(self, agent, handle) -> None:
-        release = getattr(agent, "release_xfer_handle", None)
         try:
             transfer_state = agent.transfer(handle)
             while True:
@@ -469,14 +468,13 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
                 time.sleep(0)
                 transfer_state = agent.check_xfer_state(handle)
         finally:
-            if callable(release):
-                try:
-                    release(handle)
-                except Exception:
-                    logger.debug(
-                        "SharedHiCache NIXL transfer handle release failed",
-                        exc_info=True,
-                    )
+            try:
+                agent.release_xfer_handle(handle)
+            except Exception:
+                logger.debug(
+                    "SharedHiCache NIXL transfer handle release failed",
+                    exc_info=True,
+                )
 
     def _drain_target_notifications_locked(self) -> None:
         try:
