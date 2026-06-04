@@ -83,10 +83,7 @@ def _target_kv_pool_from_scheduler(scheduler):
 
 
 def _scheduler_gpu_id(scheduler) -> int:
-    gpu_id = getattr(scheduler, "gpu_id", None)
-    if gpu_id is None:
-        gpu_id = getattr(getattr(scheduler, "ps", None), "gpu_id", None)
-    return int(gpu_id if gpu_id is not None else 0)
+    return int(scheduler.ps.gpu_id)
 
 
 def _nixl_backend_params(backend: str, transfer_parallelism: int) -> dict[str, str]:
