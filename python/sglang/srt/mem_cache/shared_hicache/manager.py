@@ -797,10 +797,6 @@ class SharedHiCacheManager:
         max_blocks = planned_blocks - plan_offset
         token_count = max_blocks * page_size
         expected_hashes = plan.planned_router_block_hashes[plan_offset:planned_blocks]
-        transfer = None
-        device_indices = None
-        direct_submit_reason = None
-        available_tokens_before = None
         if req.host_hit_length > 0:
             self._finished_plan_keys.add(plan_key)
             self._observe_reuse(
@@ -809,7 +805,6 @@ class SharedHiCacheManager:
                 reason="local_host_hit",
             )
             return SharedHiCacheResult()
-        locked_node = None
         backend = self._current_backend_label()
         self._observe_staging(
             backend=backend,
