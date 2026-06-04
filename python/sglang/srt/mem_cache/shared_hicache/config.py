@@ -9,7 +9,7 @@ SHARED_HICACHE_TRANSFER_BACKEND_CHOICES = ("nixl",)
 
 
 def shared_hicache_transfer_backend_name(server_args) -> str:
-    backend = getattr(server_args, "shared_hicache_transfer_backend", None)
+    backend = server_args.shared_hicache_transfer_backend
     if backend is None:
         return ""
     return str(backend).strip().lower()
