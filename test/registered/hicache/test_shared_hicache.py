@@ -15,7 +15,10 @@ from sglang.srt.mem_cache.shared_hicache.manager import SharedHiCacheManager
 from sglang.srt.mem_cache.shared_hicache.config import (
     normalize_shared_hicache_server_config,
 )
-from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
+from sglang.srt.mem_cache.shared_hicache.plan import (
+    SHARED_HICACHE_PLAN_VERSION,
+    SharedHiCachePlan,
+)
 from sglang.srt.mem_cache.shared_hicache.scheduler_mixin import (
     SharedHiCacheSchedulerMixin,
     SharedHiCachePrepareStatus,
@@ -46,6 +49,10 @@ def _make_plan(router_block_hashes, **overrides):
         "block_size_tokens": 2,
         "created_at_ms": 1,
         "expires_at_ms": int(time.time() * 1000) + 60_000,
+        "start_block_index": 0,
+        "plan_version": SHARED_HICACHE_PLAN_VERSION,
+        "source_tp_size": 1,
+        "target_tp_size": 1,
     }
     plan.update(overrides)
     return plan
@@ -329,6 +336,24 @@ class TestSharedHiCache(unittest.TestCase):
             SharedHiCachePlan.from_dict(
                 _make_plan([11], engine_block_hashes=[11, 12])
             )
+
+        for field_name in (
+            "plan_id",
+            "request_id",
+            "planned_prefix_blocks",
+            "created_at_ms",
+            "start_block_index",
+            "plan_version",
+            "source_tp_size",
+            "target_tp_size",
+        ):
+            missing = _make_plan([11])
+            missing.pop(field_name)
+            with self.assertRaisesRegex(ValueError, f"missing {field_name}"):
+                SharedHiCachePlan.from_dict(missing)
+
+        with self.assertRaisesRegex(ValueError, "planned_prefix_blocks"):
+            SharedHiCachePlan.from_dict(_make_plan([11], planned_prefix_blocks=2))
 
     def test_plan_keeps_router_and_engine_hash_representations_separate(self):
         signed_hash = hash_str_to_int64("aa" * 32)
