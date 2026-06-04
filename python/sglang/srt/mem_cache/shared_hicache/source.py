@@ -41,7 +41,6 @@ class SourceTransferRequest:
     plan: SharedHiCachePlan
     start_block: int
     max_blocks: int
-    target_session_id: str
     target_kv_ptrs: list[int]
     target_kv_item_lens: list[int]
     target_num_pages: int
@@ -220,7 +219,6 @@ def _is_timeout_error(err: BaseException) -> bool:
 def _parse_target_kv_metadata(
     payload: Mapping[str, Any], transfer_backend: SharedHiCacheTransferBackend
 ) -> tuple[
-    Optional[str],
     Optional[list[int]],
     Optional[list[int]],
     Optional[int],
@@ -231,18 +229,18 @@ def _parse_target_kv_metadata(
         target_kv_ptrs_raw = payload["target_kv_ptrs"]
         target_kv_item_lens_raw = payload["target_kv_item_lens"]
     except KeyError as err:
-        return None, None, None, None, f"target_kv_metadata_missing:{err}"
+        return None, None, None, f"target_kv_metadata_missing:{err}"
 
     target_session_id = str(target_session_id_raw)
     if not target_session_id or target_session_id_raw is None:
-        return None, None, None, None, "target_session_id_empty"
+        return None, None, None, "target_session_id_empty"
     target_metadata = payload.get("target_metadata")
     if isinstance(target_metadata, Mapping) and "session_id" in target_metadata:
         metadata_session_id = str(target_metadata["session_id"])
         if not metadata_session_id or target_metadata["session_id"] is None:
-            return None, None, None, None, "target_metadata_session_id_empty"
+            return None, None, None, "target_metadata_session_id_empty"
         if metadata_session_id != target_session_id:
-            return None, None, None, None, "target_session_id_mismatch"
+            return None, None, None, "target_session_id_mismatch"
 
     try:
         target_kv_ptrs = _coerce_transfer_int_list(target_kv_ptrs_raw, "target_kv_ptrs")
@@ -250,13 +248,12 @@ def _parse_target_kv_metadata(
             target_kv_item_lens_raw, "target_kv_item_lens"
         )
     except ValueError as err:
-        return None, None, None, None, str(err)
+        return None, None, None, str(err)
 
     if not target_kv_ptrs:
-        return None, None, None, None, "target_kv_ptrs_empty"
+        return None, None, None, "target_kv_ptrs_empty"
     if len(target_kv_ptrs) != len(target_kv_item_lens):
         return (
-            None,
             None,
             None,
             None,
@@ -265,13 +262,12 @@ def _parse_target_kv_metadata(
 
     uint64_max = int(np.iinfo(np.uint64).max)
     if any(ptr <= 0 or ptr > uint64_max for ptr in target_kv_ptrs):
-        return None, None, None, None, "target_kv_ptr_out_of_range"
+        return None, None, None, "target_kv_ptr_out_of_range"
     if any(length <= 0 or length > uint64_max for length in target_kv_item_lens):
-        return None, None, None, None, "target_kv_item_len_out_of_range"
+        return None, None, None, "target_kv_item_len_out_of_range"
 
     if len(transfer_backend.target_kv_item_lens) != len(target_kv_item_lens):
         return (
-            None,
             None,
             None,
             None,
@@ -281,18 +277,18 @@ def _parse_target_kv_metadata(
         transfer_backend.target_kv_item_lens, target_kv_item_lens
     ):
         if expected != actual:
-            return None, None, None, None, "target_kv_item_lens_mismatch"
+            return None, None, None, "target_kv_item_lens_mismatch"
 
     try:
         target_num_pages = _target_metadata_int(target_metadata, "target_num_pages")
     except ValueError as err:
-        return None, None, None, None, str(err)
+        return None, None, None, str(err)
     if target_num_pages is None:
-        return None, None, None, None, "target_num_pages_missing"
+        return None, None, None, "target_num_pages_missing"
     if target_num_pages <= 0:
-        return None, None, None, None, "target_num_pages_out_of_range"
+        return None, None, None, "target_num_pages_out_of_range"
 
-    return target_session_id, target_kv_ptrs, target_kv_item_lens, target_num_pages, None
+    return target_kv_ptrs, target_kv_item_lens, target_num_pages, None
 
 
 def parse_source_transfer_request(
@@ -361,7 +357,6 @@ def parse_source_transfer_request(
         }
 
     (
-        target_session_id,
         target_kv_ptrs,
         target_kv_item_lens,
         target_num_pages,
@@ -420,7 +415,6 @@ def parse_source_transfer_request(
             plan=plan,
             start_block=start_block,
             max_blocks=max_blocks,
-            target_session_id=target_session_id,
             target_kv_ptrs=target_kv_ptrs,
             target_kv_item_lens=target_kv_item_lens,
             target_num_pages=target_num_pages,
