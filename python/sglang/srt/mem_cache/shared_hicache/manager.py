@@ -243,35 +243,25 @@ class SharedHiCacheManager:
         )
 
     def _try_acquire_fetch_worker(self) -> bool:
-        semaphore = getattr(self, "_target_transfer_capacity", None)
-        if semaphore is None:
-            return True
-        return semaphore.acquire(blocking=False)
+        return self._target_transfer_capacity.acquire(blocking=False)
 
     def _release_fetch_worker(self) -> None:
-        semaphore = getattr(self, "_target_transfer_capacity", None)
-        if semaphore is None:
-            return
         try:
-            semaphore.release()
+            self._target_transfer_capacity.release()
         except ValueError:
             logger.debug(
                 "SharedHiCache fetch worker semaphore release ignored", exc_info=True
             )
 
     def _shutdown_direct_transfer_backend(self) -> None:
-        lock = getattr(self, "_direct_transfer_shutdown_lock", None)
-        if lock is None:
-            lock = threading.Lock()
-            self._direct_transfer_shutdown_lock = lock
-        with lock:
-            if getattr(self, "_direct_transfer_shutdown_done", False):
+        with self._direct_transfer_shutdown_lock:
+            if self._direct_transfer_shutdown_done:
                 return
             self.direct_transfer.shutdown()
             self._direct_transfer_shutdown_done = True
 
     def _defer_direct_transfer_shutdown(self) -> None:
-        if getattr(self, "_direct_transfer_shutdown_deferred", False):
+        if self._direct_transfer_shutdown_deferred:
             return
         self._direct_transfer_shutdown_deferred = True
 
