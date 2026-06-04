@@ -73,7 +73,9 @@ class SharedHiCacheTransferHandle:
             self._finish(KVPoll.Failed, [], SHARED_HICACHE_DIRECT_TIMEOUT_REASON)
             return self._status
 
-        notification = self._pop_target_transfer_notification()
+        notification = self.transfer_backend.pop_target_transfer_notification(
+            self.transfer_id
+        )
         if notification is not None:
             transferred_blocks, reason = notification
             pages = self._pages_for_transferred_blocks(transferred_blocks)
@@ -129,13 +131,6 @@ class SharedHiCacheTransferHandle:
         self._reason = str(reason)
         self.done_at = time.perf_counter()
 
-    def _pop_target_transfer_notification(self) -> Optional[tuple[int, str]]:
-        pop = getattr(self.transfer_backend, "pop_target_transfer_notification", None)
-        if not callable(pop):
-            return None
-        return pop(self.transfer_id)
-
-
 class SharedHiCacheTargetTransferTracker:
     """Tracks source completion messages for target-side direct transfers."""
 
@@ -172,8 +167,4 @@ class SharedHiCacheTargetTransferTracker:
         with self._lock:
             self._active.discard(transfer_id)
             self._completions.pop(transfer_id, None)
-        drop_notification = getattr(
-            self.transfer_backend, "drop_target_transfer_notification", None
-        )
-        if callable(drop_notification):
-            drop_notification(transfer_id)
+        self.transfer_backend.drop_target_transfer_notification(transfer_id)

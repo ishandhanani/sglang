@@ -23,7 +23,7 @@ class SharedHiCacheTransferBackend(ABC):
         target_num_pages: int,
         topology: SharedHiCacheTopology,
     ):
-        if not getattr(self, "name", None):
+        if not self.name:
             raise ValueError("SharedHiCache transfer backend must define a name")
         self.target_session_id = str(target_session_id)
         self.target_kv_ptrs = [int(ptr) for ptr in target_kv_ptrs]
