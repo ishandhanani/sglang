@@ -1,18 +1,11 @@
 from __future__ import annotations
 
-from enum import Enum
 from typing import Optional
 
 from sglang.srt.environ import envs
 
 
-class SharedHiCacheTransferBackendType(str, Enum):
-    NIXL = "nixl"
-
-
-SHARED_HICACHE_TRANSFER_BACKEND_CHOICES = [
-    backend.value for backend in SharedHiCacheTransferBackendType
-]
+SHARED_HICACHE_TRANSFER_BACKEND_CHOICES = ("nixl",)
 
 
 def shared_hicache_transfer_backend_name(server_args) -> str:
@@ -81,5 +74,5 @@ def normalize_shared_hicache_server_config(
         True,
         worker_id,
         bootstrap_port,
-        SharedHiCacheTransferBackendType(transfer_backend_name).value,
+        transfer_backend_name,
     )
