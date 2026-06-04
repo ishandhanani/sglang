@@ -92,7 +92,6 @@ class SharedHiCacheManager:
         self._target_transfer_capacity = threading.BoundedSemaphore(fetch_worker_limit)
         source_worker_limit = fetch_worker_limit
         self._pending_fetches: dict[str, SharedHiCachePendingFetch] = {}
-        self.source_transfer_queue: Optional[SharedHiCacheSourceTransferQueue] = None
         self.target_cache = SharedHiCacheTarget(
             tree_cache=tree_cache,
             metrics_collector=metrics_collector,
@@ -289,7 +288,7 @@ class SharedHiCacheManager:
             return
         self._shutdown = True
 
-        source_service = getattr(self, "source_service", None)
+        source_service = self.source_service
         self.source_service = None
         if source_service is not None:
             source_service.shutdown()
@@ -298,7 +297,7 @@ class SharedHiCacheManager:
             self._release_pending_fetch(pending)
         self._pending_fetches.clear()
 
-        timeout_secs = float(getattr(self, "timeout_secs", 0.0))
+        timeout_secs = float(self.timeout_secs)
         deadline = time.monotonic() + min(max(timeout_secs, 0.0), 5.0)
         while self.has_pending() and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -307,15 +306,11 @@ class SharedHiCacheManager:
             logger.warning(
                 "Deferring direct transfer backend shutdown while SharedHiCache work is still pending"
             )
-            source_transfer_queue = getattr(self, "source_transfer_queue", None)
-            if source_transfer_queue is not None:
-                source_transfer_queue.shutdown(wait=False, cancel_futures=True)
+            self.source_transfer_queue.shutdown(wait=False, cancel_futures=True)
             self._defer_direct_transfer_shutdown()
             return
 
-        source_transfer_queue = getattr(self, "source_transfer_queue", None)
-        if source_transfer_queue is not None:
-            source_transfer_queue.shutdown(wait=False, cancel_futures=True)
+        self.source_transfer_queue.shutdown(wait=False, cancel_futures=True)
         self.target_cache.release_quarantined_device_indices()
         self._shutdown_direct_transfer_backend()
 
@@ -341,7 +336,7 @@ class SharedHiCacheManager:
         return f"tcp://{plan.source_host}:{port}"
 
     def _send_control_message(self, endpoint: str, payload: Mapping[str, Any]) -> None:
-        source_service = getattr(self, "source_service", None)
+        source_service = self.source_service
         if source_service is None:
             raise RuntimeError("SharedHiCache ZMQ control service is not running")
         source_service.send(endpoint, payload)
@@ -349,17 +344,7 @@ class SharedHiCacheManager:
     def _handle_control_message(self, payload: Mapping[str, Any]) -> None:
         kind = str(payload.get("kind") or "")
         if kind == SHARED_HICACHE_TRANSFER_REQUEST:
-            source_transfer_queue = getattr(self, "source_transfer_queue", None)
-            if source_transfer_queue is None:
-                transfer_id = str(payload.get("transfer_id") or "")
-                response = {
-                    "ok": False,
-                    "reason": "source_transfer_queue_unavailable",
-                    "transfer_id": transfer_id,
-                    "transferred_blocks": 0,
-                }
-            else:
-                response = source_transfer_queue.handle(payload)
+            response = self.source_transfer_queue.handle(payload)
             if not response.get("accepted"):
                 target_endpoint = str(payload.get("target_control_endpoint") or "")
                 if target_endpoint:
@@ -449,18 +434,13 @@ class SharedHiCacheManager:
         return int(page_count) * bytes_per_page if bytes_per_page > 0 else 0
 
     def has_pending(self) -> bool:
-        source_transfer_queue = getattr(self, "source_transfer_queue", None)
-        source_transfer_count = (
-            source_transfer_queue.active_count()
-            if source_transfer_queue is not None
-            else 0
-        )
-        source_service = getattr(self, "source_service", None)
+        source_transfer_count = self.source_transfer_queue.active_count()
+        source_service = self.source_service
         active_source_count = (
             source_service.active_count() if source_service is not None else 0
         )
         return (
-            bool(getattr(self, "_pending_fetches", {}))
+            bool(self._pending_fetches)
             or source_transfer_count > 0
             or active_source_count > 0
         )
