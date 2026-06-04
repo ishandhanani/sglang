@@ -598,14 +598,7 @@ class SharedHiCacheManager:
             pop_source_completion=self.target_transfer_tracker.pop_completion,
         )
         target_descriptor = direct_transfer.target_descriptor()
-        target_page_indices_payload = [
-            int(index)
-            for index in (
-                target_page_indices.detach().cpu().tolist()
-                if hasattr(target_page_indices, "detach")
-                else list(target_page_indices)
-            )
-        ]
+        target_page_indices_payload = [int(index) for index in target_page_indices]
         self.target_transfer_tracker.start(transfer_id)
         try:
             self._send_control_message(

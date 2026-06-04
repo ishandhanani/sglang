@@ -66,12 +66,6 @@ def _lookup_hicache_host_blocks(
     return index, list(protected_nodes or []), None
 
 
-def _host_block_entry(
-    block_index: Mapping[int, tuple[TreeNode, int, str]], block_hash: int
-) -> Optional[tuple[TreeNode, int, str]]:
-    return block_index.get(block_hash)
-
-
 def _host_page_start_indices(
     entries: list[tuple[int, TreeNode, int]], page_size: int
 ) -> list[int]:
@@ -144,7 +138,7 @@ def resolve_host_page_locations(
     for router_hash, engine_hash in zip(
         requested_router_hashes, requested_engine_hashes
     ):
-        entry = _host_block_entry(block_index, engine_hash)
+        entry = block_index.get(engine_hash)
         if entry is None:
             reason = "partial" if entries else "missing_first_block"
             break
