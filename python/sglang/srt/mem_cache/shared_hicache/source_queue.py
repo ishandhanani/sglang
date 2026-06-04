@@ -175,7 +175,6 @@ class SharedHiCacheSourceTransferQueue:
         )
         if error is not None:
             response = dict(error)
-            response.setdefault("ok", False)
             response["transfer_id"] = transfer_id
             response["transferred_blocks"] = 0
             return response
