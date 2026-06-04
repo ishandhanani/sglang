@@ -131,6 +131,7 @@ class SharedHiCacheTransferHandle:
         self._reason = str(reason)
         self.done_at = time.perf_counter()
 
+
 class SharedHiCacheTargetTransferTracker:
     """Tracks source completion messages for target-side direct transfers."""
 
