@@ -2,7 +2,10 @@
 
 Authors: @ishandhanani, @hzh0425
 
-Note: For this RFC, we will define “router” as an orchestrator on top of multiple engine units. 
+## Introduction 
+
+> [!NOTE]  
+> Note: For this RFC, we will define “router” as an orchestrator on top of multiple engine units. 
 
 Agent workloads make the value of a KV block predictable from above the engine, but that value is invisible to request-local LRU. We propose exposing a narrow, router-initiated hint surface so an external router can pass cache intent to SGLang without making invasive changes to the engine scheduler and cache manager. In this way, SGLang keeps ownership of scheduling and memory and is free to clip, defer, or reject any hint. 
 
@@ -48,10 +51,10 @@ The missing abstraction is a precise, observable surface where the orchestrator 
 
 ## Design Principles
 
-1. **Orchestrator owns policy; engine executes.** The agent-graph / workflow intelligence lives outside. The engine understands priority, TTL, session membership, tier - nothing about why.
-2. **Zero overhead when unused.**  No allocations, heap ops, or timestamp checks for KV that carries no hint. Un-hinted workloads behave exactly like today.
+1. **Orchestrator owns policy; engine executes.** The agent-graph / workflow intelligence lives outside. The engine understands priority, TTL, session membership, tier - nothing about why. Keeps things simple
+2. **Zero overhead when unused.**  Un-hinted workloads behave exactly like today.
 3. **Hints are soft, bounded, and safe to reject.** The engine may accept, clip, defer, or ignore. Every hint is observable. Nothing a client says can pin memory unboundedly or deadlock the scheduler.
-4. **Router-initiated by default.** Workloads can still emit intent, but the router is where workload context merges with global KV placement, worker load, health, and admission. In production environments, the router has: a global KV index from events, built-in HA/fault-tolerance, existing overlap/load routing + admission control, and (with the harness<->orchestrator work) trajectory awareness, not just request awareness. The dynamo router is an example that fits all of these criteria. 
+4. **Router-initiated by default.** Workloads can still emit intent, but the router is where workload context merges with global KV placement, worker load, health, and admission. In production environments, the router has: a global KV index from events, built-in HA/fault-tolerance, existing overlap/load routing + admission control, and (with the harness<->orchestrator work) trajectory awareness, not just request awareness.
 
 ---
 
@@ -140,11 +143,11 @@ Bias eviction order rather than hard-pin: some token ranges are worth more than 
 <summary>External RFCs / APIs, research, and our prior work</summary>
 
 External RFCs / APIs:
-- vLLM #37003 - Context-Aware KV-Cache Retention API (Prioritized Evictions): https://github.com/vllm-project/vllm/issues/37003 (impl PR #38514; fork moreh-dev/vllm#10 aligns to TRT-LLM)
-- vLLM #37168 - Active Coordination and Two-Zone Scheduling for Long-Running Agents: https://github.com/vllm-project/vllm/issues/37168 (impl vllm-ascend#6722)
-- vLLM agentic-api #18 - Session-aware KV cache management: https://github.com/vllm-project/agentic-api/issues/18
-- vLLM #39305 - Selective KV Cache offload: https://github.com/vllm-project/vllm/issues/39305 (impl PR #39983)
-- vLLM #38260 - Multi-tier KV offloading via the offloading connector: https://github.com/vllm-project/vllm/issues/38260
+- vLLM #37003 - Context-Aware KV-Cache Retention API (Prioritized Evictions): (impl PR #38514)
+- vLLM #37168 - Active Coordination and Two-Zone Scheduling for Long-Running Agents: (impl vllm-ascend#6722)
+- vLLM agentic-api # 18 - Session-aware KV cache management
+- vLLM #39305 - Selective KV Cache offload: (impl PR #39983)
+- vLLM #38260 - Multi-tier KV offloading via the offloading connector
 - TensorRT-LLM `KvCacheRetentionConfig` / `TokenRangeRetentionConfig` (token_start/token_end/priority 0-100/duration_ms; default 35; decode_retention_priority; secondaryOffloadMinPriority)
 
 Research:
@@ -158,6 +161,6 @@ Our prior work (sglang):
 - #24656 (agent-aware KV phase 1 / API feedback), #21846 (distributed KV roadmap), #27058 (radix-native sessions), #27024 / #27025 (streaming-session deadlock + bound), #22273 / #21875 (streaming-session leak fixes), #18941 (TTL prefix pinning), #21045 (priority retention duration).
 
 Our prior work (dynamo):
-- #7665 / #7377 / #7384 (session_control + ephemeral KV routing), pi-dynamo-provider#4 (per-subagent sessions), #6213 / #6571 (Anthropic-style cache_control), #8789 / #9140 (agent_context / ATIF), #9448 (thunderagent_router program scheduler).
+- [#7665](https://github.com/ai-dynamo/dynamo/pull/7665) / [#7377](https://github.com/ai-dynamo/dynamo/pull/7377) / [#7384](https://github.com/ai-dynamo/dynamo/pull/7384) (session_control + ephemeral KV routing), pi-dynamo-provider#4 (per-subagent sessions), [#6213](https://github.com/ai-dynamo/dynamo/pull/6213) / [#6571](https://github.com/ai-dynamo/dynamo/pull/6571) (Anthropic-style cache_control), [#8789](https://github.com/ai-dynamo/dynamo/pull/8789) / [#9140](https://github.com/ai-dynamo/dynamo/pull/9140) (agent_context / ATIF), [#9448](https://github.com/ai-dynamo/dynamo/pull/9448) (thunderagent_router program scheduler).
 
 </details>
