@@ -229,12 +229,7 @@ class SharedHiCacheManager:
     ) -> None:
         if self.metrics_collector is None:
             return
-        observe_staging = getattr(
-            self.metrics_collector, "observe_shared_hicache_staging", None
-        )
-        if not callable(observe_staging):
-            return
-        observe_staging(
+        self.metrics_collector.observe_shared_hicache_staging(
             backend=backend,
             outcome=outcome,
             reason=reason,
