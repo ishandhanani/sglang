@@ -440,6 +440,11 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             state.agent.add_remote_agent(base64.b64decode(encoded_metadata))
             state.remote_agents.add(target_agent_name)
         if target_agent_name not in state.target_prep_handles:
+            target_gpu_id_raw = target_metadata.get("gpu_id")
+            if isinstance(target_gpu_id_raw, bool) or not isinstance(
+                target_gpu_id_raw, (int, np.integer)
+            ):
+                raise RuntimeError("NIXL target metadata missing gpu_id")
             state.target_prep_handles[target_agent_name] = _NixlPreppedTarget(
                 handle=self._prep_dlist(
                     state.agent,
@@ -448,7 +453,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
                     item_lens=target_kv_item_lens,
                     num_pages=target_num_pages,
                     location="VRAM",
-                    device_id=int(target_metadata.get("gpu_id", 0)),
+                    device_id=int(target_gpu_id_raw),
                 ),
                 num_pages=target_num_pages,
             )
