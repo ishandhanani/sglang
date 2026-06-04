@@ -20,7 +20,7 @@ class SharedHiCacheSourceService:
         self,
         *,
         endpoint: str,
-        worker_id: Optional[str],
+        worker_id: str,
         handle_control_message: Callable[[Mapping[str, Any]], None],
     ):
         self.endpoint = endpoint

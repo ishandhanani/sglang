@@ -92,13 +92,11 @@ def resolve_host_page_locations(
     *,
     start_block: int,
     max_blocks: int,
-    worker_id: Optional[str],
+    worker_id: str,
     topology: SharedHiCacheTopology,
     target_tp_rank: Optional[int] = None,
     target_tp_size: Optional[int] = None,
 ) -> tuple[list[ResolvedHostPageLocation], str, list[TreeNode]]:
-    if worker_id is None:
-        return [], "missing_source_worker_id", []
     if plan.source_worker_id != worker_id:
         return [], "wrong_source_worker", []
     rank_rejection = topology.validate_source_rank(
@@ -432,7 +430,7 @@ def execute_source_transfer_request(
     request: SourceTransferRequest,
     transfer_backend: SharedHiCacheTransferBackend,
     tree_cache,
-    worker_id: Optional[str],
+    worker_id: str,
     topology: SharedHiCacheTopology,
 ) -> Mapping[str, Any]:
     total_start = time.perf_counter()
