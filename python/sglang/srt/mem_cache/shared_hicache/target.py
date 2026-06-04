@@ -281,14 +281,10 @@ class SharedHiCacheTarget:
             else:
                 insert_value = device_indices
 
-            insert_shared_blocks = getattr(
-                self.tree_cache, "insert_shared_hicache_device_blocks", None
+            result = self.tree_cache.insert_shared_hicache_device_blocks(
+                key=key,
+                value=insert_value,
             )
-            if not callable(insert_shared_blocks):
-                raise RuntimeError(
-                    "tree cache does not support insert_shared_hicache_device_blocks"
-                )
-            result = insert_shared_blocks(key=key, value=insert_value)
             matched_length = result.prefix_len
             matched_new_tokens = min(max(0, matched_length - token_start), token_count)
             if matched_new_tokens > 0:
