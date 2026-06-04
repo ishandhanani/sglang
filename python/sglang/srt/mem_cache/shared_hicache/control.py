@@ -63,16 +63,6 @@ class SharedHiCacheTransferHandle:
         if self._status in (KVPoll.Success, KVPoll.Failed):
             return self._status
 
-        elapsed_secs = time.perf_counter() - self.submitted_at
-        if self.timeout_secs >= 0 and elapsed_secs > self.timeout_secs:
-            logger.warning(
-                "Shared HiCache transfer timed out transfer_id=%s ms=%.3f; target pages will be quarantined",
-                self.transfer_id,
-                elapsed_secs * 1000,
-            )
-            self._finish(KVPoll.Failed, [], SHARED_HICACHE_DIRECT_TIMEOUT_REASON)
-            return self._status
-
         notification = self.transfer_backend.pop_target_transfer_notification(
             self.transfer_id
         )
@@ -107,6 +97,16 @@ class SharedHiCacheTransferHandle:
                 return self._status
             # Positive source completion is not a readiness signal. Match disagg:
             # target observes the transfer-completion notification locally.
+
+        elapsed_secs = time.perf_counter() - self.submitted_at
+        if self.timeout_secs >= 0 and elapsed_secs > self.timeout_secs:
+            logger.warning(
+                "Shared HiCache transfer timed out transfer_id=%s ms=%.3f; target pages will be quarantined",
+                self.transfer_id,
+                elapsed_secs * 1000,
+            )
+            self._finish(KVPoll.Failed, [], SHARED_HICACHE_DIRECT_TIMEOUT_REASON)
+            return self._status
         return self._status
 
     def result(self) -> tuple[list[ResolvedHostPage], str]:
