@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
 from sglang.srt.mem_cache.shared_hicache.source import (
@@ -17,12 +16,6 @@ from sglang.srt.mem_cache.shared_hicache.transfer.common import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class _SourceTransferJob:
-    transfer_id: str
-    request: SourceTransferRequest
 
 
 class SharedHiCacheSourceTransferQueue:
@@ -45,7 +38,7 @@ class SharedHiCacheSourceTransferQueue:
         self.topology = topology
 
         worker_limit = max(1, int(worker_limit))
-        self._jobs: queue.Queue[Optional[_SourceTransferJob]] = queue.Queue()
+        self._jobs: queue.Queue[Optional[SourceTransferRequest]] = queue.Queue()
         self._capacity = threading.BoundedSemaphore(max(8, worker_limit * 2))
         self._lock = threading.Lock()
         self._transfers: set[str] = set()
@@ -94,19 +87,19 @@ class SharedHiCacheSourceTransferQueue:
         ready.put(None)
 
         while True:
-            job = self._jobs.get()
-            if job is None:
+            request = self._jobs.get()
+            if request is None:
                 self._jobs.task_done()
                 return
-            self._run_job(job, source_worker)
+            self._run_job(request, source_worker)
             self._jobs.task_done()
 
-    def _run_job(self, job: _SourceTransferJob, source_worker) -> None:
+    def _run_job(self, request: SourceTransferRequest, source_worker) -> None:
         response: Mapping[str, Any]
         try:
             response = dict(
                 execute_source_transfer_request(
-                    request=job.request,
+                    request=request,
                     transfer_backend=source_worker,
                     tree_cache=self.tree_cache,
                     worker_id=self.worker_id,
@@ -116,7 +109,7 @@ class SharedHiCacheSourceTransferQueue:
         except Exception:
             logger.exception(
                 "SharedHiCache source transfer job failed transfer_id=%s",
-                job.transfer_id,
+                request.transfer_id,
             )
             response = {
                 "ok": False,
@@ -124,18 +117,18 @@ class SharedHiCacheSourceTransferQueue:
                 "transferred_blocks": 0,
                 "block_size_tokens": self.tree_cache.page_size,
             }
-        response["transfer_id"] = job.transfer_id
+        response["transfer_id"] = request.transfer_id
         try:
-            self.send_transfer_done(job.request.target_control_endpoint, response)
+            self.send_transfer_done(request.target_control_endpoint, response)
         except Exception:
             logger.exception(
                 "SharedHiCache source transfer completion send failed transfer_id=%s",
-                job.transfer_id,
+                request.transfer_id,
             )
         finally:
             self._capacity.release()
             with self._lock:
-                self._transfers.discard(job.transfer_id)
+                self._transfers.discard(request.transfer_id)
 
     def active_count(self) -> int:
         with self._lock:
@@ -217,12 +210,7 @@ class SharedHiCacheSourceTransferQueue:
                 }
             self._transfers.add(transfer_id)
 
-        self._jobs.put(
-            _SourceTransferJob(
-                transfer_id=transfer_id,
-                request=request,
-            )
-        )
+        self._jobs.put(request)
 
         return {
             "ok": True,
