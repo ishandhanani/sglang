@@ -51,7 +51,9 @@ def _make_plan(router_block_hashes, **overrides):
         "expires_at_ms": int(time.time() * 1000) + 60_000,
         "start_block_index": 0,
         "plan_version": SHARED_HICACHE_PLAN_VERSION,
+        "source_tp_rank": 0,
         "source_tp_size": 1,
+        "target_tp_rank": 0,
         "target_tp_size": 1,
     }
     plan.update(overrides)
@@ -68,7 +70,6 @@ def _make_source_transfer_payload(plan=None, **overrides):
         "start_block": 0,
         "max_blocks": 1,
         "target_session_id": "target-session",
-        "transfer_backend": "nixl",
         "target_metadata": {
             "backend": "nixl",
             "session_id": "target-session",
@@ -262,13 +263,11 @@ def _make_manager():
     manager = SharedHiCacheManager.__new__(SharedHiCacheManager)
     manager.worker_id = "target-worker"
     manager.tree_cache = FakeTree(page_size=2)
-    manager._set_topology(
-        SharedHiCacheTopology(
-            tp_rank=1,
-            tp_size=2,
-            attn_tp_rank=1,
-            attn_tp_size=2,
-        )
+    manager.topology = SharedHiCacheTopology(
+        tp_rank=1,
+        tp_size=2,
+        attn_tp_rank=1,
+        attn_tp_size=2,
     )
     return manager
 
@@ -291,7 +290,7 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertEqual(transfer_backend, "nixl")
 
         manager = SharedHiCacheManager.__new__(SharedHiCacheManager)
-        manager._set_topology(SharedHiCacheTopology(tp_rank=3, tp_size=4))
+        manager.topology = SharedHiCacheTopology(tp_rank=3, tp_size=4)
         self.assertEqual(
             manager._local_control_endpoint(
                 SimpleNamespace(
@@ -370,7 +369,9 @@ class TestSharedHiCache(unittest.TestCase):
             "created_at_ms",
             "start_block_index",
             "plan_version",
+            "source_tp_rank",
             "source_tp_size",
+            "target_tp_rank",
             "target_tp_size",
         ):
             missing = _make_plan([11])
@@ -658,15 +659,15 @@ class TestSharedHiCache(unittest.TestCase):
                 target_tp_size=2,
             )
         )
-        rank_generic = SharedHiCachePlan.from_dict(
-            _make_plan([11], source_tp_size=2, target_tp_size=2)
-        )
+        missing_rank = _make_plan([11], source_tp_size=2, target_tp_size=2)
+        missing_rank.pop("source_tp_rank")
 
         self.assertEqual(
             manager._validate_plan(wrong_rank),
             "wrong_target_tp_rank:plan=0:local=1",
         )
-        self.assertIsNone(manager._validate_plan(rank_generic))
+        with self.assertRaisesRegex(ValueError, "missing source_tp_rank"):
+            SharedHiCachePlan.from_dict(missing_rank)
 
     def test_scheduler_keeps_longer_local_prefix(self):
         manager = FakeScheduleManager(prefix_len=8)

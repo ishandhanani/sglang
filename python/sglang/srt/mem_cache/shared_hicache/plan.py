@@ -45,10 +45,10 @@ class SharedHiCachePlan:
     expires_at_ms: int
     start_block_index: int
     plan_version: int
+    source_tp_rank: int
     source_tp_size: int
+    target_tp_rank: int
     target_tp_size: int
-    source_tp_rank: Optional[int] = None
-    target_tp_rank: Optional[int] = None
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "SharedHiCachePlan":
@@ -86,8 +86,8 @@ class SharedHiCachePlan:
         try:
             planned_prefix_blocks = int(data["planned_prefix_blocks"])
             start_block_index = int(data["start_block_index"])
-            source_tp_rank = data.get("source_tp_rank")
-            target_tp_rank = data.get("target_tp_rank")
+            source_tp_rank = int(data["source_tp_rank"])
+            target_tp_rank = int(data["target_tp_rank"])
             if planned_prefix_blocks < 0:
                 raise ValueError("planned_prefix_blocks must be non-negative")
             if planned_prefix_blocks > len(router_block_hashes):
@@ -112,9 +112,9 @@ class SharedHiCachePlan:
                 expires_at_ms=int(data["expires_at_ms"]),
                 start_block_index=start_block_index,
                 plan_version=int(data["plan_version"]),
-                source_tp_rank=None if source_tp_rank is None else int(source_tp_rank),
+                source_tp_rank=source_tp_rank,
                 source_tp_size=int(data["source_tp_size"]),
-                target_tp_rank=None if target_tp_rank is None else int(target_tp_rank),
+                target_tp_rank=target_tp_rank,
                 target_tp_size=int(data["target_tp_size"]),
             )
         except KeyError as err:
