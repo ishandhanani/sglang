@@ -20,6 +20,7 @@ class SharedHiCacheTransferBackend(ABC):
         target_session_id: str,
         target_kv_ptrs,
         target_kv_item_lens,
+        target_num_pages: int,
         topology: SharedHiCacheTopology,
     ):
         if not getattr(self, "name", None):
@@ -27,12 +28,14 @@ class SharedHiCacheTransferBackend(ABC):
         self.target_session_id = str(target_session_id)
         self.target_kv_ptrs = [int(ptr) for ptr in target_kv_ptrs]
         self.target_kv_item_lens = [int(length) for length in target_kv_item_lens]
+        self.target_num_pages = int(target_num_pages)
         self.topology = topology
 
     def target_descriptor(self) -> dict[str, Any]:
         return {
             "backend": self.name,
             "session_id": self.target_session_id,
+            "target_num_pages": self.target_num_pages,
             **self.topology.to_dict(),
         }
 
@@ -50,6 +53,7 @@ class SharedHiCacheTransferBackend(ABC):
         target_page_indices: np.ndarray,
         target_kv_ptrs: list[int],
         target_kv_item_lens: list[int],
+        target_num_pages: int,
         target_metadata: Optional[Mapping[str, Any]] = None,
     ) -> None: ...
 

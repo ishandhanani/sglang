@@ -124,9 +124,14 @@ class FakeTransferBackend:
     target_session_id = "target-session"
     target_kv_ptrs = [1]
     target_kv_item_lens = [64]
+    target_num_pages = 8
 
     def target_descriptor(self):
-        return {"backend": self.name, "session_id": self.target_session_id}
+        return {
+            "backend": self.name,
+            "session_id": self.target_session_id,
+            "target_num_pages": self.target_num_pages,
+        }
 
 
 class FakeNixlAgent:
@@ -519,6 +524,7 @@ class TestSharedHiCache(unittest.TestCase):
                 "target_metadata": {
                     "backend": "nixl",
                     "session_id": "target-session",
+                    "target_num_pages": 8,
                     "tp_rank": 1,
                     "tp_size": 2,
                 },
@@ -541,6 +547,39 @@ class TestSharedHiCache(unittest.TestCase):
 
         self.assertFalse(response["ok"])
         self.assertIn("wrong_source_tp_rank_for_target", response["reason"])
+
+    def test_source_transfer_rejects_target_page_out_of_range(self):
+        plan = SharedHiCachePlan.from_dict(_make_plan([11]))
+        request, error = parse_source_transfer_request(
+            payload={
+                "transfer_id": "transfer-1",
+                "target_control_endpoint": "tcp://127.0.0.1:49999",
+                "plan": plan.to_dict(),
+                "start_block": 0,
+                "max_blocks": 1,
+                "target_session_id": "target-session",
+                "transfer_backend": "nixl",
+                "target_metadata": {
+                    "backend": "nixl",
+                    "session_id": "target-session",
+                    "target_num_pages": 8,
+                    "tp_rank": 0,
+                    "tp_size": 1,
+                },
+                "target_kv_ptrs": [1],
+                "target_kv_item_lens": [64],
+                "target_page_indices": [8],
+            },
+            transfer_backend=FakeTransferBackend(),
+            tree_cache=FakeTree(),
+        )
+
+        self.assertIsNone(request)
+        self.assertFalse(error["ok"])
+        self.assertEqual(
+            error["reason"],
+            "malformed_transfer_request:target_page_index_out_of_range",
+        )
 
     def test_shared_hicache_device_insert_does_not_write_through(self):
         cache = HiRadixCache.__new__(HiRadixCache)
