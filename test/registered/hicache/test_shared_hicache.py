@@ -58,6 +58,32 @@ def _make_plan(router_block_hashes, **overrides):
     return plan
 
 
+def _make_source_transfer_payload(plan=None, **overrides):
+    if plan is None:
+        plan = SharedHiCachePlan.from_dict(_make_plan([11]))
+    payload = {
+        "transfer_id": "transfer-1",
+        "target_control_endpoint": "tcp://127.0.0.1:49999",
+        "plan": plan.to_dict(),
+        "start_block": 0,
+        "max_blocks": 1,
+        "target_session_id": "target-session",
+        "transfer_backend": "nixl",
+        "target_metadata": {
+            "backend": "nixl",
+            "session_id": "target-session",
+            "target_num_pages": 8,
+            "tp_rank": 0,
+            "tp_size": 1,
+        },
+        "target_kv_ptrs": [1],
+        "target_kv_item_lens": [64],
+        "target_page_indices": [0],
+    }
+    payload.update(overrides)
+    return payload
+
+
 class FakeDeviceAllocator:
     def __init__(self):
         self.fail_alloc = False
@@ -539,25 +565,16 @@ class TestSharedHiCache(unittest.TestCase):
             )
         )
         request, error = parse_source_transfer_request(
-            payload={
-                "transfer_id": "transfer-1",
-                "target_control_endpoint": "tcp://127.0.0.1:49999",
-                "plan": plan.to_dict(),
-                "start_block": 0,
-                "max_blocks": 1,
-                "target_session_id": "target-session",
-                "transfer_backend": "nixl",
-                "target_metadata": {
+            payload=_make_source_transfer_payload(
+                plan,
+                target_metadata={
                     "backend": "nixl",
                     "session_id": "target-session",
                     "target_num_pages": 8,
                     "tp_rank": 1,
                     "tp_size": 2,
                 },
-                "target_kv_ptrs": [1],
-                "target_kv_item_lens": [64],
-                "target_page_indices": [0],
-            },
+            ),
             transfer_backend=FakeTransferBackend(),
             tree_cache=FakeTree(),
         )
@@ -577,25 +594,7 @@ class TestSharedHiCache(unittest.TestCase):
     def test_source_transfer_rejects_target_page_out_of_range(self):
         plan = SharedHiCachePlan.from_dict(_make_plan([11]))
         request, error = parse_source_transfer_request(
-            payload={
-                "transfer_id": "transfer-1",
-                "target_control_endpoint": "tcp://127.0.0.1:49999",
-                "plan": plan.to_dict(),
-                "start_block": 0,
-                "max_blocks": 1,
-                "target_session_id": "target-session",
-                "transfer_backend": "nixl",
-                "target_metadata": {
-                    "backend": "nixl",
-                    "session_id": "target-session",
-                    "target_num_pages": 8,
-                    "tp_rank": 0,
-                    "tp_size": 1,
-                },
-                "target_kv_ptrs": [1],
-                "target_kv_item_lens": [64],
-                "target_page_indices": [8],
-            },
+            payload=_make_source_transfer_payload(plan, target_page_indices=[8]),
             transfer_backend=FakeTransferBackend(),
             tree_cache=FakeTree(),
         )
@@ -607,19 +606,28 @@ class TestSharedHiCache(unittest.TestCase):
             "malformed_transfer_request:target_page_index_out_of_range",
         )
 
-    def test_source_transfer_requires_transfer_id(self):
-        request, error = parse_source_transfer_request(
-            payload={"transfer_backend": "nixl"},
-            transfer_backend=FakeTransferBackend(),
-            tree_cache=FakeTree(),
-        )
+    def test_source_transfer_requires_request_fields(self):
+        for field_name in (
+            "transfer_id",
+            "target_control_endpoint",
+            "start_block",
+            "max_blocks",
+        ):
+            payload = _make_source_transfer_payload()
+            payload.pop(field_name)
 
-        self.assertIsNone(request)
-        self.assertFalse(error["ok"])
-        self.assertEqual(
-            error["reason"],
-            "malformed_transfer_request:missing_transfer_id",
-        )
+            request, error = parse_source_transfer_request(
+                payload=payload,
+                transfer_backend=FakeTransferBackend(),
+                tree_cache=FakeTree(),
+            )
+
+            self.assertIsNone(request)
+            self.assertFalse(error["ok"])
+            self.assertEqual(
+                error["reason"],
+                f"malformed_transfer_request:missing_{field_name}",
+            )
 
     def test_shared_hicache_device_insert_does_not_write_through(self):
         cache = HiRadixCache.__new__(HiRadixCache)

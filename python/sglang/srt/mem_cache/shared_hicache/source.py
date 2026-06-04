@@ -316,16 +316,20 @@ def parse_source_transfer_request(
             ),
         }
 
-    # Manager-created transfer requests always include an ID so completions can
-    # be correlated; missing IDs are malformed rather than silently invented.
-    transfer_id = str(payload.get("transfer_id") or "")
+    try:
+        transfer_id = str(payload["transfer_id"])
+    except KeyError:
+        transfer_id = ""
     if not transfer_id:
         return None, {
             "ok": False,
             "reason": "malformed_transfer_request:missing_transfer_id",
             "block_size_tokens": tree_cache.page_size,
         }
-    target_control_endpoint = str(payload.get("target_control_endpoint") or "")
+    try:
+        target_control_endpoint = str(payload["target_control_endpoint"])
+    except KeyError:
+        target_control_endpoint = ""
     if not target_control_endpoint:
         return None, {
             "ok": False,
@@ -335,14 +339,25 @@ def parse_source_transfer_request(
         }
     try:
         plan = SharedHiCachePlan.from_dict(payload["plan"])
-        start_block = _coerce_int(payload.get("start_block", 0), "start_block")
-        max_blocks = _coerce_int(
-            payload.get("max_blocks", len(plan.router_block_hashes)), "max_blocks"
-        )
     except (KeyError, ValueError) as err:
         return None, {
             "ok": False,
             "reason": f"malformed_transfer_request:plan:{err}",
+        }
+    try:
+        start_block = _coerce_int(payload["start_block"], "start_block")
+        max_blocks = _coerce_int(payload["max_blocks"], "max_blocks")
+    except KeyError as err:
+        return None, {
+            "ok": False,
+            "reason": f"malformed_transfer_request:missing_{err.args[0]}",
+            "block_size_tokens": tree_cache.page_size,
+        }
+    except ValueError as err:
+        return None, {
+            "ok": False,
+            "reason": f"malformed_transfer_request:{err}",
+            "block_size_tokens": tree_cache.page_size,
         }
 
     (
