@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import time
-import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional
 
@@ -323,7 +322,15 @@ def parse_source_transfer_request(
             ),
         }
 
-    transfer_id = str(payload.get("transfer_id") or uuid.uuid4().hex)
+    # Manager-created transfer requests always include an ID so completions can
+    # be correlated; missing IDs are malformed rather than silently invented.
+    transfer_id = str(payload.get("transfer_id") or "")
+    if not transfer_id:
+        return None, {
+            "ok": False,
+            "reason": "malformed_transfer_request:missing_transfer_id",
+            "block_size_tokens": tree_cache.page_size,
+        }
     target_control_endpoint = str(payload.get("target_control_endpoint") or "")
     if not target_control_endpoint:
         return None, {

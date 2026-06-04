@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
@@ -170,7 +169,14 @@ class SharedHiCacheSourceTransferQueue:
                 worker.join()
 
     def handle(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
-        transfer_id = str(payload.get("transfer_id") or uuid.uuid4().hex)
+        transfer_id = str(payload.get("transfer_id") or "")
+        if not transfer_id:
+            return {
+                "ok": False,
+                "reason": "malformed_transfer_request:missing_transfer_id",
+                "transferred_blocks": 0,
+                "block_size_tokens": self.tree_cache.page_size,
+            }
         target_endpoint = str(payload.get("target_control_endpoint") or "")
         payload = dict(payload)
         payload["transfer_id"] = transfer_id

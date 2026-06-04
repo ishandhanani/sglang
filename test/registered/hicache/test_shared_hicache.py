@@ -581,6 +581,20 @@ class TestSharedHiCache(unittest.TestCase):
             "malformed_transfer_request:target_page_index_out_of_range",
         )
 
+    def test_source_transfer_requires_transfer_id(self):
+        request, error = parse_source_transfer_request(
+            payload={"transfer_backend": "nixl"},
+            transfer_backend=FakeTransferBackend(),
+            tree_cache=FakeTree(),
+        )
+
+        self.assertIsNone(request)
+        self.assertFalse(error["ok"])
+        self.assertEqual(
+            error["reason"],
+            "malformed_transfer_request:missing_transfer_id",
+        )
+
     def test_shared_hicache_device_insert_does_not_write_through(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         captured = []
