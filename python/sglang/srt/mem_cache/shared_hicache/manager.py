@@ -64,10 +64,6 @@ class SharedHiCacheDirectSubmitResult:
     available_tokens_before: Optional[int] = None
 
 
-def _shared_hicache_enabled(server_args: ServerArgs) -> bool:
-    return bool(server_args.enable_shared_hicache)
-
-
 class SharedHiCacheManager:
     def __init__(
         self,
@@ -152,7 +148,7 @@ class SharedHiCacheManager:
     @classmethod
     def from_scheduler(cls, scheduler) -> Optional["SharedHiCacheManager"]:
         server_args = scheduler.server_args
-        if not _shared_hicache_enabled(server_args):
+        if not server_args.enable_shared_hicache:
             return None
         if not scheduler.enable_hierarchical_cache:
             logger.warning(
@@ -200,9 +196,6 @@ class SharedHiCacheManager:
             direct_transfer=direct_transfer,
             metrics_collector=metrics_collector,
         )
-
-    def _current_backend_label(self) -> str:
-        return self.direct_transfer.name
 
     def _observe_reuse(
         self,
@@ -660,6 +653,7 @@ class SharedHiCacheManager:
         }
 
     def prepare_reuse(self, req: Req) -> SharedHiCacheResult:
+        backend = self.direct_transfer.name
         plan = getattr(req, "shared_hicache_plan", None)
         if plan is None:
             return SharedHiCacheResult()
@@ -670,7 +664,7 @@ class SharedHiCacheManager:
                 type(plan).__name__,
             )
             self._observe_reuse(
-                backend=self._current_backend_label(),
+                backend=backend,
                 outcome="skip",
                 reason="invalid_plan",
             )
@@ -685,7 +679,7 @@ class SharedHiCacheManager:
                 rejection,
             )
             self._observe_reuse(
-                backend=self._current_backend_label(),
+                backend=backend,
                 outcome="skip",
                 reason=rejection,
             )
@@ -708,7 +702,7 @@ class SharedHiCacheManager:
                 page_size,
             )
             self._observe_reuse(
-                backend=self._current_backend_label(),
+                backend=backend,
                 outcome="skip",
                 reason="unaligned_matched_tokens",
             )
@@ -723,7 +717,7 @@ class SharedHiCacheManager:
                 plan.start_block_index,
             )
             self._observe_reuse(
-                backend=self._current_backend_label(),
+                backend=backend,
                 outcome="skip",
                 reason="before_plan_start",
             )
@@ -744,7 +738,7 @@ class SharedHiCacheManager:
                 max_plan_blocks,
             )
             self._observe_reuse(
-                backend=self._current_backend_label(),
+                backend=backend,
                 outcome="skip",
                 reason="no_remaining_planned_blocks",
             )
@@ -787,12 +781,11 @@ class SharedHiCacheManager:
         if req.host_hit_length > 0:
             self._finished_plan_keys.add(plan_key)
             self._observe_reuse(
-                backend=self._current_backend_label(),
+                backend=backend,
                 outcome="skip",
                 reason="local_host_hit",
             )
             return SharedHiCacheResult()
-        backend = self._current_backend_label()
         self._observe_staging(
             backend=backend,
             outcome="planned",
@@ -844,7 +837,7 @@ class SharedHiCacheManager:
                 available_tokens_before,
             )
             self._observe_reuse(
-                backend=self._current_backend_label(),
+                backend=backend,
                 outcome="miss",
                 reason=direct_submit_reason,
             )
