@@ -36,16 +36,12 @@ class SharedHiCacheSchedulerMixin:
             return []
 
         capacity = int(self.get_num_allocatable_reqs(running_bs))
-        prefill_max_requests = getattr(
-            getattr(self, "server_args", None), "prefill_max_requests", None
-        )
+        prefill_max_requests = self.server_args.prefill_max_requests
         if prefill_max_requests is not None:
             capacity = min(capacity, max(0, int(prefill_max_requests)))
 
         if capacity <= 0:
-            if getattr(self, "chunked_req", None) is None and not getattr(
-                self, "enable_priority_preemption", False
-            ):
+            if self.chunked_req is None and not self.enable_priority_preemption:
                 return []
             capacity = 1
 
@@ -53,7 +49,7 @@ class SharedHiCacheSchedulerMixin:
         return waiting_queue[: min(len(waiting_queue), limit)]
 
     def _prepare_shared_hicache_for_schedule_batch(self, reqs: list[Req]) -> set[str]:
-        shared_hicache_manager = getattr(self, "shared_hicache_manager", None)
+        shared_hicache_manager = self.shared_hicache_manager
         if shared_hicache_manager is None or not reqs:
             return set()
 
@@ -72,9 +68,7 @@ class SharedHiCacheSchedulerMixin:
             try:
                 # Probe the current local prefix without taking COW allocations.
                 req.init_next_round_input(self.tree_cache, cow_mamba=False)
-                local_prefix_len = len(req.prefix_indices) + int(
-                    getattr(req, "host_hit_length", 0) or 0
-                )
+                local_prefix_len = len(req.prefix_indices) + int(req.host_hit_length)
                 probe_status = SharedHiCachePrepareStatus.Ready
             except Exception:
                 logger.exception(
@@ -161,7 +155,7 @@ class SharedHiCacheSchedulerMixin:
                 pending_rids.add(str(req.rid))
                 continue
             ready_reqs.append(req)
-            shared_prefix_len = int(getattr(result, "prefix_len", 0))
+            shared_prefix_len = int(result.prefix_len)
             local_prefix_lens.append(max(local_prefix_len, shared_prefix_len))
 
         common_prefix_lens = self._sync_shared_hicache_int_min_batch(local_prefix_lens)
@@ -199,18 +193,13 @@ class SharedHiCacheSchedulerMixin:
         return [int(value) for value in tensor.tolist()]
 
     def _shared_hicache_sync_group(self):
-        ps = getattr(self, "ps", None)
-        group_size = int(getattr(ps, "attn_tp_size", getattr(ps, "tp_size", 1)))
-        group = getattr(self, "attn_tp_cpu_group", None)
-        if group is None:
-            group = getattr(self, "tp_cpu_group", None)
-        return group_size, group
+        return int(self.ps.attn_tp_size), self.attn_tp_cpu_group
 
     def _init_next_round_input_with_shared_hicache_tp_sync(self, req: Req) -> None:
         req.init_next_round_input(self.tree_cache)
         req.shared_hicache_max_prefix_len = None
 
     def release_shared_hicache_request(self, rid: str) -> None:
-        shared_hicache_manager = getattr(self, "shared_hicache_manager", None)
+        shared_hicache_manager = self.shared_hicache_manager
         if shared_hicache_manager is not None:
             shared_hicache_manager.release_request(rid)
