@@ -65,7 +65,7 @@ class SharedHiCacheDirectSubmitResult:
 
 
 def _shared_hicache_enabled(server_args: ServerArgs) -> bool:
-    return bool(getattr(server_args, "enable_shared_hicache", False))
+    return bool(server_args.enable_shared_hicache)
 
 
 class SharedHiCacheManager:
@@ -83,9 +83,7 @@ class SharedHiCacheManager:
         self.worker_id = worker_id
         self._set_topology(topology)
         self.timeout_secs = shared_hicache_timeout_secs()
-        self.prefetch_stop_policy = getattr(
-            server_args, "hicache_storage_prefetch_policy", "timeout"
-        )
+        self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
         self.direct_transfer = direct_transfer
         self.metrics_collector = metrics_collector
         self.endpoint = self._local_control_endpoint(server_args)
@@ -112,21 +110,20 @@ class SharedHiCacheManager:
         self._direct_transfer_shutdown_deferred = False
         self._direct_transfer_shutdown_lock = threading.Lock()
 
-        if self.endpoint is not None:
-            self.source_transfer_queue = SharedHiCacheSourceTransferQueue(
-                tree_cache=tree_cache,
-                worker_id=worker_id,
-                transfer_backend=direct_transfer,
-                worker_limit=source_worker_limit,
-                send_transfer_done=self._send_transfer_done,
-                topology=self.topology,
-            )
-            self.source_service = SharedHiCacheSourceService(
-                endpoint=self.endpoint,
-                worker_id=self.worker_id,
-                handle_control_message=self._handle_control_message,
-            )
-            self.source_service.start()
+        self.source_transfer_queue = SharedHiCacheSourceTransferQueue(
+            tree_cache=tree_cache,
+            worker_id=worker_id,
+            transfer_backend=direct_transfer,
+            worker_limit=source_worker_limit,
+            send_transfer_done=self._send_transfer_done,
+            topology=self.topology,
+        )
+        self.source_service = SharedHiCacheSourceService(
+            endpoint=self.endpoint,
+            worker_id=self.worker_id,
+            handle_control_message=self._handle_control_message,
+        )
+        self.source_service.start()
         atexit.register(self.shutdown)
 
     def _set_topology(
@@ -140,16 +137,14 @@ class SharedHiCacheManager:
     def _local_control_endpoint(
         self,
         server_args: ServerArgs,
-    ) -> Optional[str]:
-        bootstrap_port = getattr(server_args, "shared_hicache_bootstrap_port", None)
-        if bootstrap_port is None:
-            return None
+    ) -> str:
+        bootstrap_port = server_args.shared_hicache_bootstrap_port
         port = int(bootstrap_port) + int(self.tp_rank)
         if port > 65535:
             raise ValueError(
                 "shared_hicache_bootstrap_port + tp_rank exceeds 65535"
             )
-        host = str(getattr(server_args, "host", "")).strip()
+        host = str(server_args.host).strip()
         if not host:
             raise ValueError("host must be non-empty when SharedHiCache is enabled")
         return f"tcp://{host}:{port}"
@@ -180,7 +175,7 @@ class SharedHiCacheManager:
                 ", ".join(missing_tree_methods),
             )
             return None
-        worker_id = getattr(server_args, "shared_hicache_worker_id", None)
+        worker_id = server_args.shared_hicache_worker_id
         if worker_id is None:
             logger.warning(
                 "SharedHiCache disabled because worker_id is not set; "
