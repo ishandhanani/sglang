@@ -136,12 +136,33 @@ def _create_nixl_agent(*, transfer_parallelism: int):
     return agent, agent_name, backend
 
 
-def _source_host_buf_infos(tree_cache) -> tuple[list[int], list[int]]:
+def _num_pages_from_buf_infos(
+    data_lens: list[int], item_lens: list[int], *, label: str
+) -> int:
+    if not data_lens or len(data_lens) != len(item_lens):
+        raise RuntimeError(f"{label} KV buffer metadata is malformed")
+    pages = []
+    for data_len, item_len in zip(data_lens, item_lens):
+        if item_len <= 0 or data_len <= 0 or data_len % item_len != 0:
+            raise RuntimeError(
+                f"{label} KV buffer length is not page-aligned: "
+                f"data_len={data_len} item_len={item_len}"
+            )
+        pages.append(int(data_len // item_len))
+    first = pages[0]
+    if any(page != first for page in pages):
+        raise RuntimeError(f"{label} KV buffers have mismatched page counts")
+    return first
+
+
+def _source_host_buf_infos(tree_cache) -> tuple[list[int], list[int], list[int], int]:
     refs = _source_host_tensors(tree_cache)
     page_size = tree_cache.page_size
     ptrs = [int(ref.data_ptr()) for ref in refs]
+    data_lens = [int(ref.nbytes) for ref in refs]
     item_lens = [int(ref[0].nbytes) * page_size for ref in refs]
-    return ptrs, item_lens
+    num_pages = _num_pages_from_buf_infos(data_lens, item_lens, label="source host")
+    return ptrs, data_lens, item_lens, num_pages
 
 
 def _source_host_tensors(tree_cache) -> list[torch.Tensor]:
@@ -183,58 +204,10 @@ def _validate_kv_item_lens_match(
         )
 
 
-def _build_grouped_transfer_arrays(
-    *,
-    source_page_indices: np.ndarray,
-    target_page_indices: np.ndarray,
-    source_kv_ptrs: list[int],
-    target_kv_ptrs: list[int],
-    source_kv_item_lens: list[int],
-    target_kv_item_lens: list[int],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    if len(source_kv_ptrs) != len(target_kv_ptrs):
-        raise RuntimeError(
-            "KV pointer count mismatch: "
-            f"source={len(source_kv_ptrs)} target={len(target_kv_ptrs)}"
-        )
-    _validate_kv_item_lens_match(source_kv_item_lens, target_kv_item_lens)
-
-    src_item_lens = np.asarray(source_kv_item_lens, dtype=np.uint64)
-    dst_item_lens = np.asarray(target_kv_item_lens, dtype=np.uint64)
-    src_blocks, dst_blocks = group_concurrent_contiguous(
-        source_page_indices.astype(np.int32, copy=False),
-        target_page_indices.astype(np.int32, copy=False),
-    )
-    if not src_blocks:
-        empty = np.empty((0,), dtype=np.uint64)
-        return empty, empty, empty, 0
-
-    # Keep address arithmetic in uint64, matching existing disagg transfer code.
-    # Some platforms can expose addresses beyond signed int64.
-    src_ptrs = np.asarray(source_kv_ptrs, dtype=np.uint64)
-    dst_ptrs = np.asarray(target_kv_ptrs, dtype=np.uint64)
-    src_starts = np.fromiter((block[0] for block in src_blocks), dtype=np.uint64)
-    dst_starts = np.fromiter((block[0] for block in dst_blocks), dtype=np.uint64)
-    block_lens = np.fromiter((len(block) for block in src_blocks), dtype=np.uint64)
-
-    src_addrs = (
-        src_ptrs[:, None] + src_starts[None, :] * src_item_lens[:, None]
-    ).reshape(-1)
-    dst_addrs = (
-        dst_ptrs[:, None] + dst_starts[None, :] * dst_item_lens[:, None]
-    ).reshape(-1)
-    lengths = (src_item_lens[:, None] * block_lens[None, :]).reshape(-1)
-    return src_addrs, dst_addrs, lengths, len(src_blocks)
-
-
-def _nixl_req_array(addrs: np.ndarray, lengths: np.ndarray, gpu_id: int) -> np.ndarray:
-    return np.column_stack(
-        (
-            addrs.astype(np.uint64, copy=False),
-            lengths.astype(np.uint64, copy=False),
-            np.full(addrs.shape, int(gpu_id), dtype=np.uint64),
-        )
-    )
+@dataclass
+class _NixlPreppedTarget:
+    handle: Any
+    num_pages: int
 
 
 @dataclass
@@ -242,7 +215,11 @@ class _NixlSourceWorkerState:
     agent: Any
     agent_name: str
     backend_name: str
+    source_prep_handle: Any
+    source_num_pages: int
+    source_kv_item_lens: list[int]
     remote_agents: set[str] = field(default_factory=set)
+    target_prep_handles: dict[str, _NixlPreppedTarget] = field(default_factory=dict)
 
 
 class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
@@ -259,6 +236,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         tree_cache,
         target_kv_ptrs,
         target_kv_item_lens,
+        target_num_pages: int,
         gpu_id: int,
         topology: SharedHiCacheTopology,
         transfer_parallelism: int,
@@ -267,6 +245,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             target_session_id=agent_name,
             target_kv_ptrs=target_kv_ptrs,
             target_kv_item_lens=target_kv_item_lens,
+            target_num_pages=target_num_pages,
             topology=topology,
         )
         self.agent = agent
@@ -295,6 +274,11 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         target_kv_ptrs, target_kv_lens, target_kv_item_lens = (
             target_pool.get_contiguous_buf_infos()
         )
+        target_num_pages = _num_pages_from_buf_infos(
+            [int(length) for length in target_kv_lens],
+            [int(length) for length in target_kv_item_lens],
+            label="target device",
+        )
         gpu_id = _scheduler_gpu_id(scheduler)
         target_descs = agent.register_memory(
             [
@@ -312,6 +296,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             tree_cache=scheduler.tree_cache,
             target_kv_ptrs=target_kv_ptrs,
             target_kv_item_lens=target_kv_item_lens,
+            target_num_pages=target_num_pages,
             gpu_id=gpu_id,
             topology=topology,
             transfer_parallelism=transfer_parallelism,
@@ -352,9 +337,37 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         if not hasattr(host_pool, "kv_buffer"):
             raise RuntimeError(
                 "SharedHiCache NIXL direct transfer requires a host kv_buffer"
-        )
-        _, source_kv_item_lens = _source_host_buf_infos(self.tree_cache)
+            )
+        _, _, source_kv_item_lens, _ = _source_host_buf_infos(self.tree_cache)
         _validate_kv_item_lens_match(source_kv_item_lens, self.target_kv_item_lens)
+
+    def _prep_dlist(
+        self,
+        agent,
+        *,
+        peer_name: str,
+        ptrs: list[int],
+        item_lens: list[int],
+        num_pages: int,
+        location: str,
+        device_id: int,
+    ):
+        arrays = []
+        for ptr, item_len in zip(ptrs, item_lens):
+            addrs = np.arange(num_pages, dtype=np.int64) * int(item_len) + int(ptr)
+            arrays.append(
+                np.column_stack(
+                    [
+                        addrs,
+                        np.full(num_pages, int(item_len), dtype=np.int64),
+                        np.full(num_pages, int(device_id), dtype=np.int64),
+                    ]
+                )
+            )
+        handle = agent.prep_xfer_dlist(peer_name, np.vstack(arrays), location)
+        if handle is None:
+            raise RuntimeError("NIXL direct KV transfer descriptor preparation failed")
+        return handle
 
     def _create_source_worker_state(self) -> _NixlSourceWorkerState:
         host_pool = self.tree_cache.cache_controller.mem_pool_host
@@ -374,18 +387,34 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         )
         if not source_descs:
             raise RuntimeError("SharedHiCache NIXL source host registration failed")
+        source_kv_ptrs, _, source_kv_item_lens, source_num_pages = (
+            _source_host_buf_infos(self.tree_cache)
+        )
+        source_prep_handle = self._prep_dlist(
+            agent,
+            peer_name="",
+            ptrs=source_kv_ptrs,
+            item_lens=source_kv_item_lens,
+            num_pages=source_num_pages,
+            location="DRAM",
+            device_id=0,
+        )
         logger.info(
             "SharedHiCache NIXL source transfer worker enabled agent=%s backend=%s "
-            "thread=%d parallelism=%d",
+            "thread=%d parallelism=%d source_pages=%d",
             agent_name,
             backend_name,
             threading.get_ident(),
             self._transfer_parallelism,
+            source_num_pages,
         )
         return _NixlSourceWorkerState(
             agent=agent,
             agent_name=agent_name,
             backend_name=backend_name,
+            source_prep_handle=source_prep_handle,
+            source_num_pages=source_num_pages,
+            source_kv_item_lens=source_kv_item_lens,
         )
 
     def create_source_worker(self):
@@ -397,7 +426,11 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         self,
         state: _NixlSourceWorkerState,
         target_metadata: Optional[Mapping[str, Any]],
-    ) -> tuple[str, int]:
+        *,
+        target_kv_ptrs: list[int],
+        target_kv_item_lens: list[int],
+        target_num_pages: int,
+    ) -> str:
         if not isinstance(target_metadata, Mapping):
             raise RuntimeError("NIXL target metadata must be an object")
         target_agent_name = str(target_metadata.get("agent_name") or "")
@@ -409,7 +442,20 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         if target_agent_name not in state.remote_agents:
             state.agent.add_remote_agent(base64.b64decode(encoded_metadata))
             state.remote_agents.add(target_agent_name)
-        return target_agent_name, int(target_metadata.get("gpu_id", 0))
+        if target_agent_name not in state.target_prep_handles:
+            state.target_prep_handles[target_agent_name] = _NixlPreppedTarget(
+                handle=self._prep_dlist(
+                    state.agent,
+                    peer_name=target_agent_name,
+                    ptrs=target_kv_ptrs,
+                    item_lens=target_kv_item_lens,
+                    num_pages=target_num_pages,
+                    location="VRAM",
+                    device_id=int(target_metadata.get("gpu_id", 0)),
+                ),
+                num_pages=target_num_pages,
+            )
+        return target_agent_name
 
     def _wait_for_transfer(self, agent, handle) -> None:
         release = getattr(agent, "release_xfer_handle", None)
@@ -483,6 +529,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         target_page_indices: np.ndarray,
         target_kv_ptrs: list[int],
         target_kv_item_lens: list[int],
+        target_num_pages: int,
         target_metadata: Optional[Mapping[str, Any]] = None,
     ) -> None:
         if self._shutdown:
@@ -496,6 +543,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             target_page_indices=target_page_indices,
             target_kv_ptrs=target_kv_ptrs,
             target_kv_item_lens=target_kv_item_lens,
+            target_num_pages=target_num_pages,
             target_metadata=target_metadata,
         )
 
@@ -510,47 +558,64 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         target_page_indices: np.ndarray,
         target_kv_ptrs: list[int],
         target_kv_item_lens: list[int],
+        target_num_pages: int,
         target_metadata: Optional[Mapping[str, Any]] = None,
     ) -> None:
         if self._shutdown:
             raise RuntimeError("NIXL direct KV transfer backend is not enabled")
         setup_start = time.perf_counter()
-        target_agent_name, target_gpu_id = self._add_remote_target(
-            source_state, target_metadata
-        )
-        source_kv_ptrs, source_kv_item_lens = _source_host_buf_infos(self.tree_cache)
-        src_addrs, dst_addrs, lengths, num_blocks = _build_grouped_transfer_arrays(
-            source_page_indices=source_page_indices,
-            target_page_indices=target_page_indices,
-            source_kv_ptrs=source_kv_ptrs,
+        target_agent_name = self._add_remote_target(
+            source_state,
+            target_metadata,
             target_kv_ptrs=target_kv_ptrs,
-            source_kv_item_lens=source_kv_item_lens,
             target_kv_item_lens=target_kv_item_lens,
+            target_num_pages=target_num_pages,
         )
-        if src_addrs.size == 0:
+        if source_page_indices.size == 0:
             return
-
-        src_descs = source_state.agent.get_xfer_descs(
-            _nixl_req_array(src_addrs, lengths, 0), "DRAM"
+        if int(source_page_indices.max()) >= source_state.source_num_pages:
+            raise RuntimeError("NIXL source page index out of prepared range")
+        if int(target_page_indices.max()) >= target_num_pages:
+            raise RuntimeError("NIXL target page index out of prepared range")
+        _validate_kv_item_lens_match(
+            source_state.source_kv_item_lens, target_kv_item_lens
         )
-        dst_descs = source_state.agent.get_xfer_descs(
-            _nixl_req_array(dst_addrs, lengths, target_gpu_id), "VRAM"
+        if len(source_state.source_kv_item_lens) != len(target_kv_ptrs):
+            raise RuntimeError(
+                "KV pointer count mismatch: "
+                f"source={len(source_state.source_kv_item_lens)} "
+                f"target={len(target_kv_ptrs)}"
+            )
+        src_blocks, _ = group_concurrent_contiguous(
+            source_page_indices.astype(np.int32, copy=False),
+            target_page_indices.astype(np.int32, copy=False),
         )
-        if src_descs is None or dst_descs is None:
-            raise RuntimeError("NIXL direct KV transfer descriptor creation failed")
-        xfer_args = [
-            "WRITE",
-            src_descs,
-            dst_descs,
-            target_agent_name,
-        ]
+        target_prep = source_state.target_prep_handles[target_agent_name]
+        if target_prep.num_pages != target_num_pages:
+            raise RuntimeError("NIXL target page count changed after preparation")
+        num_layers = len(source_state.source_kv_item_lens)
+        layer_offsets = np.arange(num_layers, dtype=np.int32)
+        source_indices = (
+            layer_offsets[:, None] * source_state.source_num_pages
+            + source_page_indices.astype(np.int32, copy=False)[None, :]
+        ).ravel()
+        target_indices = (
+            layer_offsets[:, None] * target_num_pages
+            + target_page_indices.astype(np.int32, copy=False)[None, :]
+        ).ravel()
         completion_notification = _build_completion_notification(
             transfer_id=transfer_id,
             transferred_blocks=transferred_blocks,
             reason=completion_reason,
         )
-        xfer_args.append(completion_notification.encode("utf-8"))
-        handle = source_state.agent.initialize_xfer(*xfer_args)
+        handle = source_state.agent.make_prepped_xfer(
+            "WRITE",
+            source_state.source_prep_handle,
+            source_indices,
+            target_prep.handle,
+            target_indices,
+            completion_notification.encode("utf-8"),
+        )
         if not handle:
             raise RuntimeError("NIXL direct KV transfer initialization failed")
         setup_ms = (time.perf_counter() - setup_start) * 1000
@@ -559,10 +624,10 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         transfer_ms = (time.perf_counter() - start) * 1000
         logger.info(
             "SharedHiCache NIXL transferred blocks=%d slices=%d bytes=%d "
-            "ms=%.3f setup_ms=%.3f source_agent=%s",
-            num_blocks,
-            len(src_addrs),
-            int(lengths.sum()),
+            "ms=%.3f setup_ms=%.3f source_agent=%s prepped=true",
+            len(src_blocks),
+            int(source_indices.size),
+            int(len(source_page_indices) * sum(source_state.source_kv_item_lens)),
             transfer_ms,
             setup_ms,
             source_state.agent_name,
@@ -596,6 +661,7 @@ class _NixlSourceTransferWorker:
         target_page_indices: np.ndarray,
         target_kv_ptrs: list[int],
         target_kv_item_lens: list[int],
+        target_num_pages: int,
         target_metadata: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self._owner._transfer_pages_from_state(
@@ -607,5 +673,6 @@ class _NixlSourceTransferWorker:
             target_page_indices=target_page_indices,
             target_kv_ptrs=target_kv_ptrs,
             target_kv_item_lens=target_kv_item_lens,
+            target_num_pages=target_num_pages,
             target_metadata=target_metadata,
         )
