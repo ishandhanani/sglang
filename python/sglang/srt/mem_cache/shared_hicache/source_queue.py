@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _SourceTransferJob:
     transfer_id: str
-    target_endpoint: str
     request: SourceTransferRequest
 
 
@@ -125,12 +124,9 @@ class SharedHiCacheSourceTransferQueue:
                 "transferred_blocks": 0,
                 "block_size_tokens": self.tree_cache.page_size,
             }
-        response = dict(response)
         response["transfer_id"] = job.transfer_id
         try:
-            self.send_transfer_done(
-                job.target_endpoint or job.request.target_control_endpoint, response
-            )
+            self.send_transfer_done(job.request.target_control_endpoint, response)
         except Exception:
             logger.exception(
                 "SharedHiCache source transfer completion send failed transfer_id=%s",
@@ -177,7 +173,6 @@ class SharedHiCacheSourceTransferQueue:
                 "transferred_blocks": 0,
                 "block_size_tokens": self.tree_cache.page_size,
             }
-        target_endpoint = str(payload.get("target_control_endpoint") or "")
         payload = dict(payload)
         payload["transfer_id"] = transfer_id
         request, error = parse_source_transfer_request(
@@ -225,7 +220,6 @@ class SharedHiCacheSourceTransferQueue:
         self._jobs.put(
             _SourceTransferJob(
                 transfer_id=transfer_id,
-                target_endpoint=target_endpoint,
                 request=request,
             )
         )
