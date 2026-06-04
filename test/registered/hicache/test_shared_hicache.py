@@ -369,9 +369,7 @@ class TestSharedHiCache(unittest.TestCase):
             "created_at_ms",
             "start_block_index",
             "plan_version",
-            "source_tp_rank",
             "source_tp_size",
-            "target_tp_rank",
             "target_tp_size",
         ):
             missing = _make_plan([11])
@@ -659,15 +657,16 @@ class TestSharedHiCache(unittest.TestCase):
                 target_tp_size=2,
             )
         )
-        missing_rank = _make_plan([11], source_tp_size=2, target_tp_size=2)
-        missing_rank.pop("source_tp_rank")
+        rank_generic_payload = _make_plan([11], source_tp_size=2, target_tp_size=2)
+        rank_generic_payload.pop("source_tp_rank")
+        rank_generic_payload.pop("target_tp_rank")
+        rank_generic = SharedHiCachePlan.from_dict(rank_generic_payload)
 
         self.assertEqual(
             manager._validate_plan(wrong_rank),
             "wrong_target_tp_rank:plan=0:local=1",
         )
-        with self.assertRaisesRegex(ValueError, "missing source_tp_rank"):
-            SharedHiCachePlan.from_dict(missing_rank)
+        self.assertIsNone(manager._validate_plan(rank_generic))
 
     def test_scheduler_keeps_longer_local_prefix(self):
         manager = FakeScheduleManager(prefix_len=8)

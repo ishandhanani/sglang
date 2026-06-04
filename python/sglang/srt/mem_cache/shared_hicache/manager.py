@@ -259,7 +259,11 @@ class SharedHiCacheManager:
         self,
         plan: SharedHiCachePlan,
     ) -> Optional[str]:
-        source_tp_rank = int(plan.source_tp_rank)
+        source_tp_rank = (
+            int(plan.source_tp_rank)
+            if plan.source_tp_rank is not None
+            else int(self.topology.tp_rank)
+        )
         port = int(plan.source_bootstrap_port) + source_tp_rank
         if port > 65535:
             logger.warning(
