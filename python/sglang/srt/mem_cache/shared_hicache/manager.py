@@ -415,7 +415,7 @@ class SharedHiCacheManager:
     def _pending_should_stop_waiting(
         self, pending: SharedHiCachePendingFetch
     ) -> tuple[bool, str]:
-        policy = str(getattr(self, "prefetch_stop_policy", "timeout"))
+        policy = str(self.prefetch_stop_policy)
         if policy == "best_effort":
             return True, "best_effort_incomplete"
         if policy == "wait_complete":
