@@ -52,7 +52,7 @@ class SharedHiCacheManager:
     ):
         self.tree_cache = tree_cache
         self.worker_id = worker_id
-        self.topology = topology
+        self._set_topology(topology)
         self.timeout_secs = shared_hicache_timeout_secs()
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
         self.direct_transfer = direct_transfer
@@ -109,12 +109,20 @@ class SharedHiCacheManager:
         self.source_service.start()
         atexit.register(self.shutdown)
 
+    def _set_topology(
+        self,
+        topology: SharedHiCacheTopology,
+    ) -> None:
+        self.topology = topology
+        for key, value in self.topology.to_dict().items():
+            setattr(self, key, value)
+
     def _local_control_endpoint(
         self,
         server_args: ServerArgs,
     ) -> str:
         bootstrap_port = server_args.shared_hicache_bootstrap_port
-        port = int(bootstrap_port) + int(self.topology.tp_rank)
+        port = int(bootstrap_port) + int(self.tp_rank)
         if port > 65535:
             raise ValueError(
                 "shared_hicache_bootstrap_port + tp_rank exceeds 65535"
@@ -125,75 +133,56 @@ class SharedHiCacheManager:
         return f"tcp://{host}:{port}"
 
     @classmethod
-    def _startup_rejection_reason(cls, scheduler) -> Optional[str]:
-        if not getattr(scheduler, "enable_hierarchical_cache", False):
-            return "hierarchical cache is not enabled"
-        required_tree_methods = (
-            "lookup_hicache_host_blocks",
-            "insert_shared_hicache_device_blocks",
-        )
-        tree_cache = getattr(scheduler, "tree_cache", None)
-        missing_tree_methods = [
-            name
-            for name in required_tree_methods
-            if not callable(getattr(tree_cache, name, None))
-        ]
-        if missing_tree_methods:
-            return (
-                "the active tree cache lacks HiCache shared-cache primitives: "
-                f"{', '.join(missing_tree_methods)}"
-            )
-        worker_id = scheduler.server_args.shared_hicache_worker_id
-        if worker_id is None:
-            return "worker_id is not set; set --shared-hicache-worker-id"
-        return None
-
-    @classmethod
     def from_scheduler(cls, scheduler) -> Optional["SharedHiCacheManager"]:
         server_args = scheduler.server_args
         if not server_args.enable_shared_hicache:
             return None
-
-        rejection_reason = cls._startup_rejection_reason(scheduler)
-        if rejection_reason is not None:
-            logger.warning("SharedHiCache disabled: %s", rejection_reason)
-            return None
-
-        direct_transfer = None
-        try:
-            worker_id = server_args.shared_hicache_worker_id
-            topology = SharedHiCacheTopology.from_scheduler(scheduler)
-            direct_transfer = make_shared_hicache_transfer_backend(
-                scheduler, topology=topology
-            )
-            metrics_reporter = getattr(scheduler, "metrics_reporter", None)
-            metrics_collector = (
-                scheduler.metrics_collector
-                if getattr(metrics_reporter, "enable_metrics", False)
-                else None
-            )
-            return cls(
-                server_args=server_args,
-                tree_cache=scheduler.tree_cache,
-                worker_id=worker_id,
-                topology=topology,
-                direct_transfer=direct_transfer,
-                metrics_collector=metrics_collector,
-            )
-        except Exception:
+        if not scheduler.enable_hierarchical_cache:
             logger.warning(
-                "SharedHiCache initialization failed; falling back to local prefill",
-                exc_info=True,
+                "SharedHiCache disabled because hierarchical cache is not enabled"
             )
-            if direct_transfer is not None:
-                try:
-                    direct_transfer.shutdown()
-                except Exception:
-                    logger.debug(
-                        "SharedHiCache direct transfer cleanup failed after startup error",
-                        exc_info=True,
-                    )
             return None
+        required_tree_methods = (
+            "lookup_hicache_host_blocks",
+            "insert_shared_hicache_device_blocks",
+        )
+        missing_tree_methods = [
+            name
+            for name in required_tree_methods
+            if not callable(getattr(scheduler.tree_cache, name, None))
+        ]
+        if missing_tree_methods:
+            logger.warning(
+                "SharedHiCache disabled because the active tree cache lacks HiCache "
+                "shared-cache primitives: %s",
+                ", ".join(missing_tree_methods),
+            )
+            return None
+        worker_id = server_args.shared_hicache_worker_id
+        if worker_id is None:
+            logger.warning(
+                "SharedHiCache disabled because worker_id is not set; "
+                "set --shared-hicache-worker-id"
+            )
+            return None
+        topology = SharedHiCacheTopology.from_scheduler(scheduler)
+        direct_transfer = make_shared_hicache_transfer_backend(
+            scheduler, topology=topology
+        )
+        metrics_reporter = getattr(scheduler, "metrics_reporter", None)
+        metrics_collector = (
+            scheduler.metrics_collector
+            if getattr(metrics_reporter, "enable_metrics", False)
+            else None
+        )
+        return cls(
+            server_args=server_args,
+            tree_cache=scheduler.tree_cache,
+            worker_id=worker_id,
+            topology=topology,
+            direct_transfer=direct_transfer,
+            metrics_collector=metrics_collector,
+        )
 
     def _shutdown_direct_transfer_backend(self) -> None:
         with self._direct_transfer_shutdown_lock:
@@ -262,7 +251,7 @@ class SharedHiCacheManager:
         source_tp_rank = (
             int(plan.source_tp_rank)
             if plan.source_tp_rank is not None
-            else int(self.topology.tp_rank)
+            else int(self.tp_rank)
         )
         port = int(plan.source_bootstrap_port) + source_tp_rank
         if port > 65535:

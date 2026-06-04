@@ -169,11 +169,14 @@ def _source_host_tensors(tree_cache) -> list[torch.Tensor]:
             f"got {getattr(host_pool, 'layout', None)!r}"
         )
 
-    if not hasattr(host_pool, "data_refs"):
+    if hasattr(host_pool, "k_data_refs") and hasattr(host_pool, "v_data_refs"):
+        refs = host_pool.k_data_refs + host_pool.v_data_refs
+    elif hasattr(host_pool, "data_refs"):
+        refs = host_pool.data_refs
+    else:
         raise RuntimeError(
             "Unsupported HiCache host pool for SharedHiCache direct transfer"
         )
-    refs = host_pool.data_refs
     return list(refs)
 
 
