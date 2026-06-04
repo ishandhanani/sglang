@@ -137,6 +137,15 @@ Bias eviction order rather than hard-pin: some token ranges are worth more than 
 
 ---
 
+## Relationship to existing SGLang work
+
+This RFC is complementary to two in-flight SGLang efforts; it attacks the same agentic-KV problem from a different angle (a router above many engines) rather than from inside a single engine.
+
+- **[#24656](https://github.com/sgl-project/sglang/issues/24656) - Agent-Aware KV Cache (Phase 1)** is the *in-engine, client-driven* angle: an optional `agent_hints` field on the OpenAI request flows into one engine, annotates radix nodes, and feeds an experimental `agent_aware` eviction policy. This RFC is the *router-initiated, multi-engine* angle on the same intent, and the two compose: #24656's `agent_hints` is the natural request-scoped envelope, and its `cache_ttl_ms` / `reuse_hint` are exactly our Pin / Retain hints. This RFC then adds the out-of-band control path and the cross-worker KV *movement* (Share / Prefetch / Demote) that #24656 explicitly defers (HiCache/storage metadata inheritance, cross-process coordination).
+- **[#21846](https://github.com/sgl-project/sglang/issues/21846) - Distributed KVCache System for Agentic Workload** is the *mechanism / substrate*: HiCache tiering, PD incremental transfer, a storage prefetch interface, and hybrid-model support. This RFC is the *policy layer* that rides those rails - Share uses the worker-to-worker HiCache movement, Prefetch maps onto the roadmap's storage-prefetch interface, and Demote onto multi-tier offload. #21846 builds the plumbing; the router decides when to use it. Its own "Agent/Rollout KVCache Management" item already points back to #24656, so all three are one arc.
+
+---
+
 ## References
 
 <details>

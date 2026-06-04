@@ -1,9 +1,11 @@
 # RFC: Shared HiCache
 
+> [!NOTE]
+> Shared HiCache is router-agnostic: any router that can index and track G1 (GPU) and G2 (host) KV cache placement across workers can drive it. We implemented and validated this design with the Dynamo KV router, which has exactly that knowledge of G1 and G2 through its indexer and KV events. The rest of this document refers to that component simply as the "router".
+
 ## Summary
 
-Shared HiCache lets one SGLang worker reuse another worker's HiCache host-tier
-KV blocks when an external router provides an explicit plan.
+Shared HiCache lets one SGLang worker reuse another worker's HiCache host-tier KV blocks when an external router provides an explicit plan.
 
 The first supported path is:
 
@@ -14,19 +16,13 @@ source worker CPU_PINNED HiCache pages
   -> target radix-cache insert
 ```
 
-This is the concrete implementation linked from the higher-level
-[Programmatic KV Cache RFC](PROGRAMMATIC_KV_CACHE_RFC.md).
+This is the concrete implementation linked from the higher-level [Programmatic KV Cache RFC](PROGRAMMATIC_KV_CACHE_RFC_V2.md).
 
 ## Motivation
 
-Dynamo can observe KV-cache placement globally through SGLang KV events. It can
-know that worker A has a prefix in HostPinned memory while worker B is the
-better target for load, placement, or admission.
+The router observes KV-cache placement globally through SGLang KV events. It can know that worker A has a prefix in HostPinned memory while worker B is the better target for load, placement, or admission.
 
-Without Shared HiCache, routing to worker B means worker B recomputes the
-prefix. With Shared HiCache, Dynamo routes to worker B and sends a peer reuse
-plan. SGLang then pulls the reusable host KV from worker A into worker B's GPU
-KV cache before prefill.
+Without Shared HiCache, routing to worker B means worker B recomputes the prefix. With Shared HiCache, the router routes to worker B and sends a peer reuse plan. SGLang then pulls the reusable host KV from worker A into worker B's GPU KV cache before prefill.
 
 ## Non-Goals
 
@@ -41,135 +37,181 @@ Shared HiCache is not:
 
 The current PR is a default-off, NIXL-backed, peer-worker reuse path.
 
+## Design
+
+Shared HiCache sits between a cache-aware router and SGLang's HiCache. The router keeps a global view of where every prefix lives across workers — both G1 (GPU) and G2 (host / CPU-pinned) tiers — built from the KV events SGLang already emits. When it routes a request to a worker that is missing a prefix some other worker holds in G2, it attaches a peer-reuse plan.
+
+SGLang treats that plan as advice, not a command. The target worker allocates GPU staging pages, pulls the host KV directly from the source worker over NIXL, inserts the transferred blocks into its local radix cache, and then prefills only the uncovered suffix. Two properties shape the whole design: it **reuses SGLang's proven disaggregation transport** instead of inventing a new one, and it is **intentionally lightweight** — a self-contained module plus a few non-invasive scheduler hooks, with zero cost on the un-hinted path.
+
+### Why these choices
+
+**Orchestration layer, not a `HiCacheStorage` backend.** `HiCacheStorage` (`batch_exists` / `batch_get` / `batch_set`, content-addressed, landing in host memory) models L3 stores like Mooncake. Shared HiCache does not fit that shape: the source is another worker's *live* HiCache host tier, the lookup is by router-provided block hashes against protected radix nodes, and bytes land directly in target *GPU* slots. Implementing it as a storage subclass would fake that API and blur storage lifecycle with peer-write lifecycle, so it stays an orchestration layer over HiCache host-tier primitives.
+
+**Router plans, SGLang stays authoritative.** The router owns global placement and emits the plan; SGLang owns allocation, eviction protection, validation, and insertion. The plan is advisory — any inconsistency falls back to local prefill, so a wrong or stale plan can never corrupt cache state.
+
+**Target drives, source protects.** The target owns the transfer: it allocates the destination GPU pages and requests the data; the source then writes into those pages over NIXL. The source's one hard obligation is protect-vs-evict atomicity — once it accepts, it must not let host eviction reclaim the backing pages mid-read. Safety stays local to each side instead of needing a distributed lock.
+
+**Endpoint derivation over a registry.** Plans carry `source_host` plus `source_bootstrap_port`; the target computes each source rank's endpoint as `base_port + tp_rank`. This reuses the disaggregation addressing model and keeps a Shared HiCache route registry out of the data path.
+
+**Fail-open, quarantine the ambiguous case.** Every ordinary failure degrades to local prefill (see Failure Semantics). The one exception is an indeterminate direct transfer: if the source may still be writing target GPU pages after a timeout, those pages are quarantined instead of freed, since returning them to the allocator could expose them to a late peer write.
+
+### Built on disaggregation
+
+Cross-worker KV movement is the hard, safety-critical part — and SGLang already solved it for prefill/decode (PD) disaggregation. Shared HiCache deliberately rides those battle-tested primitives instead of building a parallel transport:
+
+- **Bootstrap addressing** — `source_host` + `source_bootstrap_port` + rank offset, the same scheme disagg uses to reach a specific worker rank.
+- **ZMQ PUSH/PULL control plane** — the transfer-metadata path mirrors disagg's.
+- **`KVPoll` transfer handles** — the same `Transferring` / `Success` / `Failed` poll state machine the decode side waits on (including "a positive source completion is not yet a readiness signal").
+- **NIXL transfer engine** — the prep / make-descriptor registration and transfer flow is adapted from the disagg NIXL path.
+- **`StorageMedium` KV-event types** — reused as-is (`CPU_PINNED`), not a new feature-specific tier taxonomy.
+- **TP-rank MIN status reduction** — all ranks converge on one prefix length, with a less-advanced rank dominating, exactly like disagg's ordered status polling.
+
+Because the movement path is already proven under production disaggregation load, the genuinely new code is mostly orchestration on top of it.
+
+### Lightweight by construction
+
+The change is almost entirely additive — it removes only a couple dozen lines from existing files. The vast majority of the logic is one self-contained package, `shared_hicache/`. The only core-engine touch points are a scheduler mixin with a handful of thin call sites, a single request field, additive HiCache host-index primitives, the CLI flags, and metrics. Disabled (the default), none of it sits on the request path. The exact surface is listed under [Implementation](#implementation).
+
 ## Request Hint
 
-Dynamo sends Shared HiCache through the generic `cache_hints` envelope:
+The router attaches the plan to the request under the generic `cache_hints` envelope. SGLang normalizes it into a `SharedHiCachePlan`. The essential fields:
 
 ```json
 {
   "cache_hints": {
     "shared_hicache": {
-      "plan_version": 1,
       "plan_id": "router-generated-id",
       "request_id": "request-id",
-      "target_worker_id": "target-worker-uuid",
       "source_worker_id": "source-worker-uuid",
+      "target_worker_id": "target-worker-uuid",
       "source_host": "10.0.0.11",
       "source_bootstrap_port": 41000,
-      "source_medium": "CPU_PINNED",
-      "block_hashes": [123, 456, 789],
-      "kv_block_hashes": [123, 456, 789],
-      "planned_prefix_blocks": 3,
-      "start_block_index": 0,
-      "block_size_tokens": 64,
-      "created_at_ms": 1760000000000,
-      "expires_at_ms": 1760000001000,
       "source_tp_rank": 0,
-      "source_tp_size": 4,
-      "target_tp_rank": 0,
-      "target_tp_size": 4
+      "source_medium": "CPU_PINNED",
+      "router_block_hashes": [123, 456, 789],
+      "engine_block_hashes": [123, 456, 789],
+      "planned_prefix_blocks": 3,
+      "block_size_tokens": 64,
+      "expires_at_ms": 1760000001000
     }
   }
 }
 ```
 
-SGLang normalizes this into `SharedHiCachePlan`. The plan intentionally does
-not carry concrete source endpoints. Targets derive the source TP-rank control
-endpoint from:
+Plan version, TP sizes/ranks, and `start_block_index` are carried as well; see `shared_hicache/plan.py` for the full schema. Two fields deserve explanation.
+
+**Two block-hash arrays.** `router_block_hashes` are the router's block identities — they preserve plan order and label the pages handed back to the target. `engine_block_hashes` are the source worker's HostPinned lookup keys, taken straight from SGLang KV events; the source host index is keyed by them. They are parallel arrays today because the router and SGLang do not yet share one canonical block-hash contract (same representation, hash algorithm, and parent-chaining). When they do, the source-lookup field collapses into `router_block_hashes`.
+
+**No concrete source endpoint.** The plan advertises `source_host` and `source_bootstrap_port`, not a wire address. The target derives the source TP-rank control endpoint itself:
 
 ```text
 tcp://<source_host>:<source_bootstrap_port + source_tp_rank>
 ```
 
-This mirrors disaggregation: runtime metadata advertises a worker host plus a
-bootstrap port, and each engine rank owns its rank-offset port.
-
-Strict validation:
-
-- `cache_hints` must be a dict;
-- batched requests must provide one hint object per request;
-- `parallel_sample_num > 1` is rejected;
-- integer fields must be actual integers;
-- worker id fields must be non-empty strings;
-- stale `source_endpoint` payloads are rejected; use
-  `source_host/source_bootstrap_port`;
-- `source_medium` must be `CPU_PINNED`;
-- target worker id must match local worker id;
-- source and target workers must differ;
-- plan version, expiry, block size, TP rank, and TP size must match.
+SGLang validates the plan strictly and falls back to local prefill on any mismatch: `cache_hints` must be a dict with one hint object per batched request, `parallel_sample_num > 1` is rejected, integer fields must be real integers, worker ids must be non-empty strings, the target id must match the local worker, source and target must differ, `source_medium` must be `CPU_PINNED`, and plan version / expiry / block size / TP rank / TP size must all be consistent. Stale `source_endpoint` payloads are rejected in favor of `source_host`/`source_bootstrap_port`.
 
 ## Request Flow
 
-```text
-1. Worker A processes a request.
-2. Worker A writes reusable prefix KV into HiCache CPU_PINNED pages.
-3. Worker A publishes CPU_PINNED KV events.
-4. Dynamo updates its global KV index.
-5. A later request arrives.
-6. Dynamo chooses worker B as target and attaches cache_hints.shared_hicache.
-7. Worker B validates the plan and probes local prefix coverage.
-8. Worker B derives Worker A's source TP endpoint from `source_host`,
-   `source_bootstrap_port`, and `source_tp_rank`.
-9. Worker B allocates page-aligned target GPU KV staging pages.
-10. Worker B sends a ZMQ transfer request to Worker A.
-11. Worker A resolves block hashes to live HiCache host pages.
-12. Worker A protects source host pages against eviction.
-13. Worker A uses NIXL to write source host pages into target GPU pages.
-14. Worker B receives completion notification.
-15. Worker B verifies contiguous expected block hashes.
-16. Worker B inserts staged GPU pages into the local radix cache.
-17. Worker B schedules the request with a longer cached prefix.
-18. Worker A releases source host protection.
+```mermaid
+sequenceDiagram
+    participant R as Router
+    participant A as Source worker (G2 / HiCache)
+    participant B as Target worker (G1 / GPU)
+
+    Note over A,R: An earlier request populates the prefix
+    A->>A: write reusable prefix KV into CPU_PINNED host pages
+    A->>R: publish CPU_PINNED KV events
+    R->>R: update global G1/G2 KV index
+
+    Note over R,B: A later request reuses it
+    R->>B: route request + peer-reuse plan (cache_hints.shared_hicache)
+    B->>B: validate plan, probe local prefix, derive source endpoint
+    B->>B: allocate page-aligned target GPU staging pages
+    B->>A: ZMQ transfer request
+    A->>A: resolve engine_block_hashes to host pages, protect vs eviction
+    A-->>B: NIXL write: source host pages -> target GPU pages
+    A->>A: release host protection
+    B->>B: verify router_block_hashes suffix, insert into radix cache
+    B->>B: schedule request with the longer cached prefix
+    B-->>R: tokens
 ```
 
-## Source-Side Contract
+## Contracts
 
-The source worker must be authoritative for source bytes.
+Three components share responsibility for a transfer, and safety is kept local to each: the router plans, the target owns allocation / verification / insertion, and the source owns its bytes.
 
-Required behavior:
+```mermaid
+flowchart LR
+    R[Router]
+    subgraph T["Target worker — G1 / GPU"]
+        direction TB
+        SCHED["Scheduler + mixin"]
+        MGR["SharedHiCacheManager"]
+        TS["target_side:<br/>allocate / insert / quarantine"]
+        RDX[("Local radix cache")]
+        SCHED --> MGR --> TS --> RDX
+    end
+    subgraph S["Source worker — G2 / host"]
+        direction TB
+        SVC["ZMQ control service"]
+        SQ["Source transfer queue"]
+        HIDX[("HiCache host index")]
+        SVC --> SQ --> HIDX
+    end
+    R -->|peer-reuse plan| SCHED
+    MGR -->|ZMQ request| SVC
+    SQ -->|"NIXL write: host pages -> target GPU pages"| TS
+```
 
-- resolve `block_hashes` against live HiCache host pages;
+### Source-side contract
+
+The source worker is authoritative for the source bytes. It must:
+
+- resolve `engine_block_hashes` against live HiCache host pages;
 - protect accepted host nodes before transfer;
-- reject stale or missing pages;
-- reject if source medium is not `CPU_PINNED`;
-- reject if plan topology or worker id is incompatible;
-- release protection on success, failure, timeout, or cancellation;
-- keep host eviction from reclaiming protected pages.
+- reject stale or missing pages, a non-`CPU_PINNED` medium, or an incompatible topology / worker id;
+- release protection on success, failure, timeout, or cancellation.
 
-The core invariant is protect-vs-evict atomicity. Source can reject, but it
-cannot accept and then allow eviction to invalidate the backing pages while the
-target is reading.
+The core invariant is **protect-vs-evict atomicity**: the source may reject, but it must never accept and then let host eviction invalidate the backing pages while the target is reading them.
 
-## Target-Side Contract
+### Target-side contract
 
-The target worker owns allocation, safety, and cache insertion.
+The target owns allocation, safety, and cache insertion. Its lifecycle — and the three ways a transfer can end — looks like this:
 
-Required behavior:
+```mermaid
+flowchart TD
+    A[Plan attached] --> B{"Valid, unexpired,<br/>topology matches?"}
+    B -- no --> L[Local prefill]
+    B -- yes --> C{"Local cache already<br/>covers the prefix?"}
+    C -- yes --> L
+    C -- no --> D[Allocate page-aligned<br/>GPU staging pages]
+    D --> E{Staging available?}
+    E -- no --> L
+    E -- yes --> F[ZMQ request +<br/>wait on KVPoll handle]
+    F --> G{Transfer outcome}
+    G -- verified hashes --> H[Insert into radix cache] --> K[Schedule with<br/>longer prefix]
+    G -- "ordinary miss /<br/>validation fail" --> I[Free pages] --> L
+    G -- "indeterminate<br/>failure or timeout" --> J[Quarantine pages]
+```
 
-- allocate page-aligned target GPU KV blocks;
-- evict local GPU KV first when needed for staging capacity;
-- fall back to partial page-aligned staging when possible;
-- clip requested hashes and expected pages to granted staging capacity;
-- quarantine target pages on indeterminate direct-transfer failures;
-- free target pages on ordinary misses or validation failures;
-- verify returned pages match the expected contiguous hash suffix;
-- insert staged device pages into the local radix cache;
-- report `shared_hicache` cached tokens.
+Precise requirements:
 
-## Scheduler Contract
+- allocate page-aligned GPU KV blocks, evicting local GPU KV first when needed, and fall back to partial page-aligned staging when full capacity is not free;
+- clip requested hashes and expected pages to the granted staging capacity;
+- verify returned pages match the expected contiguous `router_block_hashes` suffix before inserting;
+- on an ordinary miss or validation failure, free the pages; on an indeterminate direct-transfer failure, **quarantine** them instead of returning them to the allocator;
+- insert verified device pages into the local radix cache and report `shared_hicache` cached tokens.
 
-The scheduler must keep Shared HiCache from breaking TP-rank convergence.
+### Scheduler contract
 
-Current behavior:
+The scheduler keeps Shared HiCache from breaking TP-rank convergence. It:
 
-- probe local prefix before starting remote transfer;
-- use TP-wide MIN reduction for status and prefix length;
-- skip the request while transfer is pending;
-- clamp each rank to the common prefix length;
-- fall back to local prefill when any rank rejects the hint.
+- probes the local prefix before starting a remote transfer;
+- uses TP-wide MIN reduction for status and prefix length (a less-advanced rank dominates), then clamps every rank to the common prefix length;
+- skips the request while a transfer is pending;
+- falls back to local prefill when any rank rejects the hint.
 
-This matches the disagg-style polling pattern: lower status means less advanced
-and dominates.
+This is the same ordered-polling pattern disagg uses, so all ranks stay in lockstep.
 
 ## Failure Semantics
 
@@ -184,68 +226,36 @@ Shared HiCache is fail-open for normal misses:
 - target staging allocation unavailable -> local behavior;
 - local cache already covers the requested prefix -> local behavior.
 
-Indeterminate direct-transfer failures are handled differently. If target GPU
-pages may still be written after a timeout or backend error, the target
-quarantines those pages instead of returning them directly to the allocator.
+Indeterminate direct-transfer failures are handled differently. If target GPU pages may still be written after a timeout or backend error, the target quarantines those pages instead of returning them directly to the allocator.
 
 ## Configuration
 
 SGLang flags:
 
 ```bash
---enable-hierarchical-cache
+--enable-hierarchical-cache                      # prerequisite
 --enable-shared-hicache
---shared-hicache-transfer-backend nixl
---shared-hicache-worker-id <worker-id>           # standalone/manual launch
---shared-hicache-bootstrap-port <base-port>      # standalone/manual launch
+--shared-hicache-transfer-backend nixl           # required when enabled
+--shared-hicache-bootstrap-port <base-port>      # required when enabled
+--shared-hicache-worker-id <worker-id>           # required for standalone; the router sets it
 ```
 
 Rules:
 
 - Shared HiCache requires `--enable-hierarchical-cache`.
-- Worker id is an arbitrary non-empty string. Dynamo sets it from the Dynamo
-  endpoint connection id; standalone launches must pass
-  `--shared-hicache-worker-id`.
-- Every rank binds
-  `tcp://<server_args.host>:<shared_hicache_bootstrap_port + tp_rank>`.
-- For cross-process or cross-host reuse, launch SGLang/Dynamo with a bind host
-  reachable by the advertised `source_host`, normally `--host 0.0.0.0`.
-- Plans carry `source_host` and `source_bootstrap_port`; there is no Shared
-  HiCache route registry and no request-carried `source_endpoint`.
-- Dynamo publishes Shared HiCache runtime metadata under
-  `sglang_shared_hicache` as JSON containing `source_host` and
-  `source_bootstrap_port`.
-- If `--shared-hicache-bootstrap-port` is omitted under Dynamo, Dynamo derives
-  the base port as `DYN_SYSTEM_PORT + 20000`; if `DYN_SYSTEM_PORT` is absent, it
-  falls back to the disaggregation bootstrap port reserved for that worker.
-- Same-host multi-worker tests must space `DYN_SYSTEM_PORT` by at least TP width
-  so the rank-offset port ranges do not overlap.
+- A transfer backend is required when enabled; `nixl` is the only supported value today.
+- Worker id is an arbitrary non-empty string. Under a router it is set from the router's worker/endpoint id; standalone launches must pass `--shared-hicache-worker-id`.
+- Every rank binds `tcp://<server_args.host>:<shared_hicache_bootstrap_port + tp_rank>`.
+- For cross-process or cross-host reuse, launch the server with a bind host reachable at the advertised `source_host`, normally `--host 0.0.0.0`.
+- Plans carry `source_host` and `source_bootstrap_port`; there is no Shared HiCache route registry and no request-carried `source_endpoint`. The router is responsible for discovering each worker's `source_host` and `source_bootstrap_port` (e.g. from worker runtime metadata) and placing them in the plan.
+- The router assigns each worker's base port and passes it via `--shared-hicache-bootstrap-port`. When co-locating multiple workers on one host, base ports must be spaced by at least the TP width so the rank-offset port ranges do not overlap.
 - The supported source medium is `CPU_PINNED`.
-- Runtime parallelism and timeout are controlled by `SGLANG_SHARED_HICACHE_*`
-  env vars. Current defaults are `SGLANG_SHARED_HICACHE_FETCH_WORKERS=8` and
-  `SGLANG_SHARED_HICACHE_TIMEOUT_SECS=1.0`.
-- High source-transfer worker counts such as
-  `SGLANG_SHARED_HICACHE_FETCH_WORKERS=8` require sufficient memlock for NIXL/UCX
-  registration. The validated 4K fetch8 gate used inherited unlimited memlock.
+- Runtime parallelism and timeout are controlled by `SGLANG_SHARED_HICACHE_*` env vars: `SGLANG_SHARED_HICACHE_FETCH_WORKERS` (source worker threads, default `8`), `SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM` (per-transfer NIXL parallelism, default `8`), and `SGLANG_SHARED_HICACHE_TIMEOUT_SECS` (default `1.0`).
+- High source-transfer worker counts (e.g. `SGLANG_SHARED_HICACHE_FETCH_WORKERS=8`) require sufficient memlock for NIXL/UCX registration.
 
-## Current Validation
+## Performance
 
-### Cache-Hints Retest
-
-SGLang `f07f09a45`, Dynamo `650ea95c8`:
-
-- validated API rename from direct `shared_hicache_plan` to
-  `cache_hints.shared_hicache`;
-- focused SGLang pytest: `18 passed`;
-- full MiniMax TP4 ramp on H100 NVL:
-  - source c32: `192/192`;
-  - target c8/c16/c32/c64: all `192/192`;
-- nonzero Shared HiCache request, token, transfer-byte, and cached-token metrics;
-- zero direct-transfer failures and source-transfer timeouts.
-
-### Shared HiCache + Router vs Mooncake Store
-
-SGLang `d33602478`, Dynamo `650ea95c8`:
+Two TP4 MiniMax-M2.7 workers on one 8x H100 NVL host, 4096-token exact prefix overlap. Compared against routing the same reuse through a Mooncake Store L3 backend:
 
 | Metric | Shared HiCache + router | Mooncake Store |
 |---|---:|---:|
@@ -253,73 +263,28 @@ SGLang `d33602478`, Dynamo `650ea95c8`:
 | Remote target avg latency | 2858.5 ms | 3902.9 ms |
 | Remote target p95 latency | 3373.3 ms | 5462.6 ms |
 | E2E reuse workflow | 9.723 s | 11.693 s |
-| Direct staged inserts | 48 | n/a |
 
-Setup:
+## Implementation
 
-- MiniMax-M2.7;
-- two TP4 workers on one 8x H100 NVL host;
-- 4096-token exact prefix overlap;
-- source concurrency 12;
-- target concurrency 8;
-- `HICACHE_RATIO=4`;
-- `SGLANG_SHARED_HICACHE_FETCH_WORKERS=8`;
-- `--max-total-tokens 49152`;
-- all phases `12/12` HTTP 200;
-- zero direct-transfer failures, source-transfer timeouts, staging allocation
-  failures, transfer timeouts, or tracebacks.
+The change is almost entirely additive — it removes only a couple dozen lines from existing files — and nearly all of the logic lives in one self-contained package.
 
-### Host/Bootstrap Hard Cut
+**Self-contained module** — `python/sglang/srt/mem_cache/shared_hicache/`:
 
-SGLang PR branch `5a8b8d367`, Dynamo `a7a2f98d8`:
+- `plan.py` — plan schema and validation;
+- `config.py` — CLI / server-arg normalization;
+- `manager.py` — scheduler facade, factory, lifecycle wiring;
+- `scheduler_mixin.py` — the `SharedHiCacheSchedulerMixin` the `Scheduler` inherits;
+- `target_side/` — target allocation, insertion, quarantine, and reuse FSM (`cache.py`, `pending.py`, `reuse.py`);
+- `source.py` / `source_queue.py` — source host-page lookup, protection, and the source-side transfer worker queue;
+- `service.py` / `control.py` / `topology.py` — ZMQ control plane, `KVPoll` transfer handles, and endpoint derivation;
+- `transfer/` — NIXL transfer backend (`common.py`, `nixl.py`).
 
-- removed request-carried `source_endpoint`, `{tp_rank}` endpoint templating,
-  and the intermediate Shared HiCache route registry;
-- route lookup now derives the source rank endpoint from
-  `source_host/source_bootstrap_port/source_tp_rank`;
-- Dynamo auto-populates worker id and shared bootstrap metadata; the 4K harness
-  launched `dynamo.sglang` with `--host 0.0.0.0` and no manual
-  `--shared-hicache-bootstrap-port`;
-- focused SGLang pytest: `17 passed`;
-- MiniMax-M2.7 TP4 exact-4096 gate on TRY-67676:
-  - artifact:
-    `/tmp/dynamo_shared_hicache_host_bootstrap_4k_prlimit_20260603T110010Z`;
-  - cold target: `12/12` HTTP 200, avg `5909.44 ms`, p95 `7627.32 ms`;
-  - source populate: `12/12` HTTP 200, avg `3956.52 ms`, p95 `4098.07 ms`;
-  - source write: `12/12` HTTP 200, avg `908.46 ms`, p95 `912.91 ms`;
-  - remote target: `12/12` HTTP 200, avg `3794.96 ms`, p95 `4565.18 ms`;
-  - remote target cache-read: `46080`;
-  - remote-vs-cold speedup: `35.78%` avg latency, `40.15%` p95 latency;
-  - final target metrics: `112` Shared HiCache requests, `44` OK hits,
-    `134336` Shared HiCache tokens, `10.63 GB` transfer bytes, and `33584`
-    `shared_hicache` cached tokens;
-  - `56` NIXL transfer logs, `48` direct staged inserts;
-  - zero direct-transfer failures, source-transfer timeouts, transfer timeouts,
-    queue-full logs, or tracebacks.
+**Engine touch points** — small and additive:
 
-The failed no-registry rerun immediately before this was not caused by port
-derivation itself. Dynamo advertised the node IP, while SGLang had been bound to
-loopback. The validated run made the launch contract explicit with
-`--host 0.0.0.0` and inherited unlimited memlock via
-`sudo prlimit --pid <shell-pid> --memlock=unlimited:unlimited`.
+- `managers/scheduler.py` — the mixin plus a handful of call sites (init, per-batch prepare, release on finish/abort, idle and shutdown);
+- `managers/io_struct.py` / `managers/schedule_batch.py` — the `shared_hicache_plan` request field;
+- `mem_cache/hiradix_cache.py` / `mem_cache/hicache_host_index.py` — protected host-page lookup and the block-hash → host-page index;
+- `observability/metrics_collector.py` — `sglang:shared_hicache_*` metrics;
+- `server_args.py` / `environ.py` — the CLI flags and env vars.
 
-## Current PR Shape
-
-Major implementation surfaces:
-
-- request parsing: `python/sglang/srt/managers/io_struct.py`;
-- plan schema: `python/sglang/srt/mem_cache/shared_hicache/plan.py`;
-- scheduler integration:
-  `python/sglang/srt/mem_cache/shared_hicache/scheduler_mixin.py`;
-- target allocation/insertion:
-  `python/sglang/srt/mem_cache/shared_hicache/target.py`;
-- source resolution/protection:
-  `python/sglang/srt/mem_cache/shared_hicache/source.py`;
-- NIXL transfer:
-  `python/sglang/srt/mem_cache/shared_hicache/transfer.py`;
-- ZMQ control plane and endpoint derivation:
-  `python/sglang/srt/mem_cache/shared_hicache/service.py`;
-- manager/orchestration:
-  `python/sglang/srt/mem_cache/shared_hicache/manager.py`;
-- metrics: `python/sglang/srt/observability/metrics_collector.py`;
-- tests: `test/registered/hicache/test_shared_hicache.py`.
+Tests live in `test/registered/hicache/test_shared_hicache.py`.
