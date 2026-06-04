@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import numpy as np
 
-from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.shared_hicache.topology import SharedHiCacheTopology
 from sglang.srt.mem_cache.shared_hicache.transfer.common import (
@@ -586,10 +585,6 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
                 f"source={len(source_state.source_kv_item_lens)} "
                 f"target={len(target_kv_ptrs)}"
             )
-        src_blocks, _ = group_concurrent_contiguous(
-            source_page_indices.astype(np.int32, copy=False),
-            target_page_indices.astype(np.int32, copy=False),
-        )
         target_prep = source_state.target_prep_handles[target_agent_name]
         if target_prep.num_pages != target_num_pages:
             raise RuntimeError("NIXL target page count changed after preparation")
@@ -625,7 +620,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         logger.info(
             "SharedHiCache NIXL transferred blocks=%d slices=%d bytes=%d "
             "ms=%.3f setup_ms=%.3f source_agent=%s prepped=true",
-            len(src_blocks),
+            len(source_page_indices),
             int(source_indices.size),
             int(len(source_page_indices) * sum(source_state.source_kv_item_lens)),
             transfer_ms,
