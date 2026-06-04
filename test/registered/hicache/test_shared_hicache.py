@@ -193,7 +193,8 @@ class FakeScheduleManager:
 class FakeScheduler(SharedHiCacheSchedulerMixin):
     def __init__(self, manager):
         self.shared_hicache_manager = manager
-        self.ps = SimpleNamespace(tp_size=1)
+        self.ps = SimpleNamespace(tp_size=1, attn_tp_size=1)
+        self.attn_tp_cpu_group = None
         self.tree_cache = object()
         self.server_args = SimpleNamespace(prefill_max_requests=None)
         self.chunked_req = None
