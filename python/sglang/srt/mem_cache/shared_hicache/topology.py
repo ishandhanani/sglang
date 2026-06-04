@@ -115,9 +115,13 @@ class SharedHiCacheTopology:
         if source_tp_rank != self.tp_rank:
             return f"wrong_source_tp_rank:plan={source_tp_rank}:local={self.tp_rank}"
         if target_tp_size is None:
-            return "missing_target_tp_size"
+            if self.tp_size > 1:
+                return "missing_target_tp_size"
+            target_tp_size = 1
         if target_tp_rank is None:
-            return "missing_target_tp_rank"
+            if self.tp_size > 1:
+                return "missing_target_tp_rank"
+            target_tp_rank = 0
 
         target_tp_size = int(target_tp_size)
         target_tp_rank = int(target_tp_rank)

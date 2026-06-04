@@ -45,8 +45,8 @@ class SourceTransferRequest:
     target_kv_item_lens: list[int]
     target_num_pages: int
     target_metadata: Any
-    target_tp_rank: int
-    target_tp_size: int
+    target_tp_rank: Optional[int]
+    target_tp_size: Optional[int]
     target_page_indices: list[int]
 
 
@@ -295,6 +295,21 @@ def parse_source_transfer_request(
     transfer_backend: SharedHiCacheTransferBackend,
     tree_cache,
 ) -> tuple[Optional[SourceTransferRequest], Optional[Mapping[str, Any]]]:
+    if "transfer_backend" not in payload:
+        return None, {
+            "ok": False,
+            "reason": "malformed_transfer_request:missing_transfer_backend",
+        }
+    requested_backend = str(payload["transfer_backend"]).lower()
+    if requested_backend != transfer_backend.name:
+        return None, {
+            "ok": False,
+            "reason": (
+                f"unsupported_transfer_backend:{requested_backend}:"
+                f"local={transfer_backend.name}"
+            ),
+        }
+
     try:
         transfer_id = str(payload["transfer_id"])
     except KeyError:
@@ -359,18 +374,6 @@ def parse_source_transfer_request(
         return None, {
             "ok": False,
             "reason": f"malformed_transfer_request:{err}",
-            "block_size_tokens": tree_cache.page_size,
-        }
-    if target_tp_rank is None:
-        return None, {
-            "ok": False,
-            "reason": "malformed_transfer_request:target_metadata.tp_rank_missing",
-            "block_size_tokens": tree_cache.page_size,
-        }
-    if target_tp_size is None:
-        return None, {
-            "ok": False,
-            "reason": "malformed_transfer_request:target_metadata.tp_size_missing",
             "block_size_tokens": tree_cache.page_size,
         }
     try:
