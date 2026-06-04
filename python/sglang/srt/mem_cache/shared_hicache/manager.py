@@ -390,7 +390,6 @@ class SharedHiCacheManager:
     def _send_transfer_done(self, endpoint: str, payload: Mapping[str, Any]) -> None:
         message = dict(payload)
         message["kind"] = SHARED_HICACHE_TRANSFER_DONE
-        message["pending"] = False
         try:
             self._send_control_message(endpoint, message)
         except Exception:

@@ -214,7 +214,6 @@ class SharedHiCacheSourceTransferQueue:
         return {
             "ok": True,
             "accepted": True,
-            "pending": True,
             "reason": "accepted",
             "transfer_id": transfer_id,
             "block_size_tokens": self.tree_cache.page_size,
