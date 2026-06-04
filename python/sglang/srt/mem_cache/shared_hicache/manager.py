@@ -407,7 +407,7 @@ class SharedHiCacheManager:
     def _pending_ready_wait_ms(
         self, pending: SharedHiCachePendingFetch
     ) -> Optional[float]:
-        done_at = pending.done_at or float(getattr(pending.transfer, "done_at", 0.0))
+        done_at = pending.done_at or pending.transfer.done_at
         if done_at <= 0:
             return None
         return max(0.0, (time.perf_counter() - done_at) * 1000)
@@ -462,18 +462,14 @@ class SharedHiCacheManager:
     def _release_pending_fetch(self, pending: SharedHiCachePendingFetch) -> None:
         self._unlock_pending_prefix(pending)
         if pending.device_indices is None:
-            transfer_id = getattr(pending.transfer, "transfer_id", None)
-            if transfer_id:
-                self.target_transfer_tracker.finish(transfer_id)
+            self.target_transfer_tracker.finish(pending.transfer.transfer_id)
             self._release_fetch_worker()
             return
         backend = pending.backend
         transfer = pending.transfer
         if transfer.done():
             _, reason = transfer.result()
-            transfer_id = getattr(transfer, "transfer_id", None)
-            if transfer_id:
-                self.target_transfer_tracker.finish(transfer_id)
+            self.target_transfer_tracker.finish(transfer.transfer_id)
             if str(reason).startswith(SHARED_HICACHE_DIRECT_TIMEOUT_REASON):
                 self.target_cache.quarantine_device_indices(
                     pending.device_indices, reason, backend=backend
@@ -481,9 +477,7 @@ class SharedHiCacheManager:
             else:
                 self.target_cache.free_device_indices(pending.device_indices)
         else:
-            transfer_id = getattr(transfer, "transfer_id", None)
-            if transfer_id:
-                self.target_transfer_tracker.finish(transfer_id)
+            self.target_transfer_tracker.finish(transfer.transfer_id)
             self.target_cache.quarantine_device_indices(
                 pending.device_indices,
                 SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
@@ -871,16 +865,12 @@ class SharedHiCacheManager:
         self._pending_fetches.pop(str(req.rid), None)
         plan = pending.plan
         if pending.done_at <= 0:
-            pending.done_at = (
-                float(getattr(pending.transfer, "done_at", 0.0)) or time.perf_counter()
-            )
+            pending.done_at = pending.transfer.done_at or time.perf_counter()
 
         try:
             pages, reason = pending.transfer.result()
         except Exception:
-            transfer_id = getattr(pending.transfer, "transfer_id", None)
-            if transfer_id:
-                self.target_transfer_tracker.finish(transfer_id)
+            self.target_transfer_tracker.finish(pending.transfer.transfer_id)
             logger.exception(
                 "Shared HiCache fetch failed rid=%s plan_id=%s", req.rid, plan.plan_id
             )
@@ -896,9 +886,7 @@ class SharedHiCacheManager:
             )
             self._release_fetch_worker()
             return SharedHiCacheResult()
-        transfer_id = getattr(pending.transfer, "transfer_id", None)
-        if transfer_id:
-            self.target_transfer_tracker.finish(transfer_id)
+        self.target_transfer_tracker.finish(pending.transfer.transfer_id)
 
         if not pages:
             logger.debug(
