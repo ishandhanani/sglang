@@ -345,7 +345,6 @@ class SharedHiCacheTargetReuse:
                     "start_block": start_block,
                     "max_blocks": submitted_blocks,
                     "target_session_id": direct_transfer.target_session_id,
-                    "transfer_backend": direct_transfer.name,
                     "target_metadata": target_descriptor,
                     "target_kv_ptrs": direct_transfer.target_kv_ptrs,
                     "target_kv_item_lens": direct_transfer.target_kv_item_lens,
