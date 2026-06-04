@@ -5,12 +5,14 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.hicache_host_index import HiCacheHostBlockIndex
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
+from sglang.srt.mem_cache.shared_hicache.control import SharedHiCacheTransferHandle
 from sglang.srt.mem_cache.shared_hicache.manager import SharedHiCacheManager
 from sglang.srt.mem_cache.shared_hicache.config import (
     normalize_shared_hicache_server_config,
@@ -159,12 +161,18 @@ class FakeTransferBackend:
     target_kv_item_lens = [64]
     target_num_pages = 8
 
+    def __init__(self, notifications=None):
+        self.notifications = dict(notifications or {})
+
     def target_descriptor(self):
         return {
             "backend": self.name,
             "session_id": self.target_session_id,
             "target_num_pages": self.target_num_pages,
         }
+
+    def pop_target_transfer_notification(self, transfer_id):
+        return self.notifications.pop(str(transfer_id), None)
 
 
 class FakeNixlAgent:
@@ -455,6 +463,24 @@ class TestSharedHiCache(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "poll failed"):
             backend._wait_for_transfer(stalled_agent, "poll-handle")
         self.assertEqual(stalled_agent.released, ["poll-handle"])
+
+    def test_transfer_handle_late_target_notification_wins_over_timeout(self):
+        transfer_id = "late-notification"
+        handle = SharedHiCacheTransferHandle(
+            transfer_backend=FakeTransferBackend(notifications={transfer_id: (1, "ok")}),
+            transfer_id=transfer_id,
+            plan=SharedHiCachePlan.from_dict(_make_plan([11])),
+            start_block=0,
+            max_blocks=1,
+            timeout_secs=0.0,
+            pop_source_completion=lambda _transfer_id: None,
+        )
+        handle.submitted_at = time.perf_counter() - 1.0
+
+        self.assertEqual(handle.poll(), KVPoll.Success)
+        pages, reason = handle.result()
+        self.assertEqual([page.block_hash for page in pages], [11])
+        self.assertEqual(reason, "ok")
 
     def test_hiradix_cpu_events_maintain_host_index(self):
         cache = HiRadixCache.__new__(HiRadixCache)
