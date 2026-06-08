@@ -114,8 +114,9 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
-    from sglang.srt.session.session_controller import Session
     from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
+    from sglang.srt.mem_cache.shared_hicache.route import SharedHiCacheSourceRoute
+    from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -675,6 +676,7 @@ class Req(ReqDllmMixin):
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
         shared_hicache_plan: Optional["SharedHiCachePlan"] = None,
+        shared_hicache_source_routes: tuple["SharedHiCacheSourceRoute", ...] = (),
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
@@ -759,6 +761,7 @@ class Req(ReqDllmMixin):
         self.lora_id = lora_id
         self.routing_key = routing_key
         self.shared_hicache_plan = shared_hicache_plan
+        self.shared_hicache_source_routes = shared_hicache_source_routes
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None

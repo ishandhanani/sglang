@@ -34,8 +34,6 @@ class SharedHiCachePlan:
     request_id: str
     target_worker_id: str
     source_worker_id: str
-    source_host: str
-    source_bootstrap_port: int
     source_medium: str
     router_block_hashes: tuple[int, ...]
     engine_block_hashes: tuple[int, ...]
@@ -101,8 +99,6 @@ class SharedHiCachePlan:
                 request_id=str(data["request_id"]),
                 target_worker_id=str(data["target_worker_id"]),
                 source_worker_id=str(data["source_worker_id"]),
-                source_host=str(data["source_host"]),
-                source_bootstrap_port=int(data["source_bootstrap_port"]),
                 source_medium=str(data["source_medium"]),
                 router_block_hashes=router_block_hashes,
                 engine_block_hashes=engine_block_hashes,
@@ -126,8 +122,6 @@ class SharedHiCachePlan:
             "request_id": self.request_id,
             "target_worker_id": self.target_worker_id,
             "source_worker_id": self.source_worker_id,
-            "source_host": self.source_host,
-            "source_bootstrap_port": self.source_bootstrap_port,
             "source_medium": self.source_medium,
             "router_block_hashes": list(self.router_block_hashes),
             "engine_block_hashes": list(self.engine_block_hashes),

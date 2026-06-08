@@ -34,6 +34,9 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Modality
 from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
+from sglang.srt.mem_cache.shared_hicache.route import (
+    SharedHiCacheSourceRoute,
+)
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
@@ -147,7 +150,10 @@ def _shared_hicache_plan_from_cache_hints(
     hint = cache_hints.get("shared_hicache")
     if hint is None:
         return None
-    return SharedHiCachePlan.from_dict(hint)
+    try:
+        return SharedHiCachePlan.from_dict(hint)
+    except ValueError:
+        return None
 
 
 def _cache_hints_has_shared_hicache(
@@ -262,12 +268,18 @@ class GenerateReqInput(BaseReq):
     disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
-    # Internal router-provided cache execution hints.
-    # `shared_hicache` is normalized into `shared_hicache_plan` below.
+    # Router-provided cache execution hints.
+    # `shared_hicache` is normalized into `shared_hicache_plan` below. Source
+    # endpoints are intentionally not accepted here; trusted adapters attach
+    # `shared_hicache_source_routes` on the internal request object instead.
     cache_hints: Optional[CacheHintsInput] = None
     shared_hicache_plan: Optional[
         Union[SharedHiCachePlan, List[Optional[SharedHiCachePlan]]]
     ] = field(default=None, init=False, repr=False)
+    shared_hicache_source_routes: Union[
+        tuple[SharedHiCacheSourceRoute, ...],
+        List[tuple[SharedHiCacheSourceRoute, ...]],
+    ] = field(default_factory=tuple, init=False, repr=False)
 
     # For background responses (OpenAI responses API)
     background: bool = False
@@ -680,8 +692,14 @@ class GenerateReqInput(BaseReq):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
     def _normalize_cache_hints(self, num):
+        routes = (
+            self.shared_hicache_source_routes
+            if isinstance(self.shared_hicache_source_routes, tuple)
+            else ()
+        )
         if self.cache_hints is None:
             self.shared_hicache_plan = [None] * num
+            self.shared_hicache_source_routes = [routes] * num
         elif isinstance(self.cache_hints, list):
             if len(self.cache_hints) != self.batch_size:
                 raise ValueError(
@@ -694,6 +712,7 @@ class GenerateReqInput(BaseReq):
                 for i, hints in enumerate(self.cache_hints)
             ]
             self.shared_hicache_plan = plans * self.parallel_sample_num
+            self.shared_hicache_source_routes = [routes] * num
         else:
             if self.batch_size != 1:
                 raise ValueError(
@@ -701,6 +720,7 @@ class GenerateReqInput(BaseReq):
                 )
             plan = _shared_hicache_plan_from_cache_hints(self.cache_hints)
             self.shared_hicache_plan = [plan] * num
+            self.shared_hicache_source_routes = [routes] * num
 
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
@@ -804,6 +824,11 @@ class GenerateReqInput(BaseReq):
             if isinstance(self.shared_hicache_plan, list)
             else self.shared_hicache_plan
         )
+        sub.shared_hicache_source_routes = (
+            self.shared_hicache_source_routes[i]
+            if isinstance(self.shared_hicache_source_routes, list)
+            else self.shared_hicache_source_routes
+        )
         cache[i] = sub
         return sub
 
@@ -871,6 +896,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
     shared_hicache_plan: Optional[SharedHiCachePlan] = None
+    shared_hicache_source_routes: tuple[SharedHiCacheSourceRoute, ...] = ()
 
     # Priority for the request
     priority: Optional[int] = None

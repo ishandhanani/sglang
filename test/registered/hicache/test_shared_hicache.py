@@ -21,6 +21,10 @@ from sglang.srt.mem_cache.shared_hicache.plan import (
     SHARED_HICACHE_PLAN_VERSION,
     SharedHiCachePlan,
 )
+from sglang.srt.mem_cache.shared_hicache.route import (
+    SharedHiCacheSourceRoute,
+    SharedHiCacheSourceRouteRegistry,
+)
 from sglang.srt.mem_cache.shared_hicache.scheduler_mixin import (
     SharedHiCacheSchedulerMixin,
     SharedHiCachePrepareStatus,
@@ -42,8 +46,6 @@ def _make_plan(router_block_hashes, **overrides):
         "request_id": "request-1",
         "target_worker_id": "target-worker",
         "source_worker_id": "source-worker",
-        "source_host": "127.0.0.1",
-        "source_bootstrap_port": 39006,
         "source_medium": StorageMedium.CPU.value,
         "router_block_hashes": router_block_hashes,
         "engine_block_hashes": router_block_hashes,
@@ -270,6 +272,7 @@ def _make_manager():
     manager = SharedHiCacheManager.__new__(SharedHiCacheManager)
     manager.worker_id = "target-worker"
     manager.tree_cache = FakeTree(page_size=2)
+    manager.source_route_registry = SharedHiCacheSourceRouteRegistry()
     manager._set_topology(
         SharedHiCacheTopology(
             tp_rank=1,
@@ -299,6 +302,15 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertEqual(transfer_backend, "nixl")
 
         manager = SharedHiCacheManager.__new__(SharedHiCacheManager)
+        manager.source_route_registry = SharedHiCacheSourceRouteRegistry(
+            [
+                SharedHiCacheSourceRoute(
+                    worker_id="source-worker",
+                    tp_rank=3,
+                    endpoint="tcp://127.0.0.1:39009",
+                )
+            ]
+        )
         manager._set_topology(SharedHiCacheTopology(tp_rank=3, tp_size=4))
         self.assertEqual(
             manager._local_control_endpoint(
@@ -353,8 +365,6 @@ class TestSharedHiCache(unittest.TestCase):
         )
 
         self.assertEqual(plan.source_medium, StorageMedium.CPU.value)
-        self.assertEqual(plan.source_host, "127.0.0.1")
-        self.assertEqual(plan.source_bootstrap_port, 39006)
         self.assertEqual(plan.router_block_hashes, (11,))
         self.assertEqual(plan.engine_block_hashes, (11,))
 

@@ -14,6 +14,9 @@ from sglang.srt.mem_cache.shared_hicache.control import (
     SharedHiCacheTargetTransferTracker,
 )
 from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
+from sglang.srt.mem_cache.shared_hicache.route import (
+    SharedHiCacheSourceRouteRegistry,
+)
 from sglang.srt.mem_cache.shared_hicache.service import SharedHiCacheSourceService
 from sglang.srt.mem_cache.shared_hicache.source_queue import (
     SharedHiCacheSourceTransferQueue,
@@ -59,6 +62,7 @@ class SharedHiCacheManager:
         self.metrics_collector = metrics_collector
         self.endpoint = self._local_control_endpoint(server_args)
         self.source_service: Optional[SharedHiCacheSourceService] = None
+        self.source_route_registry = SharedHiCacheSourceRouteRegistry()
         self._shutdown = False
 
         fetch_worker_limit = max(
@@ -253,17 +257,18 @@ class SharedHiCacheManager:
             if plan.source_tp_rank is not None
             else int(self.tp_rank)
         )
-        port = int(plan.source_bootstrap_port) + source_tp_rank
-        if port > 65535:
+        source_control_endpoint = self.source_route_registry.resolve(
+            plan.source_worker_id, source_tp_rank
+        )
+        if source_control_endpoint is None:
             logger.warning(
-                "Shared HiCache source bootstrap port exceeds range plan_id=%s source_worker=%s source_tp_rank=%s source_bootstrap_port=%s",
+                "Shared HiCache source route unavailable plan_id=%s source_worker=%s source_tp_rank=%s",
                 plan.plan_id,
                 plan.source_worker_id,
                 source_tp_rank,
-                plan.source_bootstrap_port,
             )
             return None
-        return f"tcp://{plan.source_host}:{port}"
+        return source_control_endpoint
 
     def _send_control_message(self, endpoint: str, payload: Mapping[str, Any]) -> None:
         source_service = self.source_service
@@ -325,4 +330,7 @@ class SharedHiCacheManager:
         self.target_reuse.release_request(rid)
 
     def prepare_reuse(self, req: Req) -> SharedHiCacheResult:
+        self.source_route_registry.update(
+            getattr(req, "shared_hicache_source_routes", ())
+        )
         return self.target_reuse.prepare_reuse(req)

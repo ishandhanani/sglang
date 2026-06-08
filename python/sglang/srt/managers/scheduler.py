@@ -1961,6 +1961,7 @@ class Scheduler(
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
                 shared_hicache_plan=recv_req.shared_hicache_plan,
+                shared_hicache_source_routes=recv_req.shared_hicache_source_routes,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
