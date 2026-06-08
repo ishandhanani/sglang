@@ -23,7 +23,7 @@ from sglang.srt.mem_cache.shared_hicache.plan import (
 )
 from sglang.srt.mem_cache.shared_hicache.route import (
     SharedHiCacheSourceRoute,
-    SharedHiCacheSourceRouteRegistry,
+    shared_hicache_source_endpoint,
 )
 from sglang.srt.mem_cache.shared_hicache.scheduler_mixin import (
     SharedHiCacheSchedulerMixin,
@@ -272,7 +272,6 @@ def _make_manager():
     manager = SharedHiCacheManager.__new__(SharedHiCacheManager)
     manager.worker_id = "target-worker"
     manager.tree_cache = FakeTree(page_size=2)
-    manager.source_route_registry = SharedHiCacheSourceRouteRegistry()
     manager._set_topology(
         SharedHiCacheTopology(
             tp_rank=1,
@@ -302,15 +301,6 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertEqual(transfer_backend, "nixl")
 
         manager = SharedHiCacheManager.__new__(SharedHiCacheManager)
-        manager.source_route_registry = SharedHiCacheSourceRouteRegistry(
-            [
-                SharedHiCacheSourceRoute(
-                    worker_id="source-worker",
-                    tp_rank=3,
-                    endpoint="tcp://127.0.0.1:39009",
-                )
-            ]
-        )
         manager._set_topology(SharedHiCacheTopology(tp_rank=3, tp_size=4))
         self.assertEqual(
             manager._local_control_endpoint(
@@ -322,10 +312,16 @@ class TestSharedHiCache(unittest.TestCase):
             "tcp://127.0.0.1:39003",
         )
         self.assertEqual(
-            manager._source_control_endpoint_for_plan(
-                SharedHiCachePlan.from_dict(
-                    _make_plan([11], source_tp_rank=3, source_tp_size=4)
-                )
+            shared_hicache_source_endpoint(
+                (
+                    SharedHiCacheSourceRoute(
+                        worker_id="source-worker",
+                        tp_rank=3,
+                        endpoint="tcp://127.0.0.1:39009",
+                    ),
+                ),
+                "source-worker",
+                3,
             ),
             "tcp://127.0.0.1:39009",
         )

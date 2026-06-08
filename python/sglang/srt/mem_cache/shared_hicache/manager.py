@@ -13,10 +13,6 @@ from sglang.srt.mem_cache.shared_hicache.control import (
     SHARED_HICACHE_TRANSFER_REQUEST,
     SharedHiCacheTargetTransferTracker,
 )
-from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
-from sglang.srt.mem_cache.shared_hicache.route import (
-    SharedHiCacheSourceRouteRegistry,
-)
 from sglang.srt.mem_cache.shared_hicache.service import SharedHiCacheSourceService
 from sglang.srt.mem_cache.shared_hicache.source_queue import (
     SharedHiCacheSourceTransferQueue,
@@ -37,6 +33,7 @@ from sglang.srt.mem_cache.shared_hicache.transfer.common import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -62,7 +59,6 @@ class SharedHiCacheManager:
         self.metrics_collector = metrics_collector
         self.endpoint = self._local_control_endpoint(server_args)
         self.source_service: Optional[SharedHiCacheSourceService] = None
-        self.source_route_registry = SharedHiCacheSourceRouteRegistry()
         self._shutdown = False
 
         fetch_worker_limit = max(
@@ -86,7 +82,6 @@ class SharedHiCacheManager:
             target_transfer_tracker=self.target_transfer_tracker,
             endpoint=self.endpoint,
             send_control_message=self._send_control_message,
-            source_control_endpoint_for_plan=self._source_control_endpoint_for_plan,
             timeout_secs=self.timeout_secs,
             prefetch_stop_policy=self.prefetch_stop_policy,
             fetch_worker_limit=fetch_worker_limit,
@@ -248,28 +243,6 @@ class SharedHiCacheManager:
         self.target_cache.release_quarantined_device_indices()
         self._shutdown_direct_transfer_backend()
 
-    def _source_control_endpoint_for_plan(
-        self,
-        plan: SharedHiCachePlan,
-    ) -> Optional[str]:
-        source_tp_rank = (
-            int(plan.source_tp_rank)
-            if plan.source_tp_rank is not None
-            else int(self.tp_rank)
-        )
-        source_control_endpoint = self.source_route_registry.resolve(
-            plan.source_worker_id, source_tp_rank
-        )
-        if source_control_endpoint is None:
-            logger.warning(
-                "Shared HiCache source route unavailable plan_id=%s source_worker=%s source_tp_rank=%s",
-                plan.plan_id,
-                plan.source_worker_id,
-                source_tp_rank,
-            )
-            return None
-        return source_control_endpoint
-
     def _send_control_message(self, endpoint: str, payload: Mapping[str, Any]) -> None:
         source_service = self.source_service
         if source_service is None:
@@ -330,7 +303,4 @@ class SharedHiCacheManager:
         self.target_reuse.release_request(rid)
 
     def prepare_reuse(self, req: Req) -> SharedHiCacheResult:
-        self.source_route_registry.update(
-            getattr(req, "shared_hicache_source_routes", ())
-        )
         return self.target_reuse.prepare_reuse(req)

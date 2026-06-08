@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from threading import Lock
 from typing import Any, Iterable, Mapping, Optional
 
 
@@ -23,20 +22,16 @@ class SharedHiCacheSourceRoute:
         return cls(worker_id=worker_id, tp_rank=tp_rank, endpoint=endpoint)
 
 
-class SharedHiCacheSourceRouteRegistry:
-    def __init__(self, routes: Iterable[SharedHiCacheSourceRoute] = ()):
-        self._lock = Lock()
-        self._routes: dict[tuple[str, int], str] = {}
-        self.update(routes)
-
-    def update(self, routes: Iterable[SharedHiCacheSourceRoute]) -> None:
-        with self._lock:
-            for route in routes:
-                self._routes[(route.worker_id, int(route.tp_rank))] = route.endpoint
-
-    def resolve(self, worker_id: str, tp_rank: int) -> Optional[str]:
-        with self._lock:
-            return self._routes.get((str(worker_id), int(tp_rank)))
+def shared_hicache_source_endpoint(
+    routes: Iterable[SharedHiCacheSourceRoute],
+    worker_id: str,
+    tp_rank: int,
+) -> Optional[str]:
+    key = (str(worker_id), int(tp_rank))
+    for route in routes:
+        if (route.worker_id, int(route.tp_rank)) == key:
+            return route.endpoint
+    return None
 
 
 def shared_hicache_source_routes_from_hint(

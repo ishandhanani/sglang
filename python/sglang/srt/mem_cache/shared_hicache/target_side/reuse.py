@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.shared_hicache.plan import (
     SHARED_HICACHE_SOURCE_MEDIUM,
     SharedHiCachePlan,
 )
+from sglang.srt.mem_cache.shared_hicache.route import shared_hicache_source_endpoint
 from sglang.srt.mem_cache.shared_hicache.target_side.cache import SharedHiCacheTarget
 from sglang.srt.mem_cache.shared_hicache.target_side.pending import (
     SharedHiCachePendingFetch,
@@ -91,7 +92,6 @@ class SharedHiCacheTargetReuse:
         target_transfer_tracker: SharedHiCacheTargetTransferTracker,
         endpoint: str,
         send_control_message: Callable[[str, Mapping[str, Any]], None],
-        source_control_endpoint_for_plan: Callable[[SharedHiCachePlan], Optional[str]],
         timeout_secs: float,
         prefetch_stop_policy: str,
         fetch_worker_limit: int,
@@ -105,7 +105,6 @@ class SharedHiCacheTargetReuse:
         self.target_transfer_tracker = target_transfer_tracker
         self.endpoint = endpoint
         self._send_control_message = send_control_message
-        self._source_control_endpoint_for_plan = source_control_endpoint_for_plan
         self.timeout_secs = timeout_secs
         self.prefetch_stop_policy = prefetch_stop_policy
         self.metrics_collector = metrics_collector
@@ -270,14 +269,30 @@ class SharedHiCacheTargetReuse:
 
     def _submit_direct_transfer(
         self,
+        req: Req,
         plan: SharedHiCachePlan,
         *,
         start_block: int,
         token_count: int,
     ) -> SharedHiCacheDirectSubmitResult:
         direct_transfer = self.direct_transfer
-        source_control_endpoint = self._source_control_endpoint_for_plan(plan)
+        source_tp_rank = (
+            int(plan.source_tp_rank)
+            if plan.source_tp_rank is not None
+            else int(self.topology.tp_rank)
+        )
+        source_control_endpoint = shared_hicache_source_endpoint(
+            getattr(req, "shared_hicache_source_routes", ()),
+            plan.source_worker_id,
+            source_tp_rank,
+        )
         if not source_control_endpoint:
+            logger.warning(
+                "Shared HiCache source route unavailable plan_id=%s source_worker=%s source_tp_rank=%s",
+                plan.plan_id,
+                plan.source_worker_id,
+                source_tp_rank,
+            )
             return SharedHiCacheDirectSubmitResult(
                 reason="source_control_endpoint_unavailable"
             )
@@ -542,6 +557,7 @@ class SharedHiCacheTargetReuse:
         locked_node = self._lock_request_prefix(req)
         try:
             direct_submit = self._submit_direct_transfer(
+                req,
                 plan,
                 start_block=plan_offset,
                 token_count=token_count,
