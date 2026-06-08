@@ -9,6 +9,8 @@ Authors: @ishandhanani, @hzh0425
 
 Agent workloads make the value of a KV block predictable from above the engine, but that value is invisible to request-local LRU. We propose exposing a narrow, router-initiated hint surface so an external router can pass cache intent to SGLang without making invasive changes to the engine scheduler and cache manager. In this way, SGLang keeps ownership of scheduling and memory and is free to clip, defer, or reject any hint. 
 
+The first concrete primitive is **session membership**: [#27058](https://github.com/sgl-project/sglang/pull/27058) tags each request's KV with its session id, so the engine can name — and the router can address — a whole session's KV (it otherwise sees only a block hash and a refcount). It's the foundation the session-scoped hints below build on.
+
 The first concrete hint we propose is Shared HiCache. This allows for a router to request KV cache to be moved from a workers G2 to another workers G1 directly within HiCache without a need for a secondary memory pool. This scaffolding paves the way for various other KV transfer mechanisms that directly improve performance of agentic inference.
 
 ---
@@ -167,7 +169,7 @@ Research:
 - MARCONI (prefix caching for hybrid LLMs): https://arxiv.org/abs/2411.19379
 
 Our prior work (sglang):
-- #24656 (agent-aware KV phase 1 / API feedback), #21846 (distributed KV roadmap), #27058 (radix-native sessions), #27024 / #27025 (streaming-session deadlock + bound), #22273 / #21875 (streaming-session leak fixes), #18941 (TTL prefix pinning), #21045 (priority retention duration).
+- #24656 (agent-aware KV phase 1 / API feedback), #21846 (distributed KV roadmap), #27058 (radix-native sessions — the session-membership tag; first landed primitive), #27024 / #27025 (streaming-session deadlock + bound), #22273 / #21875 (streaming-session leak fixes), #18941 (TTL prefix pinning), #21045 (priority retention duration).
 
 Our prior work (dynamo):
 - [#7665](https://github.com/ai-dynamo/dynamo/pull/7665) / [#7377](https://github.com/ai-dynamo/dynamo/pull/7377) / [#7384](https://github.com/ai-dynamo/dynamo/pull/7384) (session_control + ephemeral KV routing), pi-dynamo-provider#4 (per-subagent sessions), [#6213](https://github.com/ai-dynamo/dynamo/pull/6213) / [#6571](https://github.com/ai-dynamo/dynamo/pull/6571) (Anthropic-style cache_control), [#8789](https://github.com/ai-dynamo/dynamo/pull/8789) / [#9140](https://github.com/ai-dynamo/dynamo/pull/9140) (agent_context / ATIF), [#9448](https://github.com/ai-dynamo/dynamo/pull/9448) (thunderagent_router program scheduler).
