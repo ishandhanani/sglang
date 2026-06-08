@@ -167,7 +167,7 @@ class SharedHiCacheTargetReuse:
             )
 
     def _max_cacheable_blocks(self, req: Req) -> int:
-        max_prefix_len = max(len(req.fill_ids) - 1, 0)
+        max_prefix_len = max(int(req.fill_len) - 1, 0)
         if req.return_logprob and req.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, req.logprob_start_len)
         if req.positional_embed_overrides is not None:

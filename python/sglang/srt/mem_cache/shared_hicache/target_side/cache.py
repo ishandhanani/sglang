@@ -240,9 +240,10 @@ class SharedHiCacheTarget:
         token_start = start_block * page_size
         token_end = token_start + token_count
         allocated_tokens = len(device_indices)
+        fill_ids = req.get_fill_ids()
 
-        if token_end > len(req.fill_ids):
-            token_count = ((len(req.fill_ids) - token_start) // page_size) * page_size
+        if token_end > len(fill_ids):
+            token_count = ((len(fill_ids) - token_start) // page_size) * page_size
             pages = pages[: token_count // page_size]
             token_end = token_start + token_count
 
@@ -269,7 +270,7 @@ class SharedHiCacheTarget:
                 return 0
 
             key = RadixKey(
-                req.fill_ids[:token_end],
+                fill_ids[:token_end],
                 extra_key=req.extra_key,
                 is_bigram=self.tree_cache.is_eagle,
             )
