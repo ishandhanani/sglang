@@ -240,7 +240,7 @@ class SharedHiCacheTarget:
         token_start = start_block * page_size
         token_end = token_start + token_count
         allocated_tokens = len(device_indices)
-        fill_ids = req.get_fill_ids()
+        fill_ids = req.full_untruncated_fill_ids
 
         if token_end > len(fill_ids):
             token_count = ((len(fill_ids) - token_start) // page_size) * page_size
