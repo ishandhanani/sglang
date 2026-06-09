@@ -545,14 +545,6 @@ class SharedHiCacheTargetReuse:
         max_blocks = planned_blocks - plan_offset
         token_count = max_blocks * page_size
         expected_hashes = plan.planned_router_block_hashes[plan_offset:planned_blocks]
-        if req.host_hit_length > 0:
-            self._finished_plan_keys.add(plan_key)
-            self._observe_reuse(
-                backend=backend,
-                outcome="skip",
-                reason="local_host_hit",
-            )
-            return SharedHiCacheResult()
         self._observe_staging(
             backend=backend,
             outcome="planned",
@@ -570,7 +562,30 @@ class SharedHiCacheTargetReuse:
         except Exception:
             if locked_node is not None:
                 self.tree_cache.dec_lock_ref(locked_node)
-            raise
+            self._finished_plan_keys.add(plan_key)
+            self._observe_staging(
+                backend=backend,
+                outcome="failed",
+                reason="direct_submit_exception",
+                tokens=token_count,
+            )
+            self._observe_reuse(
+                backend=backend,
+                outcome="miss",
+                reason="direct_submit_exception",
+            )
+            logger.exception(
+                "Shared HiCache direct transfer submit failed; falling back to local prefill "
+                "rid=%s plan_id=%s source_worker=%s start_block=%d max_blocks=%d "
+                "token_count=%d",
+                req.rid,
+                plan.plan_id,
+                plan.source_worker_id,
+                plan_offset,
+                max_blocks,
+                token_count,
+            )
+            return SharedHiCacheResult()
         transfer = direct_submit.transfer
         device_indices = direct_submit.device_indices
         direct_submit_reason = direct_submit.reason
