@@ -18,6 +18,16 @@ source worker CPU_PINNED HiCache pages
 
 This is the concrete implementation linked from the higher-level [Programmatic KV Cache RFC](https://github.com/sgl-project/sglang/issues/27574).
 
+## Status
+
+SGLang has a working default-off implementation that we will upstream as a functionality PR. Out-of-the-box performance depends on the router's admission policy.
+
+Current benchmark evidence is mixed and should be read conservatively:
+
+- The old capped Direct G2 policy produced real NIXL transfers, but worsened TTFT and latency.
+- Pivot scoring with the old conservative cost gate avoided bad pulls, but produced zero Direct G2 plans.
+- The current moonmatch/default benchmark is being relaunched because the first run used a mismatched model id; that invalidation is not a router or SGLang Shared HiCache failure.
+
 ## Motivation
 
 The router observes KV-cache placement globally through SGLang KV events. It can know that worker A has a prefix in HostPinned memory while worker B is the better target for load, placement, or admission.
@@ -42,6 +52,30 @@ The current PR is a default-off, NIXL-backed, peer-worker reuse path.
 Shared HiCache sits between a cache-aware router and SGLang's HiCache. The router keeps a global view of where every prefix lives across workers — both G1 (GPU) and G2 (host / CPU-pinned) tiers — built from the KV events SGLang already emits. When it routes a request to a worker that is missing a prefix some other worker holds in G2, it attaches a peer-reuse plan.
 
 SGLang treats that plan as advice, not a command. The target worker allocates GPU staging pages, pulls the host KV directly from the source worker over NIXL, inserts the transferred blocks into its local radix cache, and then prefills only the uncovered suffix. Two properties shape the whole design: it **reuses SGLang's proven disaggregation transport** instead of inventing a new one, and it is **intentionally lightweight** — a self-contained module plus a few non-invasive scheduler hooks, with zero cost on the un-hinted path.
+
+### Mooncake-compatible Direct G2 routing
+
+Direct G2 routing has pivoted to model native SGLang HiCache / Mooncake behavior rather than the older capped, high-cost remote-pull model.
+
+Native SGLang enqueues storage prefetch from the scheduler, aligns cache work to page size, and applies a prefetch threshold before treating remote reuse as worth waiting for. The default threshold is 256 tokens, which maps to 16 KV blocks for 16-token blocks. There is no fixed 512-block cap. The default timeout policy uses a bounded timeout computed from base timeout plus per-1K-token timeout, capped at 30 seconds.
+
+Dynamo's Direct G2 defaults now match that surface: `remote_g2_cost_blocks=16.0`, `remote_g2_cost_per_block=0.0`, and `remote_g2_max_planned_blocks=None` (no cap). Routing compares the remote G2 incremental benefit against the best local-prefix baseline, and still requires the target-local incremental benefit to be greater than zero.
+
+```mermaid
+flowchart TD
+    A[Request arrives] --> B[Find best local-prefix baseline]
+    A --> C[Find best remote G2 candidate]
+    C --> D[Align candidate to page / block size]
+    D --> E{"Meets Mooncake-like threshold?<br/>default 256 tokens = 16 blocks at block size 16"}
+    E -- no --> L[Use local route]
+    E -- yes --> F[Score remote incremental benefit]
+    B --> F
+    F --> G{"Remote beats local baseline<br/>and target-local benefit > 0?"}
+    G -- no --> L
+    G -- yes --> H[Attach shared_hicache plan]
+```
+
+The design intent is narrow: the router may plan a direct worker-to-worker top-up only when remote G2 locality beats the local baseline enough to satisfy Mooncake-like admission, and the SGLang target may stop or decline the pull when the active HiCache prefetch policy says the pull is no longer beneficial or needed.
 
 ### Built on disaggregation
 
@@ -196,7 +230,10 @@ flowchart TD
 Precise requirements:
 
 - allocate page-aligned GPU KV blocks, evicting local GPU KV first when needed, and fall back to partial page-aligned staging when full capacity is not free;
+- reserve target tokens for remote-KV staging before starting the transfer;
 - clip requested hashes and expected pages to the granted staging capacity;
+- pass `hicache_storage_prefetch_policy` into target reuse and honor it there; in default timeout mode, use the same bounded timeout family as native HiCache and cap the wait at 30 seconds;
+- decline or finish as a no-op when the local cache already covers the planned prefix;
 - verify returned pages match the expected contiguous `router_block_hashes` suffix before inserting;
 - on an ordinary miss or validation failure, free the pages; on an indeterminate direct-transfer failure, **quarantine** them instead of returning them to the allocator;
 - insert verified device pages into the local radix cache and report `shared_hicache` cached tokens.
