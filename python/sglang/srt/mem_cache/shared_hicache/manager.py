@@ -39,6 +39,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _shared_hicache_target_reserve_tokens(
+    server_args: ServerArgs, page_size: int
+) -> int:
+    override = int(envs.SGLANG_SHARED_HICACHE_TARGET_RESERVE_TOKENS.get())
+    if override >= 0:
+        return override
+
+    max_prefill_tokens = max(0, int(getattr(server_args, "max_prefill_tokens", 0) or 0))
+    prefill_max_requests = getattr(server_args, "prefill_max_requests", None)
+    if prefill_max_requests is None:
+        prefill_max_requests = 1
+    request_padding = max(1, int(prefill_max_requests)) * max(1, int(page_size))
+    return max_prefill_tokens + request_padding
+
+
 class SharedHiCacheManager:
     def __init__(
         self,
@@ -66,6 +81,9 @@ class SharedHiCacheManager:
             int(envs.SGLANG_SHARED_HICACHE_FETCH_WORKERS.get()),
         )
         source_worker_limit = fetch_worker_limit
+        target_reserve_tokens = _shared_hicache_target_reserve_tokens(
+            server_args, tree_cache.page_size
+        )
         self.target_cache = SharedHiCacheTarget(
             tree_cache=tree_cache,
             metrics_collector=metrics_collector,
@@ -85,6 +103,7 @@ class SharedHiCacheManager:
             timeout_secs=self.timeout_secs,
             prefetch_stop_policy=self.prefetch_stop_policy,
             fetch_worker_limit=fetch_worker_limit,
+            target_reserve_tokens=target_reserve_tokens,
             metrics_collector=metrics_collector,
         )
 

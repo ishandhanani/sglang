@@ -95,6 +95,7 @@ class SharedHiCacheTargetReuse:
         timeout_secs: float,
         prefetch_stop_policy: str,
         fetch_worker_limit: int,
+        target_reserve_tokens: int,
         metrics_collector=None,
     ):
         self.tree_cache = tree_cache
@@ -107,6 +108,7 @@ class SharedHiCacheTargetReuse:
         self._send_control_message = send_control_message
         self.timeout_secs = timeout_secs
         self.prefetch_stop_policy = prefetch_stop_policy
+        self.target_reserve_tokens = max(0, int(target_reserve_tokens))
         self.metrics_collector = metrics_collector
         self._target_transfer_capacity = threading.BoundedSemaphore(
             max(1, int(fetch_worker_limit))
@@ -302,6 +304,7 @@ class SharedHiCacheTargetReuse:
         allocation = self.target_cache.alloc_page_aligned_device_indices(
             token_count,
             page_size=self.tree_cache.page_size,
+            reserve_tokens=self.target_reserve_tokens,
         )
         device_indices = allocation.device_indices
         if device_indices is None:
@@ -504,7 +507,9 @@ class SharedHiCacheTargetReuse:
                 outcome="skip",
                 reason="no_remaining_planned_blocks",
             )
-            return SharedHiCacheResult()
+            self._finished_plan_keys.add(plan_key)
+            self._finished_plan_prefix_lens[plan_key] = matched_tokens
+            return SharedHiCacheResult(prefix_len=matched_tokens)
 
         pending = self._pending_fetches.get(str(req.rid))
         if pending is not None:

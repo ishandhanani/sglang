@@ -60,10 +60,12 @@ class SharedHiCacheTarget:
         *,
         page_size: int,
         min_token_count: Optional[int] = None,
+        reserve_tokens: int = 0,
     ) -> SharedHiCacheDeviceAllocation:
         requested_tokens = max(0, int(token_count))
         min_token_count = page_size if min_token_count is None else min_token_count
         min_token_count = max(page_size, int(min_token_count))
+        reserve_tokens = max(0, int(reserve_tokens))
 
         available_tokens_before = self.available_device_tokens()
         if requested_tokens <= 0:
@@ -72,31 +74,38 @@ class SharedHiCacheTarget:
                 available_tokens_before=available_tokens_before,
             )
 
-        device_indices = self.alloc_device_indices(requested_tokens)
-        if device_indices is not None:
-            return SharedHiCacheDeviceAllocation(
-                device_indices=device_indices,
-                available_tokens_before=available_tokens_before,
-            )
-
-        evicted_tokens, available_tokens_after_evict = self._evict_device_tokens(
-            requested_tokens,
-            available_tokens_before=available_tokens_before,
-        )
-        if evicted_tokens > 0:
-            logger.info(
-                "Shared HiCache target staging evicted %d GPU KV tokens requested_tokens=%d available_tokens_before=%s available_tokens_after_evict=%s",
-                evicted_tokens,
-                requested_tokens,
-                available_tokens_before,
-                available_tokens_after_evict,
-            )
+        required_tokens = requested_tokens + reserve_tokens
+        if available_tokens_before is None or available_tokens_before >= required_tokens:
             device_indices = self.alloc_device_indices(requested_tokens)
             if device_indices is not None:
                 return SharedHiCacheDeviceAllocation(
                     device_indices=device_indices,
                     available_tokens_before=available_tokens_before,
                 )
+
+        evicted_tokens, available_tokens_after_evict = self._evict_device_tokens(
+            required_tokens,
+            available_tokens_before=available_tokens_before,
+        )
+        if evicted_tokens > 0:
+            logger.info(
+                "Shared HiCache target staging evicted %d GPU KV tokens requested_tokens=%d reserve_tokens=%d available_tokens_before=%s available_tokens_after_evict=%s",
+                evicted_tokens,
+                requested_tokens,
+                reserve_tokens,
+                available_tokens_before,
+                available_tokens_after_evict,
+            )
+            if (
+                available_tokens_after_evict is None
+                or available_tokens_after_evict >= required_tokens
+            ):
+                device_indices = self.alloc_device_indices(requested_tokens)
+                if device_indices is not None:
+                    return SharedHiCacheDeviceAllocation(
+                        device_indices=device_indices,
+                        available_tokens_before=available_tokens_before,
+                    )
 
         available_tokens = (
             available_tokens_after_evict
@@ -109,9 +118,17 @@ class SharedHiCacheTarget:
                 available_tokens_before=available_tokens_before,
             )
 
-        partial_tokens = min(requested_tokens, available_tokens)
+        staging_budget = max(0, available_tokens - reserve_tokens)
+        partial_tokens = min(requested_tokens, staging_budget)
         partial_tokens = (partial_tokens // page_size) * page_size
         if partial_tokens < min_token_count:
+            if reserve_tokens > 0:
+                logger.debug(
+                    "Shared HiCache skipped direct transfer; target reserve left no staging budget requested_tokens=%d reserve_tokens=%d available_tokens=%d",
+                    requested_tokens,
+                    reserve_tokens,
+                    available_tokens,
+                )
             return SharedHiCacheDeviceAllocation(
                 device_indices=None,
                 available_tokens_before=available_tokens_before,
