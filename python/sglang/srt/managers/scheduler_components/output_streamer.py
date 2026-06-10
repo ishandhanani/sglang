@@ -65,7 +65,9 @@ class SchedulerOutputStreamer:
             return
 
         req._shared_hicache_completion_logged = True
-        plan = getattr(req, "shared_hicache_plan", None)
+        plan = getattr(req, "shared_hicache_consumed_plan", None) or getattr(
+            req, "shared_hicache_plan", None
+        )
         logger.info(
             "SharedHiCache request consumed cached tokens "
             "rid=%s plan_id=%s source_worker_id=%s target_worker_id=%s "

@@ -888,6 +888,7 @@ class SharedHiCacheTargetReuse:
             req.shared_hicache_hit_length = (
                 getattr(req, "shared_hicache_hit_length", 0) + staged_tokens
             )
+            req.shared_hicache_consumed_plan = plan
             wait_ms = self._pending_wait_ms(pending)
             ready_wait_ms = self._pending_ready_wait_ms(pending)
             logger.info(

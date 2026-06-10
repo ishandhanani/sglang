@@ -762,6 +762,7 @@ class Req(ReqDllmMixin):
         self.routing_key = routing_key
         self.shared_hicache_plan = shared_hicache_plan
         self.shared_hicache_source_routes = shared_hicache_source_routes
+        self.shared_hicache_consumed_plan = None
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
