@@ -491,6 +491,7 @@ def execute_source_transfer_request(
             try:
                 transfer_backend.transfer_pages(
                     transfer_id=request.transfer_id,
+                    plan_id=request.plan.plan_id,
                     transferred_blocks=len(pages),
                     completion_reason=reason,
                     source_page_indices=source_page_indices,
@@ -507,7 +508,9 @@ def execute_source_transfer_request(
                 else:
                     failure_reason = "direct_transfer_failed"
                 logger.warning(
-                    "SharedHiCache source direct transfer failed pages=%d resolve_ms=%.3f transfer_ms=%.3f reason=%s",
+                    "SharedHiCache source direct transfer failed transfer_id=%s plan_id=%s pages=%d resolve_ms=%.3f transfer_ms=%.3f reason=%s",
+                    request.transfer_id,
+                    request.plan.plan_id,
                     len(pages),
                     resolve_ms,
                     transfer_ms,
@@ -526,7 +529,9 @@ def execute_source_transfer_request(
             transfer_ms = (time.perf_counter() - transfer_start) * 1000
         total_ms = (time.perf_counter() - total_start) * 1000
         logger.debug(
-            "SharedHiCache source transfer handled pages=%d reason=%s resolve_ms=%.3f transfer_ms=%.3f total_ms=%.3f",
+            "SharedHiCache source transfer handled transfer_id=%s plan_id=%s pages=%d reason=%s resolve_ms=%.3f transfer_ms=%.3f total_ms=%.3f",
+            request.transfer_id,
+            request.plan.plan_id,
             len(pages),
             reason,
             resolve_ms,

@@ -47,6 +47,7 @@ class SharedHiCacheTransferBackend(ABC):
         self,
         *,
         transfer_id: str,
+        plan_id: str,
         transferred_blocks: int,
         completion_reason: str,
         source_page_indices: np.ndarray,

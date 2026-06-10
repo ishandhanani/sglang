@@ -522,6 +522,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         self,
         *,
         transfer_id: str,
+        plan_id: str,
         transferred_blocks: int,
         completion_reason: str,
         source_page_indices: np.ndarray,
@@ -536,6 +537,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         self._transfer_pages_from_state(
             self._create_source_worker_state(),
             transfer_id=transfer_id,
+            plan_id=plan_id,
             transferred_blocks=transferred_blocks,
             completion_reason=completion_reason,
             source_page_indices=source_page_indices,
@@ -551,6 +553,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         source_state: _NixlSourceWorkerState,
         *,
         transfer_id: str,
+        plan_id: str,
         transferred_blocks: int,
         completion_reason: str,
         source_page_indices: np.ndarray,
@@ -618,8 +621,10 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         self._wait_for_transfer(source_state.agent, handle)
         transfer_ms = (time.perf_counter() - start) * 1000
         logger.info(
-            "SharedHiCache NIXL transferred blocks=%d slices=%d bytes=%d "
+            "SharedHiCache NIXL transferred transfer_id=%s plan_id=%s blocks=%d slices=%d bytes=%d "
             "ms=%.3f setup_ms=%.3f source_agent=%s prepped=true",
+            transfer_id,
+            plan_id,
             len(source_page_indices),
             int(source_indices.size),
             int(len(source_page_indices) * sum(source_state.source_kv_item_lens)),
@@ -650,6 +655,7 @@ class _NixlSourceTransferWorker:
         self,
         *,
         transfer_id: str,
+        plan_id: str,
         transferred_blocks: int,
         completion_reason: str,
         source_page_indices: np.ndarray,
@@ -662,6 +668,7 @@ class _NixlSourceTransferWorker:
         self._owner._transfer_pages_from_state(
             self._state,
             transfer_id=transfer_id,
+            plan_id=plan_id,
             transferred_blocks=transferred_blocks,
             completion_reason=completion_reason,
             source_page_indices=source_page_indices,
