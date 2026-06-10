@@ -70,12 +70,14 @@ class SchedulerOutputStreamer:
         )
         logger.info(
             "SharedHiCache request consumed cached tokens "
-            "rid=%s plan_id=%s source_worker_id=%s target_worker_id=%s "
+            "rid=%s plan_id=%s x_request_id=%s "
+            "source_worker_id=%s target_worker_id=%s "
             "start_block_index=%s planned_prefix_blocks=%s "
             "shared_hicache_tokens=%s device_tokens=%s host_tokens=%s "
             "storage_tokens=%s cached_tokens_total=%s",
             req.rid,
             getattr(plan, "plan_id", None),
+            getattr(plan, "x_request_id", None),
             getattr(plan, "source_worker_id", None),
             getattr(plan, "target_worker_id", None),
             getattr(plan, "start_block_index", None),

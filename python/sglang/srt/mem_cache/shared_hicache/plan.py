@@ -45,6 +45,7 @@ class SharedHiCachePlan:
     plan_version: int
     source_tp_size: int
     target_tp_size: int
+    x_request_id: Optional[str] = None
     source_tp_rank: Optional[int] = None
     target_tp_rank: Optional[int] = None
 
@@ -97,6 +98,11 @@ class SharedHiCachePlan:
             return cls(
                 plan_id=str(data["plan_id"]),
                 request_id=str(data["request_id"]),
+                x_request_id=(
+                    None
+                    if data.get("x_request_id") is None
+                    else str(data.get("x_request_id"))
+                ),
                 target_worker_id=str(data["target_worker_id"]),
                 source_worker_id=str(data["source_worker_id"]),
                 source_medium=str(data["source_medium"]),
@@ -117,7 +123,7 @@ class SharedHiCachePlan:
             raise ValueError(f"SharedHiCache plan missing {err.args[0]}") from err
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "plan_id": self.plan_id,
             "request_id": self.request_id,
             "target_worker_id": self.target_worker_id,
@@ -136,6 +142,9 @@ class SharedHiCachePlan:
             "target_tp_rank": self.target_tp_rank,
             "target_tp_size": self.target_tp_size,
         }
+        if self.x_request_id is not None:
+            data["x_request_id"] = self.x_request_id
+        return data
 
     @property
     def planned_router_block_hashes(self) -> tuple[int, ...]:

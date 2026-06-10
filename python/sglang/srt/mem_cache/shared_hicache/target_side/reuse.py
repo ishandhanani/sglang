@@ -202,9 +202,11 @@ class SharedHiCacheTargetReuse:
 
         backend = self.direct_transfer.name
         plan_id = "unknown"
+        x_request_id = None
         source_worker = "unknown"
         if isinstance(plan, SharedHiCachePlan):
             plan_id = plan.plan_id
+            x_request_id = plan.x_request_id
             source_worker = plan.source_worker_id
             plan_key = self._plan_key(req, plan)
             if plan_key in self._finished_plan_keys:
@@ -212,9 +214,11 @@ class SharedHiCacheTargetReuse:
             self._finished_plan_keys.add(plan_key)
 
         logger.debug(
-            "Skipping shared HiCache plan rid=%s plan_id=%s reason=%s source_worker=%s",
+            "Skipping shared HiCache plan rid=%s plan_id=%s x_request_id=%s "
+            "reason=%s source_worker=%s",
             req.rid,
             plan_id,
+            x_request_id,
             reason,
             source_worker,
         )
@@ -327,8 +331,10 @@ class SharedHiCacheTargetReuse:
         )
         if not source_control_endpoint:
             logger.warning(
-                "Shared HiCache source route unavailable plan_id=%s source_worker=%s source_tp_rank=%s",
+                "Shared HiCache source route unavailable plan_id=%s x_request_id=%s "
+                "source_worker=%s source_tp_rank=%s",
                 plan.plan_id,
+                plan.x_request_id,
                 plan.source_worker_id,
                 source_tp_rank,
             )
@@ -620,10 +626,11 @@ class SharedHiCacheTargetReuse:
             )
             logger.exception(
                 "Shared HiCache direct transfer submit failed; falling back to local prefill "
-                "rid=%s plan_id=%s source_worker=%s start_block=%d max_blocks=%d "
-                "token_count=%d",
+                "rid=%s plan_id=%s x_request_id=%s source_worker=%s "
+                "start_block=%d max_blocks=%d token_count=%d",
                 req.rid,
                 plan.plan_id,
+                plan.x_request_id,
                 plan.source_worker_id,
                 plan_offset,
                 max_blocks,
@@ -650,11 +657,12 @@ class SharedHiCacheTargetReuse:
                 )
             logger.info(
                 "Shared HiCache direct submit unavailable "
-                "rid=%s plan_id=%s reason=%s source_worker=%s start_block=%d "
-                "max_blocks=%d token_count=%d host_hit_length=%d "
+                "rid=%s plan_id=%s x_request_id=%s reason=%s source_worker=%s "
+                "start_block=%d max_blocks=%d token_count=%d host_hit_length=%d "
                 "available_tokens_before=%s",
                 req.rid,
                 plan.plan_id,
+                plan.x_request_id,
                 direct_submit_reason,
                 plan.source_worker_id,
                 plan_offset,
@@ -673,11 +681,12 @@ class SharedHiCacheTargetReuse:
             shortfall_tokens = token_count - submitted_tokens
             logger.info(
                 "Shared HiCache target staging partially granted "
-                "rid=%s plan_id=%s source_worker=%s start_block=%d "
+                "rid=%s plan_id=%s x_request_id=%s source_worker=%s start_block=%d "
                 "requested_blocks=%d granted_blocks=%d requested_tokens=%d "
                 "granted_tokens=%d failed_tokens=%d available_tokens_before=%s",
                 req.rid,
                 plan.plan_id,
+                plan.x_request_id,
                 plan.source_worker_id,
                 plan_offset,
                 max_blocks,
@@ -778,7 +787,10 @@ class SharedHiCacheTargetReuse:
         except Exception:
             self.target_transfer_tracker.finish(pending.transfer.transfer_id)
             logger.exception(
-                "Shared HiCache fetch failed rid=%s plan_id=%s", req.rid, plan.plan_id
+                "Shared HiCache fetch failed rid=%s plan_id=%s x_request_id=%s",
+                req.rid,
+                plan.plan_id,
+                plan.x_request_id,
             )
             return self._finish_terminal_pending_fetch(
                 req,
@@ -791,9 +803,11 @@ class SharedHiCacheTargetReuse:
 
         if not pages:
             logger.debug(
-                "Shared HiCache source returned no pages rid=%s plan_id=%s reason=%s",
+                "Shared HiCache source returned no pages rid=%s plan_id=%s "
+                "x_request_id=%s reason=%s",
                 req.rid,
                 plan.plan_id,
+                plan.x_request_id,
                 reason,
             )
             indeterminate_transfer = str(reason).startswith(
@@ -811,9 +825,11 @@ class SharedHiCacheTargetReuse:
 
         if len(pages) > len(pending.expected_hashes):
             logger.warning(
-                "Shared HiCache source returned too many pages rid=%s plan_id=%s pages=%d expected=%d",
+                "Shared HiCache source returned too many pages rid=%s plan_id=%s "
+                "x_request_id=%s pages=%d expected=%d",
                 req.rid,
                 plan.plan_id,
+                plan.x_request_id,
                 len(pages),
                 len(pending.expected_hashes),
             )
@@ -829,9 +845,11 @@ class SharedHiCacheTargetReuse:
         expected_hashes = pending.expected_hashes[: len(pages)]
         if tuple(page.block_hash for page in pages) != expected_hashes:
             logger.warning(
-                "Shared HiCache source returned non-contiguous pages rid=%s plan_id=%s",
+                "Shared HiCache source returned non-contiguous pages "
+                "rid=%s plan_id=%s x_request_id=%s",
                 req.rid,
                 plan.plan_id,
+                plan.x_request_id,
             )
             return self._finish_terminal_pending_fetch(
                 req,
@@ -864,9 +882,10 @@ class SharedHiCacheTargetReuse:
         except Exception:
             insert_ms = (time.perf_counter() - insert_start) * 1000
             logger.exception(
-                "Shared HiCache insert failed rid=%s plan_id=%s",
+                "Shared HiCache insert failed rid=%s plan_id=%s x_request_id=%s",
                 req.rid,
                 plan.plan_id,
+                plan.x_request_id,
             )
             return self._finish_terminal_pending_fetch(
                 req,
@@ -892,10 +911,13 @@ class SharedHiCacheTargetReuse:
             wait_ms = self._pending_wait_ms(pending)
             ready_wait_ms = self._pending_ready_wait_ms(pending)
             logger.info(
-                "Shared HiCache staged %d tokens rid=%s plan_id=%s source_worker=%s fetched_tokens=%d prefix_len=%d wait_ms=%s ready_wait_ms=%s insert_ms=%.3f direct=%s",
+                "Shared HiCache staged %d tokens rid=%s plan_id=%s x_request_id=%s "
+                "source_worker=%s fetched_tokens=%d prefix_len=%d wait_ms=%s "
+                "ready_wait_ms=%s insert_ms=%.3f direct=%s",
                 staged_tokens,
                 req.rid,
                 plan.plan_id,
+                plan.x_request_id,
                 plan.source_worker_id,
                 fetched_tokens,
                 prefix_len,

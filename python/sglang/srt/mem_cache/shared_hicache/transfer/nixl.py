@@ -531,6 +531,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         target_kv_item_lens: list[int],
         target_num_pages: int,
         target_metadata: Optional[Mapping[str, Any]] = None,
+        x_request_id: Optional[str] = None,
     ) -> None:
         if self._shutdown:
             raise RuntimeError("NIXL direct KV transfer backend is not enabled")
@@ -546,6 +547,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             target_kv_item_lens=target_kv_item_lens,
             target_num_pages=target_num_pages,
             target_metadata=target_metadata,
+            x_request_id=x_request_id,
         )
 
     def _transfer_pages_from_state(
@@ -562,6 +564,7 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         target_kv_item_lens: list[int],
         target_num_pages: int,
         target_metadata: Optional[Mapping[str, Any]] = None,
+        x_request_id: Optional[str] = None,
     ) -> None:
         if self._shutdown:
             raise RuntimeError("NIXL direct KV transfer backend is not enabled")
@@ -621,10 +624,12 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         self._wait_for_transfer(source_state.agent, handle)
         transfer_ms = (time.perf_counter() - start) * 1000
         logger.info(
-            "SharedHiCache NIXL transferred transfer_id=%s plan_id=%s blocks=%d slices=%d bytes=%d "
-            "ms=%.3f setup_ms=%.3f source_agent=%s prepped=true",
+            "SharedHiCache NIXL transferred transfer_id=%s plan_id=%s "
+            "x_request_id=%s blocks=%d slices=%d bytes=%d ms=%.3f "
+            "setup_ms=%.3f source_agent=%s prepped=true",
             transfer_id,
             plan_id,
+            x_request_id,
             len(source_page_indices),
             int(source_indices.size),
             int(len(source_page_indices) * sum(source_state.source_kv_item_lens)),
@@ -664,6 +669,7 @@ class _NixlSourceTransferWorker:
         target_kv_item_lens: list[int],
         target_num_pages: int,
         target_metadata: Optional[Mapping[str, Any]] = None,
+        x_request_id: Optional[str] = None,
     ) -> None:
         self._owner._transfer_pages_from_state(
             self._state,
@@ -677,4 +683,5 @@ class _NixlSourceTransferWorker:
             target_kv_item_lens=target_kv_item_lens,
             target_num_pages=target_num_pages,
             target_metadata=target_metadata,
+            x_request_id=x_request_id,
         )

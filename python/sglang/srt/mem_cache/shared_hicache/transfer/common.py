@@ -56,6 +56,7 @@ class SharedHiCacheTransferBackend(ABC):
         target_kv_item_lens: list[int],
         target_num_pages: int,
         target_metadata: Optional[Mapping[str, Any]] = None,
+        x_request_id: Optional[str] = None,
     ) -> None: ...
 
     def shutdown(self) -> None:
