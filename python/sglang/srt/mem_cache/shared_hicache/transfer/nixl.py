@@ -132,6 +132,13 @@ def _create_nixl_agent(*, transfer_parallelism: int):
     return agent, agent_name, backend
 
 
+def _metadata_log_value(metadata: Optional[Mapping[str, Any]], field_name: str) -> Any:
+    if not isinstance(metadata, Mapping):
+        return "n/a"
+    value = metadata.get(field_name)
+    return "n/a" if value is None else value
+
+
 def _num_pages_from_buf_infos(
     data_lens: list[int], item_lens: list[int], *, label: str
 ) -> int:
@@ -318,12 +325,16 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         )
         return descriptor
 
+    def local_gpu_id(self) -> int:
+        return self._gpu_id
+
     def _log_ready(self) -> None:
         logger.info(
             "SharedHiCache NIXL direct transfer enabled agent=%s backend=%s "
-            "gpu_id=%d parallelism=%d",
+            "tp_rank=%d gpu_id=%d parallelism=%d",
             self.agent_name,
             self.backend_name,
+            self.topology.tp_rank,
             self._gpu_id,
             self._transfer_parallelism,
         )
@@ -397,9 +408,11 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         )
         logger.info(
             "SharedHiCache NIXL source transfer worker enabled agent=%s backend=%s "
-            "thread=%d parallelism=%d source_pages=%d",
+            "tp_rank=%d gpu_id=%d thread=%d parallelism=%d source_pages=%d",
             agent_name,
             backend_name,
+            self.topology.tp_rank,
+            self._gpu_id,
             threading.get_ident(),
             self._transfer_parallelism,
             source_num_pages,
@@ -626,7 +639,8 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
         logger.info(
             "SharedHiCache NIXL transferred transfer_id=%s plan_id=%s "
             "x_request_id=%s blocks=%d slices=%d bytes=%d ms=%.3f "
-            "setup_ms=%.3f source_agent=%s prepped=true",
+            "setup_ms=%.3f source_agent=%s source_tp_rank=%d source_gpu_id=%d "
+            "target_tp_rank=%s target_gpu_id=%s prepped=true",
             transfer_id,
             plan_id,
             x_request_id,
@@ -636,6 +650,10 @@ class NixlSharedHiCacheTransferBackend(SharedHiCacheTransferBackend):
             transfer_ms,
             setup_ms,
             source_state.agent_name,
+            self.topology.tp_rank,
+            self._gpu_id,
+            _metadata_log_value(target_metadata, "tp_rank"),
+            _metadata_log_value(target_metadata, "gpu_id"),
         )
 
     def shutdown(self) -> None:

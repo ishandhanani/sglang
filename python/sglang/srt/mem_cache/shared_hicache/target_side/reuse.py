@@ -912,13 +912,21 @@ class SharedHiCacheTargetReuse:
             ready_wait_ms = self._pending_ready_wait_ms(pending)
             logger.info(
                 "Shared HiCache staged %d tokens rid=%s plan_id=%s x_request_id=%s "
-                "source_worker=%s fetched_tokens=%d prefix_len=%d wait_ms=%s "
+                "source_worker=%s source_tp_rank=%s target_tp_rank=%d "
+                "target_gpu_id=%s fetched_tokens=%d prefix_len=%d wait_ms=%s "
                 "ready_wait_ms=%s insert_ms=%.3f direct=%s",
                 staged_tokens,
                 req.rid,
                 plan.plan_id,
                 plan.x_request_id,
                 plan.source_worker_id,
+                (
+                    plan.source_tp_rank
+                    if plan.source_tp_rank is not None
+                    else self.topology.tp_rank
+                ),
+                self.topology.tp_rank,
+                self.direct_transfer.local_gpu_id(),
                 fetched_tokens,
                 prefix_len,
                 "n/a" if wait_ms is None else f"{wait_ms:.3f}",

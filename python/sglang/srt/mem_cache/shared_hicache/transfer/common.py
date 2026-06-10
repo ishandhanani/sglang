@@ -39,6 +39,9 @@ class SharedHiCacheTransferBackend(ABC):
             **self.topology.to_dict(),
         }
 
+    def local_gpu_id(self) -> Optional[int]:
+        return None
+
     def create_source_worker(self):
         return self
 

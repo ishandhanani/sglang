@@ -80,8 +80,10 @@ class SharedHiCacheSourceTransferQueue:
             return
 
         logger.info(
-            "SharedHiCache source transfer worker ready tp_rank=%d worker_index=%d",
+            "SharedHiCache source transfer worker ready tp_rank=%d gpu_id=%s "
+            "worker_index=%d",
             self.topology.tp_rank,
+            self.transfer_backend.local_gpu_id(),
             index,
         )
         ready.put(None)
