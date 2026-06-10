@@ -342,6 +342,7 @@ class Scheduler(
         )
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self._skip_next_prefill_hicache_event_check = False
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.enable_decode_hicache = (
             server_args.disaggregation_decode_enable_radix_cache
@@ -1464,6 +1465,10 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            if self.enable_hierarchical_cache:
+                self.tree_cache.check_hicache_events()
+                self._skip_next_prefill_hicache_event_check = True
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -2588,7 +2593,10 @@ class Scheduler(
                 self._add_request_to_queue(req)
 
         if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
+            if self._skip_next_prefill_hicache_event_check:
+                self._skip_next_prefill_hicache_event_check = False
+            else:
+                self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
