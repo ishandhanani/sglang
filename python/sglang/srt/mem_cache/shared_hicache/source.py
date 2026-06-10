@@ -1,0 +1,559 @@
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass
+from typing import Any, Iterable, Mapping, Optional
+
+import numpy as np
+
+from sglang.srt.mem_cache.radix_cache import TreeNode
+from sglang.srt.mem_cache.shared_hicache.plan import (
+    SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
+    SHARED_HICACHE_SOURCE_MEDIUM,
+    SharedHiCachePlan,
+)
+from sglang.srt.mem_cache.shared_hicache.topology import (
+    SharedHiCacheTopology,
+)
+from sglang.srt.mem_cache.shared_hicache.transfer.common import (
+    SharedHiCacheTransferBackend,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ResolvedHostPage:
+    block_hash: int
+
+
+@dataclass(frozen=True)
+class ResolvedHostPageLocation:
+    block_hash: int
+    host_index: int
+
+
+@dataclass(frozen=True)
+class SourceTransferRequest:
+    transfer_id: str
+    target_control_endpoint: str
+    plan: SharedHiCachePlan
+    start_block: int
+    max_blocks: int
+    target_kv_ptrs: list[int]
+    target_kv_item_lens: list[int]
+    target_num_pages: int
+    target_metadata: Any
+    target_tp_rank: Optional[int]
+    target_tp_size: Optional[int]
+    target_page_indices: list[int]
+
+
+def _lookup_hicache_host_blocks(
+    tree_cache, wanted_hashes: set[int]
+) -> tuple[dict[int, tuple[TreeNode, int, str]], list[TreeNode], Optional[str]]:
+    lookup_index = getattr(tree_cache, "lookup_hicache_host_blocks", None)
+    if not callable(lookup_index):
+        return {}, [], "hicache_host_lookup_unavailable"
+    lookup_result = lookup_index(wanted_hashes, protect=True)
+    if not isinstance(lookup_result, tuple) or len(lookup_result) != 2:
+        return {}, [], "malformed_hicache_host_lookup"
+    index, protected_nodes = lookup_result
+    if not isinstance(index, dict):
+        return {}, list(protected_nodes or []), "malformed_hicache_host_lookup"
+    return index, list(protected_nodes or []), None
+
+
+def _host_page_start_indices(
+    entries: list[tuple[int, TreeNode, int]], page_size: int
+) -> list[int]:
+    host_indices = [0] * len(entries)
+    grouped_entries: dict[int, tuple[TreeNode, list[tuple[int, int]]]] = {}
+    for output_idx, (_, node, page_idx) in enumerate(entries):
+        group = grouped_entries.get(node.id)
+        if group is None:
+            grouped_entries[node.id] = (node, [(output_idx, page_idx)])
+        else:
+            group[1].append((output_idx, page_idx))
+
+    for node, refs in grouped_entries.values():
+        offsets = [page_idx * page_size for _, page_idx in refs]
+        starts = node.host_value[offsets].detach().cpu().tolist()
+        for (output_idx, _), host_index in zip(refs, starts):
+            host_indices[output_idx] = int(host_index)
+
+    return host_indices
+
+
+def resolve_host_page_locations(
+    tree_cache,
+    plan: SharedHiCachePlan,
+    *,
+    start_block: int,
+    max_blocks: int,
+    worker_id: str,
+    topology: SharedHiCacheTopology,
+    target_tp_rank: Optional[int] = None,
+    target_tp_size: Optional[int] = None,
+) -> tuple[list[ResolvedHostPageLocation], str, list[TreeNode]]:
+    if plan.source_worker_id != worker_id:
+        return [], "wrong_source_worker", []
+    rank_rejection = topology.validate_source_rank(
+        plan,
+        target_tp_rank=target_tp_rank,
+        target_tp_size=target_tp_size,
+    )
+    if rank_rejection is not None:
+        return [], rank_rejection, []
+    if plan.is_expired():
+        return [], "plan_expired", []
+    if plan.source_medium != SHARED_HICACHE_SOURCE_MEDIUM:
+        return [], "unsupported_source_medium", []
+    if plan.block_size_tokens != tree_cache.page_size:
+        return [], "incompatible_block_size", []
+
+    if start_block < 0 or max_blocks <= 0:
+        return [], "empty_request", []
+
+    router_hashes = plan.planned_router_block_hashes
+    engine_hashes = plan.planned_engine_block_hashes
+    if start_block >= len(router_hashes):
+        return [], "already_local", []
+
+    requested_router_hashes = router_hashes[start_block : start_block + max_blocks]
+    requested_engine_hashes = engine_hashes[start_block : start_block + max_blocks]
+    entries: list[tuple[int, TreeNode, int]] = []
+    block_index, protected_nodes, lookup_error = _lookup_hicache_host_blocks(
+        tree_cache, set(requested_engine_hashes)
+    )
+    if lookup_error is not None:
+        return [], lookup_error, protected_nodes
+
+    protected_ids = {node.id for node in protected_nodes}
+    reason = "ok"
+    for router_hash, engine_hash in zip(
+        requested_router_hashes, requested_engine_hashes
+    ):
+        entry = block_index.get(engine_hash)
+        if entry is None:
+            reason = "partial" if entries else "missing_first_block"
+            break
+        node, page_idx, _ = entry
+        if node.id not in protected_ids:
+            return [], "unprotected_hicache_host_lookup", protected_nodes
+        entries.append((router_hash, node, page_idx))
+
+    pages = [
+        ResolvedHostPageLocation(
+            block_hash=router_hash,
+            host_index=host_index,
+        )
+        for (router_hash, _, _), host_index in zip(
+            entries,
+            _host_page_start_indices(entries, tree_cache.page_size),
+        )
+    ]
+    if reason != "ok":
+        return pages, reason, protected_nodes
+
+    return pages, "ok", protected_nodes
+
+
+def release_protected_host_nodes(nodes: Iterable[TreeNode]) -> None:
+    for node in nodes:
+        try:
+            node.release_host()
+        except RuntimeError:
+            logger.exception(
+                "Failed to release shared HiCache source host page protection"
+            )
+
+
+def _coerce_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an integer, got {value!r}")
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    raise ValueError(f"{field_name} must be an integer, got {value!r}")
+
+
+def _coerce_transfer_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name}_contains_non_integer")
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    raise ValueError(f"{field_name}_contains_non_integer")
+
+
+def _coerce_transfer_int_list(raw: Any, field_name: str) -> list[int]:
+    if isinstance(raw, (str, bytes, Mapping)):
+        raise ValueError(f"{field_name}_must_be_array")
+    try:
+        values = list(raw)
+    except TypeError as err:
+        raise ValueError(f"{field_name}_must_be_array") from err
+    return [
+        _coerce_transfer_int(value, f"{field_name}[{idx}]")
+        for idx, value in enumerate(values)
+    ]
+
+
+def _target_metadata_int(
+    metadata: Any,
+    field_name: str,
+) -> Optional[int]:
+    if not isinstance(metadata, Mapping) or field_name not in metadata:
+        return None
+    return _coerce_transfer_int(metadata[field_name], f"target_metadata.{field_name}")
+
+
+def _is_timeout_error(err: BaseException) -> bool:
+    if isinstance(err, TimeoutError):
+        return True
+    return "timed out" in str(err).lower()
+
+
+def _parse_target_kv_metadata(
+    payload: Mapping[str, Any], transfer_backend: SharedHiCacheTransferBackend
+) -> tuple[
+    Optional[list[int]],
+    Optional[list[int]],
+    Optional[int],
+    Optional[str],
+]:
+    try:
+        target_session_id_raw = payload["target_session_id"]
+        target_kv_ptrs_raw = payload["target_kv_ptrs"]
+        target_kv_item_lens_raw = payload["target_kv_item_lens"]
+    except KeyError as err:
+        return None, None, None, f"target_kv_metadata_missing:{err}"
+
+    target_session_id = str(target_session_id_raw)
+    if not target_session_id or target_session_id_raw is None:
+        return None, None, None, "target_session_id_empty"
+    target_metadata = payload.get("target_metadata")
+    if isinstance(target_metadata, Mapping) and "session_id" in target_metadata:
+        metadata_session_id = str(target_metadata["session_id"])
+        if not metadata_session_id or target_metadata["session_id"] is None:
+            return None, None, None, "target_metadata_session_id_empty"
+        if metadata_session_id != target_session_id:
+            return None, None, None, "target_session_id_mismatch"
+
+    try:
+        target_kv_ptrs = _coerce_transfer_int_list(target_kv_ptrs_raw, "target_kv_ptrs")
+        target_kv_item_lens = _coerce_transfer_int_list(
+            target_kv_item_lens_raw, "target_kv_item_lens"
+        )
+    except ValueError as err:
+        return None, None, None, str(err)
+
+    if not target_kv_ptrs:
+        return None, None, None, "target_kv_ptrs_empty"
+    if len(target_kv_ptrs) != len(target_kv_item_lens):
+        return (
+            None,
+            None,
+            None,
+            "target_kv_item_lens_count_mismatch",
+        )
+
+    uint64_max = int(np.iinfo(np.uint64).max)
+    if any(ptr <= 0 or ptr > uint64_max for ptr in target_kv_ptrs):
+        return None, None, None, "target_kv_ptr_out_of_range"
+    if any(length <= 0 or length > uint64_max for length in target_kv_item_lens):
+        return None, None, None, "target_kv_item_len_out_of_range"
+
+    if len(transfer_backend.target_kv_item_lens) != len(target_kv_item_lens):
+        return (
+            None,
+            None,
+            None,
+            "target_kv_item_lens_count_mismatch",
+        )
+    for expected, actual in zip(
+        transfer_backend.target_kv_item_lens, target_kv_item_lens
+    ):
+        if expected != actual:
+            return None, None, None, "target_kv_item_lens_mismatch"
+
+    try:
+        target_num_pages = _target_metadata_int(target_metadata, "target_num_pages")
+    except ValueError as err:
+        return None, None, None, str(err)
+    if target_num_pages is None:
+        return None, None, None, "target_num_pages_missing"
+    if target_num_pages <= 0:
+        return None, None, None, "target_num_pages_out_of_range"
+
+    return target_kv_ptrs, target_kv_item_lens, target_num_pages, None
+
+
+def parse_source_transfer_request(
+    *,
+    payload: Mapping[str, Any],
+    transfer_backend: SharedHiCacheTransferBackend,
+    tree_cache,
+) -> tuple[Optional[SourceTransferRequest], Optional[Mapping[str, Any]]]:
+    if "transfer_backend" not in payload:
+        return None, {
+            "ok": False,
+            "reason": "malformed_transfer_request:missing_transfer_backend",
+        }
+    requested_backend = str(payload["transfer_backend"]).lower()
+    if requested_backend != transfer_backend.name:
+        return None, {
+            "ok": False,
+            "reason": (
+                f"unsupported_transfer_backend:{requested_backend}:"
+                f"local={transfer_backend.name}"
+            ),
+        }
+
+    try:
+        transfer_id = str(payload["transfer_id"])
+    except KeyError:
+        transfer_id = ""
+    if not transfer_id:
+        return None, {
+            "ok": False,
+            "reason": "malformed_transfer_request:missing_transfer_id",
+            "block_size_tokens": tree_cache.page_size,
+        }
+    try:
+        target_control_endpoint = str(payload["target_control_endpoint"])
+    except KeyError:
+        target_control_endpoint = ""
+    if not target_control_endpoint:
+        return None, {
+            "ok": False,
+            "reason": "malformed_transfer_request:missing_target_control_endpoint",
+            "transfer_id": transfer_id,
+            "block_size_tokens": tree_cache.page_size,
+        }
+    try:
+        plan = SharedHiCachePlan.from_dict(payload["plan"])
+    except (KeyError, ValueError) as err:
+        return None, {
+            "ok": False,
+            "reason": f"malformed_transfer_request:plan:{err}",
+        }
+    try:
+        start_block = _coerce_int(payload["start_block"], "start_block")
+        max_blocks = _coerce_int(payload["max_blocks"], "max_blocks")
+    except KeyError as err:
+        return None, {
+            "ok": False,
+            "reason": f"malformed_transfer_request:missing_{err.args[0]}",
+            "block_size_tokens": tree_cache.page_size,
+        }
+    except ValueError as err:
+        return None, {
+            "ok": False,
+            "reason": f"malformed_transfer_request:{err}",
+            "block_size_tokens": tree_cache.page_size,
+        }
+
+    (
+        target_kv_ptrs,
+        target_kv_item_lens,
+        target_num_pages,
+        target_kv_metadata_error,
+    ) = _parse_target_kv_metadata(payload, transfer_backend)
+    if target_kv_metadata_error is not None:
+        return None, {
+            "ok": False,
+            "reason": f"malformed_transfer_request:{target_kv_metadata_error}",
+            "block_size_tokens": tree_cache.page_size,
+        }
+    target_metadata = payload.get("target_metadata")
+    try:
+        target_tp_rank = _target_metadata_int(target_metadata, "tp_rank")
+        target_tp_size = _target_metadata_int(target_metadata, "tp_size")
+    except ValueError as err:
+        return None, {
+            "ok": False,
+            "reason": f"malformed_transfer_request:{err}",
+            "block_size_tokens": tree_cache.page_size,
+        }
+    try:
+        target_page_indices_list = _coerce_transfer_int_list(
+            payload["target_page_indices"], "target_page_indices"
+        )
+    except KeyError as err:
+        return None, {
+            "ok": False,
+            "reason": f"malformed_transfer_request:target_page_indices_missing:{err}",
+            "block_size_tokens": tree_cache.page_size,
+        }
+    except ValueError as err:
+        return None, {
+            "ok": False,
+            "reason": f"malformed_transfer_request:{err}",
+            "block_size_tokens": tree_cache.page_size,
+        }
+    max_int32 = np.iinfo(np.int32).max
+    if any(idx < 0 or idx > max_int32 for idx in target_page_indices_list):
+        return None, {
+            "ok": False,
+            "reason": "malformed_transfer_request:target_page_index_out_of_range",
+            "block_size_tokens": tree_cache.page_size,
+        }
+    if any(idx >= target_num_pages for idx in target_page_indices_list):
+        return None, {
+            "ok": False,
+            "reason": "malformed_transfer_request:target_page_index_out_of_range",
+            "block_size_tokens": tree_cache.page_size,
+        }
+
+    return (
+        SourceTransferRequest(
+            transfer_id=transfer_id,
+            target_control_endpoint=target_control_endpoint,
+            plan=plan,
+            start_block=start_block,
+            max_blocks=max_blocks,
+            target_kv_ptrs=target_kv_ptrs,
+            target_kv_item_lens=target_kv_item_lens,
+            target_num_pages=target_num_pages,
+            target_metadata=target_metadata,
+            target_tp_rank=target_tp_rank,
+            target_tp_size=target_tp_size,
+            target_page_indices=target_page_indices_list,
+        ),
+        None,
+    )
+
+
+def execute_source_transfer_request(
+    *,
+    request: SourceTransferRequest,
+    transfer_backend: SharedHiCacheTransferBackend,
+    tree_cache,
+    worker_id: str,
+    topology: SharedHiCacheTopology,
+) -> Mapping[str, Any]:
+    total_start = time.perf_counter()
+    resolve_start = total_start
+    pages, reason, protected_nodes = resolve_host_page_locations(
+        tree_cache,
+        request.plan,
+        start_block=request.start_block,
+        max_blocks=request.max_blocks,
+        worker_id=worker_id,
+        topology=topology,
+        target_tp_rank=request.target_tp_rank,
+        target_tp_size=request.target_tp_size,
+    )
+    resolve_ms = (time.perf_counter() - resolve_start) * 1000
+    transfer_ms = 0.0
+    transfer_bytes = 0
+    try:
+        if pages:
+            page_size = tree_cache.page_size
+            source_page_indices_list: list[int] = []
+            max_int32 = np.iinfo(np.int32).max
+            for page in pages:
+                host_index = int(page.host_index)
+                if host_index < 0:
+                    return {
+                        "ok": False,
+                        "reason": "source_host_page_index_out_of_range",
+                        "block_size_tokens": tree_cache.page_size,
+                    }
+                if host_index % page_size != 0:
+                    return {
+                        "ok": False,
+                        "reason": "source_host_page_index_unaligned",
+                        "block_size_tokens": tree_cache.page_size,
+                    }
+                page_index = host_index // page_size
+                if page_index > max_int32:
+                    return {
+                        "ok": False,
+                        "reason": "source_page_index_out_of_range",
+                        "block_size_tokens": tree_cache.page_size,
+                    }
+                source_page_indices_list.append(page_index)
+            source_page_indices = np.array(source_page_indices_list, dtype=np.int32)
+            transfer_bytes = len(pages) * sum(
+                int(x) for x in request.target_kv_item_lens
+            )
+            if len(request.target_page_indices) < len(pages):
+                return {
+                    "ok": False,
+                    "reason": "malformed_transfer_request:target_page_indices_too_short",
+                    "block_size_tokens": tree_cache.page_size,
+                }
+            target_page_indices_list = request.target_page_indices[: len(pages)]
+            target_page_indices = np.array(target_page_indices_list, dtype=np.int32)
+            transfer_start = time.perf_counter()
+            try:
+                transfer_backend.transfer_pages(
+                    transfer_id=request.transfer_id,
+                    plan_id=request.plan.plan_id,
+                    transferred_blocks=len(pages),
+                    completion_reason=reason,
+                    source_page_indices=source_page_indices,
+                    target_page_indices=target_page_indices,
+                    target_kv_ptrs=request.target_kv_ptrs,
+                    target_kv_item_lens=request.target_kv_item_lens,
+                    target_num_pages=request.target_num_pages,
+                    target_metadata=request.target_metadata,
+                    x_request_id=request.plan.x_request_id,
+                )
+            except Exception as err:
+                transfer_ms = (time.perf_counter() - transfer_start) * 1000
+                if _is_timeout_error(err):
+                    failure_reason = SHARED_HICACHE_DIRECT_TIMEOUT_REASON
+                else:
+                    failure_reason = "direct_transfer_failed"
+                logger.warning(
+                    "SharedHiCache source direct transfer failed transfer_id=%s "
+                    "plan_id=%s x_request_id=%s pages=%d resolve_ms=%.3f "
+                    "transfer_ms=%.3f reason=%s",
+                    request.transfer_id,
+                    request.plan.plan_id,
+                    request.plan.x_request_id,
+                    len(pages),
+                    resolve_ms,
+                    transfer_ms,
+                    err,
+                    exc_info=True,
+                )
+                return {
+                    "ok": False,
+                    "reason": failure_reason,
+                    "block_size_tokens": tree_cache.page_size,
+                    "resolve_ms": resolve_ms,
+                    "transfer_ms": transfer_ms,
+                    "total_ms": (time.perf_counter() - total_start) * 1000,
+                    "transfer_bytes": transfer_bytes,
+                }
+            transfer_ms = (time.perf_counter() - transfer_start) * 1000
+        total_ms = (time.perf_counter() - total_start) * 1000
+        logger.debug(
+            "SharedHiCache source transfer handled transfer_id=%s plan_id=%s "
+            "x_request_id=%s pages=%d reason=%s resolve_ms=%.3f transfer_ms=%.3f "
+            "total_ms=%.3f",
+            request.transfer_id,
+            request.plan.plan_id,
+            request.plan.x_request_id,
+            len(pages),
+            reason,
+            resolve_ms,
+            transfer_ms,
+            total_ms,
+        )
+        return {
+            "ok": bool(pages) or reason in {"ok", "already_local"},
+            "reason": reason,
+            "block_size_tokens": tree_cache.page_size,
+            "resolve_ms": resolve_ms,
+            "transfer_ms": transfer_ms,
+            "total_ms": total_ms,
+            "transfer_bytes": transfer_bytes,
+            "transferred_blocks": len(pages),
+        }
+    finally:
+        release_protected_host_nodes(protected_nodes)

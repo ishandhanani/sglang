@@ -41,6 +41,10 @@ SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STAT
 logger = logging.getLogger(__name__)
 
 
+def _shared_hicache_reason_code(reason: str) -> str:
+    return str(reason or "unknown").split(":", 1)[0] or "unknown"
+
+
 @dataclass
 class QueueCount:
     """Holds both the total count and optional per-priority breakdown for a queue."""
@@ -627,6 +631,63 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
+            shared_hicache_labels = list(labels.keys()) + [
+                "backend",
+                "outcome",
+                "reason_code",
+            ]
+            self.shared_hicache_requests_total = Counter(
+                name="sglang:shared_hicache_requests_total",
+                documentation="Shared HiCache KV reuse requests by backend, outcome, and reason code.",
+                labelnames=shared_hicache_labels,
+            )
+            self.shared_hicache_tokens_total = Counter(
+                name="sglang:shared_hicache_tokens_total",
+                documentation="Tokens staged by Shared HiCache KV reuse by backend, outcome, and reason code.",
+                labelnames=shared_hicache_labels,
+            )
+            self.shared_hicache_staging_tokens_total = Counter(
+                name="sglang:shared_hicache_staging_tokens_total",
+                documentation="Target KV staging tokens planned, granted, or unavailable for Shared HiCache reuse.",
+                labelnames=shared_hicache_labels,
+            )
+            self.shared_hicache_wait_seconds = Histogram(
+                name="sglang:shared_hicache_wait_seconds",
+                documentation="Scheduler wait time for Shared HiCache KV reuse in seconds.",
+                labelnames=shared_hicache_labels,
+                buckets=(0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5),
+            )
+            self.shared_hicache_insert_seconds = Histogram(
+                name="sglang:shared_hicache_insert_seconds",
+                documentation="Scheduler cache insertion time for Shared HiCache KV reuse in seconds.",
+                labelnames=shared_hicache_labels,
+                buckets=(0.00001, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1),
+            )
+            self.shared_hicache_transfer_bytes_total = Counter(
+                name="sglang:shared_hicache_transfer_bytes_total",
+                documentation="Shared HiCache KV reuse transfer bytes.",
+                labelnames=shared_hicache_labels,
+            )
+            shared_hicache_quarantine_labels = list(labels.keys()) + [
+                "backend",
+                "reason_code",
+            ]
+            self.shared_hicache_quarantine_events_total = Counter(
+                name="sglang:shared_hicache_quarantine_events_total",
+                documentation="Shared HiCache KV reuse target-page quarantine events.",
+                labelnames=shared_hicache_quarantine_labels,
+            )
+            self.shared_hicache_quarantined_tokens_total = Counter(
+                name="sglang:shared_hicache_quarantined_tokens_total",
+                documentation="Total target KV tokens quarantined by Shared HiCache KV reuse.",
+                labelnames=shared_hicache_quarantine_labels,
+            )
+            self.shared_hicache_quarantined_tokens = Gauge(
+                name="sglang:shared_hicache_quarantined_tokens_current",
+                documentation="Current target KV tokens held out of the allocator after indeterminate Shared HiCache KV reuse transfers.",
+                labelnames=list(labels.keys()) + ["backend"],
+                multiprocess_mode="mostrecent",
+            )
 
         # =================================================================
         # Streaming session metrics (only created when streaming sessions are enabled)
@@ -1132,6 +1193,103 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_histogram(self.kv_transfer_bootstrap_ms, bootstrap_ms)
         self._log_histogram(self.kv_transfer_alloc_ms, alloc_ms)
 
+    def observe_shared_hicache(
+        self,
+        *,
+        backend: str,
+        outcome: str,
+        reason: str,
+        tokens: int = 0,
+        wait_ms: Optional[float] = None,
+        insert_ms: Optional[float] = None,
+        transfer_bytes: Optional[int] = None,
+    ) -> None:
+        requests_total = getattr(self, "shared_hicache_requests_total", None)
+        if requests_total is None:
+            return
+
+        tokens = max(0, int(tokens))
+        labels = {
+            **self.labels,
+            "backend": backend,
+            "outcome": outcome,
+            "reason_code": _shared_hicache_reason_code(reason),
+        }
+        requests_total.labels(**labels).inc(1)
+
+        if tokens > 0:
+            self.shared_hicache_tokens_total.labels(**labels).inc(tokens)
+        if wait_ms is not None:
+            self.shared_hicache_wait_seconds.labels(**labels).observe(
+                float(wait_ms) / 1000
+            )
+        if insert_ms is not None:
+            self.shared_hicache_insert_seconds.labels(**labels).observe(
+                float(insert_ms) / 1000
+            )
+        if transfer_bytes is not None:
+            self.shared_hicache_transfer_bytes_total.labels(**labels).inc(
+                max(0, int(transfer_bytes))
+            )
+
+    def observe_shared_hicache_staging(
+        self,
+        *,
+        backend: str,
+        outcome: str,
+        reason: str,
+        tokens: int,
+    ) -> None:
+        staging_tokens_total = getattr(
+            self, "shared_hicache_staging_tokens_total", None
+        )
+        if staging_tokens_total is None:
+            return
+
+        tokens = max(0, int(tokens))
+        if tokens <= 0:
+            return
+        labels = {
+            **self.labels,
+            "backend": backend,
+            "outcome": outcome,
+            "reason_code": _shared_hicache_reason_code(reason),
+        }
+        staging_tokens_total.labels(**labels).inc(tokens)
+
+    def observe_shared_hicache_quarantine(
+        self,
+        *,
+        backend: str,
+        reason: str,
+        tokens: int,
+        current_tokens: int,
+    ) -> None:
+        events_total = getattr(
+            self, "shared_hicache_quarantine_events_total", None
+        )
+        current_gauge = getattr(self, "shared_hicache_quarantined_tokens", None)
+        if events_total is None or current_gauge is None:
+            return
+
+        tokens = max(0, int(tokens))
+        current_tokens = max(0, int(current_tokens))
+        event_labels = {
+            **self.labels,
+            "backend": backend,
+            "reason_code": _shared_hicache_reason_code(reason),
+        }
+        gauge_labels = {
+            **self.labels,
+            "backend": backend,
+        }
+        if tokens > 0:
+            events_total.labels(**event_labels).inc(1)
+            self.shared_hicache_quarantined_tokens_total.labels(
+                **event_labels
+            ).inc(tokens)
+        current_gauge.labels(**gauge_labels).set(current_tokens)
+
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}
         self.per_stage_req_latency_seconds.labels(**labels_with_stage).observe(latency)
@@ -1506,7 +1664,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
         self.cached_tokens_total = Counter(
             name="sglang:cached_tokens_total",
-            documentation="Number of cached prompt tokens by source (device/host/storage).",
+            documentation="Number of cached prompt tokens by source (device/host/shared_hicache/storage).",
             labelnames=list(labels.keys()) + ["cache_source"],
         )
 
@@ -1658,6 +1816,9 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
                 report_cache_source("device", cached_tokens_details.get("device", 0))
                 report_cache_source("host", cached_tokens_details.get("host", 0))
+                report_cache_source(
+                    "shared_hicache", cached_tokens_details.get("shared_hicache", 0)
+                )
 
                 # Storage fields are only present when L3 storage backend is enabled
                 if "storage" in cached_tokens_details:

@@ -114,6 +114,8 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
+    from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
+    from sglang.srt.mem_cache.shared_hicache.route import SharedHiCacheSourceRoute
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -673,6 +675,8 @@ class Req(ReqDllmMixin):
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
+        shared_hicache_plan: Optional["SharedHiCachePlan"] = None,
+        shared_hicache_source_routes: tuple["SharedHiCacheSourceRoute", ...] = (),
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
@@ -756,6 +760,9 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.lora_id = lora_id
         self.routing_key = routing_key
+        self.shared_hicache_plan = shared_hicache_plan
+        self.shared_hicache_source_routes = shared_hicache_source_routes
+        self.shared_hicache_consumed_plan = None
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -830,6 +837,10 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        # Tokens staged into local cache from a SharedHiCache plan.
+        self.shared_hicache_hit_length = 0
+        # Temporary TP-wide cap applied while scheduling SharedHiCache reuse.
+        self.shared_hicache_max_prefix_len: Optional[int] = None
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
@@ -920,9 +931,11 @@ class Req(ReqDllmMixin):
         self.cached_tokens_device = 0  # Tokens from device cache (GPU)
         self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)
         self.cached_tokens_storage = 0  # Tokens from L3 storage backend
+        self.cached_tokens_shared_hicache = 0  # Tokens staged by SharedHiCache
         self._cache_breakdown_computed = (
             False  # Track if breakdown was already computed
         )
+        self._shared_hicache_completion_logged = False
 
         # Per-request count of verification forward passes.
         self.spec_verify_ct = 0
@@ -1169,6 +1182,8 @@ class Req(ReqDllmMixin):
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        if self.shared_hicache_max_prefix_len is not None:
+            max_prefix_len = min(max_prefix_len, self.shared_hicache_max_prefix_len)
         return max(max_prefix_len, 0)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -2043,7 +2058,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # - len(prefix_indices) = device_original + host_loaded
                     # - host_hit_length = total tokens from host cache (including storage-prefetched)
                     # - storage_hit_length = tokens loaded from storage backend (L3 hits)
-                    # - device_portion = len(prefix_indices) - host_hit_length
+                    # - shared_hicache_hit_length = tokens inserted into the device prefix by SharedHiCache
+                    # - device_portion = len(prefix_indices) - host_hit_length - shared_hicache_portion
                     #
                     # Storage hits are now tracked via scheduler after prefetch completes.
                     # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
@@ -2051,11 +2067,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # Clamp storage to host_total to handle edge cases
                     storage_portion = min(host_total, req.storage_hit_length)
                     host_portion = host_total - storage_portion
-                    device_portion = max(0, len(req.prefix_indices) - host_total)
+                    device_total = max(0, len(req.prefix_indices) - host_total)
+                    shared_hicache_portion = min(
+                        device_total, max(0, req.shared_hicache_hit_length)
+                    )
+                    device_portion = device_total - shared_hicache_portion
 
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion
                     req.cached_tokens_storage = storage_portion
+                    req.cached_tokens_shared_hicache = shared_hicache_portion
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len

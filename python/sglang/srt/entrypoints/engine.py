@@ -61,6 +61,7 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    CacheHintsInput,
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
@@ -89,6 +90,9 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_detection import resolve_auto_parsers
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.mem_cache.shared_hicache.route import (
+    shared_hicache_source_routes_from_hint,
+)
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -348,6 +352,8 @@ class Engine(EngineScoreMixin, EngineBase):
         disagg_prefill_dp_rank: Optional[int] = None,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
+        cache_hints: Optional[CacheHintsInput] = None,
+        shared_hicache_source_routes: Optional[Any] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
@@ -385,10 +391,14 @@ class Engine(EngineScoreMixin, EngineBase):
             bootstrap_room=bootstrap_room,
             routed_dp_rank=routed_dp_rank,
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
+            cache_hints=cache_hints,
             external_trace_header=external_trace_header,
             rid=rid,
             session_params=session_params,
             priority=priority,
+        )
+        obj.shared_hicache_source_routes = shared_hicache_source_routes_from_hint(
+            shared_hicache_source_routes
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -450,6 +460,8 @@ class Engine(EngineScoreMixin, EngineBase):
         disagg_prefill_dp_rank: Optional[int] = None,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
+        cache_hints: Optional[CacheHintsInput] = None,
+        shared_hicache_source_routes: Optional[Any] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
@@ -487,10 +499,14 @@ class Engine(EngineScoreMixin, EngineBase):
             bootstrap_room=bootstrap_room,
             routed_dp_rank=routed_dp_rank,
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
+            cache_hints=cache_hints,
             external_trace_header=external_trace_header,
             rid=rid,
             session_params=session_params,
             priority=priority,
+        )
+        obj.shared_hicache_source_routes = shared_hicache_source_routes_from_hint(
+            shared_hicache_source_routes
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 

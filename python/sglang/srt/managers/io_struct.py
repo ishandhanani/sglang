@@ -33,6 +33,10 @@ from pydantic import PlainValidator
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Modality
+from sglang.srt.mem_cache.shared_hicache.plan import SharedHiCachePlan
+from sglang.srt.mem_cache.shared_hicache.route import (
+    SharedHiCacheSourceRoute,
+)
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
@@ -132,6 +136,39 @@ MultimodalDataInputFormat = Union[
     List[MultimodalDataInputItem],
     MultimodalDataInputItem,
 ]
+CacheHintsInput = Union[Dict[str, Any], List[Optional[Dict[str, Any]]]]
+
+
+def _shared_hicache_plan_from_cache_hints(
+    cache_hints: Optional[Any],
+    field_name: str = "cache_hints",
+) -> Optional[SharedHiCachePlan]:
+    if cache_hints is None:
+        return None
+    if not isinstance(cache_hints, dict):
+        raise ValueError(f"{field_name} must be a dict.")
+    hint = cache_hints.get("shared_hicache")
+    if hint is None:
+        return None
+    try:
+        return SharedHiCachePlan.from_dict(hint)
+    except ValueError:
+        return None
+
+
+def _cache_hints_has_shared_hicache(
+    cache_hints: Optional[Any],
+    field_name: str = "cache_hints",
+) -> bool:
+    if cache_hints is None:
+        return False
+    if isinstance(cache_hints, list):
+        return any(
+            _shared_hicache_plan_from_cache_hints(item, f"{field_name}[{i}]")
+            is not None
+            for i, item in enumerate(cache_hints)
+        )
+    return _shared_hicache_plan_from_cache_hints(cache_hints, field_name) is not None
 
 
 @dataclass
@@ -231,6 +268,18 @@ class GenerateReqInput(BaseReq):
     disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
+    # Router-provided cache execution hints.
+    # `shared_hicache` is normalized into `shared_hicache_plan` below. Source
+    # endpoints are intentionally not accepted here; trusted adapters attach
+    # `shared_hicache_source_routes` on the internal request object instead.
+    cache_hints: Optional[CacheHintsInput] = None
+    shared_hicache_plan: Optional[
+        Union[SharedHiCachePlan, List[Optional[SharedHiCachePlan]]]
+    ] = field(default=None, init=False, repr=False)
+    shared_hicache_source_routes: Union[
+        tuple[SharedHiCacheSourceRoute, ...],
+        List[tuple[SharedHiCacheSourceRoute, ...]],
+    ] = field(default_factory=tuple, init=False, repr=False)
 
     # For background responses (OpenAI responses API)
     background: bool = False
@@ -373,7 +422,6 @@ class GenerateReqInput(BaseReq):
         # Determine parallel sample count
         if self.sampling_params is None:
             self.parallel_sample_num = 1
-            return
         elif isinstance(self.sampling_params, dict):
             self.parallel_sample_num = self.sampling_params.get("n", 1)
         else:  # isinstance(self.sampling_params, list):
@@ -383,6 +431,14 @@ class GenerateReqInput(BaseReq):
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
+
+        if (
+            _cache_hints_has_shared_hicache(self.cache_hints)
+            and self.parallel_sample_num != 1
+        ):
+            raise ValueError(
+                "cache_hints.shared_hicache does not support parallel_sample_num > 1"
+            )
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
@@ -408,6 +464,9 @@ class GenerateReqInput(BaseReq):
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
+        self.shared_hicache_plan = _shared_hicache_plan_from_cache_hints(
+            self.cache_hints
+        )
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -429,6 +488,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_bootstrap_params(num)
+        self._normalize_cache_hints(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -631,6 +691,37 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
+    def _normalize_cache_hints(self, num):
+        routes = (
+            self.shared_hicache_source_routes
+            if isinstance(self.shared_hicache_source_routes, tuple)
+            else ()
+        )
+        if self.cache_hints is None:
+            self.shared_hicache_plan = [None] * num
+            self.shared_hicache_source_routes = [routes] * num
+        elif isinstance(self.cache_hints, list):
+            if len(self.cache_hints) != self.batch_size:
+                raise ValueError(
+                    "The length of cache_hints should be equal to the batch size."
+                )
+            plans = [
+                _shared_hicache_plan_from_cache_hints(
+                    hints, f"cache_hints[{i}]"
+                )
+                for i, hints in enumerate(self.cache_hints)
+            ]
+            self.shared_hicache_plan = plans * self.parallel_sample_num
+            self.shared_hicache_source_routes = [routes] * num
+        else:
+            if self.batch_size != 1:
+                raise ValueError(
+                    "cache_hints must be a list when batch size is greater than 1."
+                )
+            plan = _shared_hicache_plan_from_cache_hints(self.cache_hints)
+            self.shared_hicache_plan = [plan] * num
+            self.shared_hicache_source_routes = [routes] * num
+
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
         if self.session_params is not None:
@@ -728,6 +819,16 @@ class GenerateReqInput(BaseReq):
                 else None
             ),
         )
+        sub.shared_hicache_plan = (
+            self.shared_hicache_plan[i]
+            if isinstance(self.shared_hicache_plan, list)
+            else self.shared_hicache_plan
+        )
+        sub.shared_hicache_source_routes = (
+            self.shared_hicache_source_routes[i]
+            if isinstance(self.shared_hicache_source_routes, list)
+            else self.shared_hicache_source_routes
+        )
         cache[i] = sub
         return sub
 
@@ -794,6 +895,8 @@ class TokenizedGenerateReqInput(BaseReq):
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    shared_hicache_plan: Optional[SharedHiCachePlan] = None
+    shared_hicache_source_routes: tuple[SharedHiCacheSourceRoute, ...] = ()
 
     # Priority for the request
     priority: Optional[int] = None

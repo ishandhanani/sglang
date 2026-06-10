@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+import threading
+
+from sglang.srt.mem_cache.radix_cache import TreeNode
+from sglang.srt.mem_cache.utils import compute_node_hash_values, hash_str_to_int64
+
+
+class HiCacheHostBlockIndex:
+    def __init__(self, page_size: int):
+        self.page_size = page_size
+        self.lock = threading.RLock()
+        self.block_index: dict[int, tuple[TreeNode, int, str]] = {}
+
+    def _drop_node_locked(self, node: TreeNode) -> None:
+        stale = [
+            block_hash
+            for block_hash, entry in self.block_index.items()
+            if entry[0] is node
+        ]
+        for block_hash in stale:
+            self.block_index.pop(block_hash, None)
+
+    def clear(self) -> None:
+        with self.lock:
+            self.block_index.clear()
+
+    def index_node(self, node: TreeNode) -> None:
+        if node.host_value is None:
+            self.drop_node(node)
+            return
+        if node.hash_value is None:
+            node.hash_value = compute_node_hash_values(node, self.page_size)
+
+        num_pages = min(len(node.hash_value), len(node.host_value) // self.page_size)
+        with self.lock:
+            self.drop_node(node, locked=True)
+            for page_idx in range(num_pages):
+                hash_value = node.hash_value[page_idx]
+                block_hash = hash_str_to_int64(hash_value)
+                self.block_index[block_hash] = (node, page_idx, hash_value)
+
+    def drop_node(self, node: TreeNode, *, locked: bool = False) -> None:
+        if locked:
+            self._drop_node_locked(node)
+        else:
+            with self.lock:
+                self._drop_node_locked(node)
+
+    def claim_unprotected_node_for_eviction(self, node: TreeNode) -> bool:
+        with self.lock:
+            if node.host_value is None or node.host_ref_counter > 0:
+                return False
+            self._drop_node_locked(node)
+            return True
+
+    def lookup(
+        self, wanted_hashes: set[int], *, protect: bool = False
+    ) -> (
+        dict[int, tuple[TreeNode, int, str]]
+        | tuple[dict[int, tuple[TreeNode, int, str]], list[TreeNode]]
+    ):
+        matches: dict[int, tuple[TreeNode, int, str]] = {}
+        protected_nodes: list[TreeNode] = []
+        protected_ids: set[int] = set()
+        stale_hashes = []
+        with self.lock:
+            for block_hash in wanted_hashes:
+                entry = self.block_index.get(block_hash)
+                if entry is None:
+                    continue
+                node, page_idx, hash_value = entry
+                valid = (
+                    node.host_value is not None
+                    and node.hash_value is not None
+                    and 0 <= page_idx < len(node.hash_value)
+                    and page_idx * self.page_size < len(node.host_value)
+                    and node.hash_value[page_idx] == hash_value
+                )
+                if valid:
+                    matches[block_hash] = entry
+                    if protect and node.id not in protected_ids:
+                        node.protect_host()
+                        protected_nodes.append(node)
+                        protected_ids.add(node.id)
+                else:
+                    stale_hashes.append(block_hash)
+
+            for block_hash in stale_hashes:
+                self.block_index.pop(block_hash, None)
+        if protect:
+            return matches, protected_nodes
+        return matches
