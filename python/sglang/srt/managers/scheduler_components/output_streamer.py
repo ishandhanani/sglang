@@ -57,6 +57,34 @@ class SchedulerOutputStreamer:
                 storage_backend_type = type(storage_backend).__name__
         return storage_backend_type
 
+    def _log_shared_hicache_completion(self, req: Req, details: dict) -> None:
+        shared_hicache_tokens = details.get("shared_hicache", 0)
+        if shared_hicache_tokens <= 0 or getattr(
+            req, "_shared_hicache_completion_logged", False
+        ):
+            return
+
+        req._shared_hicache_completion_logged = True
+        plan = getattr(req, "shared_hicache_plan", None)
+        logger.info(
+            "SharedHiCache request consumed cached tokens "
+            "rid=%s plan_id=%s source_worker_id=%s target_worker_id=%s "
+            "start_block_index=%s planned_prefix_blocks=%s "
+            "shared_hicache_tokens=%s device_tokens=%s host_tokens=%s "
+            "storage_tokens=%s cached_tokens_total=%s",
+            req.rid,
+            getattr(plan, "plan_id", None),
+            getattr(plan, "source_worker_id", None),
+            getattr(plan, "target_worker_id", None),
+            getattr(plan, "start_block_index", None),
+            getattr(plan, "planned_prefix_blocks", None),
+            shared_hicache_tokens,
+            details.get("device", 0),
+            details.get("host", 0),
+            details.get("storage", 0),
+            req.cached_tokens,
+        )
+
     def get_cached_tokens_details(self, req: Req) -> Optional[dict]:
         """Get detailed cache breakdown for a request, if available.
 
@@ -85,6 +113,8 @@ class SchedulerOutputStreamer:
                 details["storage"] = req.cached_tokens_storage
             if self.enable_hicache_storage():
                 details["storage_backend"] = self._get_storage_backend_type()
+            if req.finished():
+                self._log_shared_hicache_completion(req, details)
             return details
 
         if req.cached_tokens > 0:

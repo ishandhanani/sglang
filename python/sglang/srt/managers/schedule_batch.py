@@ -934,6 +934,7 @@ class Req(ReqDllmMixin):
         self._cache_breakdown_computed = (
             False  # Track if breakdown was already computed
         )
+        self._shared_hicache_completion_logged = False
 
         # Per-request count of verification forward passes.
         self.spec_verify_ct = 0
