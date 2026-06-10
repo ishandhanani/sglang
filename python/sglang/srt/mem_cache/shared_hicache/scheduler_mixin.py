@@ -61,6 +61,12 @@ class SharedHiCacheSchedulerMixin:
         pending_rids: set[str] = set()
 
         for req in reqs:
+            rejection = shared_hicache_manager.reuse_plan_rejection(req)
+            if rejection is not None:
+                shared_hicache_manager.observe_plan_skip(req, rejection)
+                probe_statuses.append(SharedHiCachePrepareStatus.Skip)
+                local_prefix_lens.append(0)
+                continue
             if not shared_hicache_manager.has_reuse_plan(req):
                 probe_statuses.append(SharedHiCachePrepareStatus.Skip)
                 local_prefix_lens.append(0)
@@ -89,6 +95,12 @@ class SharedHiCacheSchedulerMixin:
             reqs, probe_statuses, reduced_probe_statuses, local_prefix_lens
         ):
             if reduced_status == SharedHiCachePrepareStatus.Failed:
+                reason = (
+                    "local_prefix_probe_failed"
+                    if local_status == SharedHiCachePrepareStatus.Failed
+                    else "tp_peer_prefix_probe_failed"
+                )
+                shared_hicache_manager.observe_plan_skip(req, reason)
                 req.shared_hicache_plan = None
                 self.release_shared_hicache_request(req.rid)
                 continue
@@ -98,6 +110,9 @@ class SharedHiCacheSchedulerMixin:
                         "SharedHiCache plan availability diverged across TP ranks for rid=%s; "
                         "falling back to local prefill",
                         req.rid,
+                    )
+                    shared_hicache_manager.observe_plan_skip(
+                        req, "tp_peer_plan_unavailable"
                     )
                 req.shared_hicache_plan = None
                 self.release_shared_hicache_request(req.rid)
@@ -111,7 +126,7 @@ class SharedHiCacheSchedulerMixin:
             [local_prefix_len for _, local_prefix_len in local_reqs]
         )
 
-        prepared_reqs: list[tuple[Req, SharedHiCacheResult | None, int]] = []
+        prepared_reqs: list[tuple[Req, SharedHiCacheResult | None, int, int]] = []
         prepare_statuses: list[int] = []
 
         for (req, _), common_local_prefix_len in zip(
@@ -136,7 +151,9 @@ class SharedHiCacheSchedulerMixin:
                 )
                 prepare_status = SharedHiCachePrepareStatus.Failed
 
-            prepared_reqs.append((req, result, common_local_prefix_len))
+            prepared_reqs.append(
+                (req, result, common_local_prefix_len, prepare_status)
+            )
             prepare_statuses.append(prepare_status)
 
         reduced_prepare_statuses = self._sync_shared_hicache_status_min_batch(
@@ -144,10 +161,16 @@ class SharedHiCacheSchedulerMixin:
         )
         ready_reqs = []
         local_prefix_lens = []
-        for (req, result, local_prefix_len), reduced_status in zip(
+        for (req, result, local_prefix_len, local_status), reduced_status in zip(
             prepared_reqs, reduced_prepare_statuses
         ):
             if reduced_status == SharedHiCachePrepareStatus.Failed:
+                reason = (
+                    "prepare_exception"
+                    if local_status == SharedHiCachePrepareStatus.Failed
+                    else "tp_peer_prepare_failed"
+                )
+                shared_hicache_manager.observe_plan_skip(req, reason)
                 req.shared_hicache_plan = None
                 self.release_shared_hicache_request(req.rid)
                 continue

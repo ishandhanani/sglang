@@ -221,6 +221,14 @@ class FakeScheduleManager:
         self.pending = pending
         self.prepared = []
         self.released = []
+        self.rejections = {}
+        self.skips = []
+
+    def reuse_plan_rejection(self, req):
+        return self.rejections.get(req.rid)
+
+    def observe_plan_skip(self, req, reason):
+        self.skips.append((req.rid, reason))
 
     def has_reuse_plan(self, _req):
         return True
@@ -729,6 +737,21 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertEqual(scheduler.prefix_inputs, [])
         self.assertEqual(manager.prepared, [])
         self.assertEqual(manager.released, ["rid-1"])
+        self.assertEqual(manager.skips, [("rid-1", "tp_peer_prefix_probe_failed")])
+        self.assertIsNone(req.shared_hicache_plan)
+
+    def test_scheduler_observes_rejected_shared_hicache_plan(self):
+        manager = FakeScheduleManager(prefix_len=8)
+        manager.rejections["rid-1"] = "wrong_target_worker"
+        scheduler = FakeScheduler(manager)
+        req = FakeSharedHiCacheReq("rid-1", local_prefix_len=24)
+
+        pending_rids = scheduler._prepare_shared_hicache_for_schedule_batch([req])
+
+        self.assertEqual(pending_rids, set())
+        self.assertEqual(manager.prepared, [])
+        self.assertEqual(manager.released, ["rid-1"])
+        self.assertEqual(manager.skips, [("rid-1", "wrong_target_worker")])
         self.assertIsNone(req.shared_hicache_plan)
 
     def test_scheduler_tp_pending_status_dominates_ready(self):

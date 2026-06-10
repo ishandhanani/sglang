@@ -187,6 +187,43 @@ class SharedHiCacheTargetReuse:
     def _plan_key(self, req: Req, plan: SharedHiCachePlan) -> tuple[str, str]:
         return str(req.rid), plan.plan_id
 
+    def reuse_plan_rejection(self, req: Req) -> Optional[str]:
+        plan = getattr(req, "shared_hicache_plan", None)
+        if plan is None:
+            return None
+        if not isinstance(plan, SharedHiCachePlan):
+            return "invalid_plan"
+        return self._validate_plan(plan)
+
+    def observe_plan_skip(self, req: Req, reason: str) -> None:
+        plan = getattr(req, "shared_hicache_plan", None)
+        if plan is None:
+            return
+
+        backend = self.direct_transfer.name
+        plan_id = "unknown"
+        source_worker = "unknown"
+        if isinstance(plan, SharedHiCachePlan):
+            plan_id = plan.plan_id
+            source_worker = plan.source_worker_id
+            plan_key = self._plan_key(req, plan)
+            if plan_key in self._finished_plan_keys:
+                return
+            self._finished_plan_keys.add(plan_key)
+
+        logger.debug(
+            "Skipping shared HiCache plan rid=%s plan_id=%s reason=%s source_worker=%s",
+            req.rid,
+            plan_id,
+            reason,
+            source_worker,
+        )
+        self._observe_reuse(
+            backend=backend,
+            outcome="skip",
+            reason=reason,
+        )
+
     def _pending_wait_ms(self, pending: SharedHiCachePendingFetch) -> Optional[float]:
         if pending.submitted_at <= 0:
             return None
@@ -399,13 +436,20 @@ class SharedHiCacheTargetReuse:
         plan = getattr(req, "shared_hicache_plan", None)
         if not isinstance(plan, SharedHiCachePlan):
             return False
-        return self._validate_plan(plan) is None
+        return self.reuse_plan_rejection(req) is None
 
     def release_request(self, rid: str) -> None:
         rid = str(rid)
         pending = self._pending_fetches.pop(rid, None)
 
         if pending is not None:
+            self._finished_plan_keys.add((rid, pending.plan.plan_id))
+            self._observe_reuse(
+                backend=pending.backend,
+                outcome="miss",
+                reason="request_released_pending",
+                wait_ms=self._pending_wait_ms(pending),
+            )
             self._release_pending_fetch(pending)
 
         self._finished_plan_keys = {

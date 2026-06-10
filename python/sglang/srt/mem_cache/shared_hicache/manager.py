@@ -318,6 +318,12 @@ class SharedHiCacheManager:
     def has_reuse_plan(self, req: Req) -> bool:
         return self.target_reuse.has_reuse_plan(req)
 
+    def reuse_plan_rejection(self, req: Req) -> Optional[str]:
+        return self.target_reuse.reuse_plan_rejection(req)
+
+    def observe_plan_skip(self, req: Req, reason: str) -> None:
+        self.target_reuse.observe_plan_skip(req, reason)
+
     def release_request(self, rid: str) -> None:
         self.target_reuse.release_request(rid)
 
