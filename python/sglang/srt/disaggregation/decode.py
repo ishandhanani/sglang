@@ -1154,6 +1154,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return (
             len(self.scheduler.running_batch.reqs)
             + len(self.transfer_queue.queue)
+            + len(self.scheduler.disagg_decode_prebuilt_queue)
             + len(self.scheduler.waiting_queue)
             + extra_reserved_reqs
         )
@@ -1883,8 +1884,10 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
         """Process prebuilt batch and schedule the next decode batch."""
-        # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch()
+        # Defer prebuilt absorption while a (conditional-agg) chunked prefill is in flight.
+        new_prebuilt_batch = (
+            self.get_new_prebuilt_batch() if self.chunked_req is None else None
+        )
         if new_prebuilt_batch:
             assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
@@ -1900,6 +1903,11 @@ class SchedulerDisaggregationDecodeMixin:
                         )
                 else:
                     self.running_batch.merge_batch(new_prebuilt_batch)
+
+        if self.conditional_agg_enabled:
+            # Local-prefill reqs sit in waiting_queue; reuse the standard
+            # prefill->decode scheduler for them alongside prebuilt reqs.
+            return self.get_next_batch_to_run()
 
         # Schedule decode batch
         if self.running_batch.is_empty():
@@ -1920,11 +1928,12 @@ class SchedulerDisaggregationDecodeMixin:
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if len(self.waiting_queue) == 0:
+        prebuilt_queue = self.disagg_decode_prebuilt_queue
+        if len(prebuilt_queue) == 0:
             return None
 
         if self.enable_priority_scheduling:
-            self.policy.calc_priority(self.waiting_queue, self.running_batch)
+            self.policy.calc_priority(prebuilt_queue, self.running_batch)
 
         curr_batch_size = self.running_batch.batch_size()
 
@@ -1932,12 +1941,12 @@ class SchedulerDisaggregationDecodeMixin:
 
         num_not_used_batch = batch_size - curr_batch_size
 
-        # pop req from waiting queue
+        # pop req from the prebuilt (KV-transferred) queue
         can_run_list: List[Req] = []
-        waiting_queue: List[Req] = []
+        remaining_prebuilt: List[Req] = []
 
-        for i in range(len(self.waiting_queue)):
-            req = self.waiting_queue[i]
+        for i in range(len(prebuilt_queue)):
+            req = prebuilt_queue[i]
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
@@ -1955,9 +1964,9 @@ class SchedulerDisaggregationDecodeMixin:
                 if req.kv_committed_len is not None:
                     req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
             else:
-                waiting_queue.append(req)
+                remaining_prebuilt.append(req)
 
-        self.waiting_queue = waiting_queue
+        self.disagg_decode_prebuilt_queue = remaining_prebuilt
         if len(can_run_list) == 0:
             return None
 
@@ -1989,7 +1998,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
-        self.waiting_queue.extend(resumed_reqs)
+        self.disagg_decode_prebuilt_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return
@@ -2012,4 +2021,4 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.extend(transferred_reqs)
+            self.disagg_decode_prebuilt_queue.extend(transferred_reqs)

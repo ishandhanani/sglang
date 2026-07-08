@@ -250,6 +250,8 @@ class GenerateReqInput:
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    # PD disagg conditional aggregation: decode worker prefills this req locally.
+    do_local_prefill: bool = False
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
     # Conversation id used for tracking requests
@@ -756,6 +758,7 @@ class GenerateReqInput:
             ),
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
+            do_local_prefill=self.do_local_prefill,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
             priority=self.priority,
@@ -833,6 +836,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    # For PD disagg conditional aggregation — decode worker prefills locally.
+    do_local_prefill: bool = False
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
