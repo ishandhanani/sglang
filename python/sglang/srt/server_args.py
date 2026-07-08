@@ -2361,6 +2361,10 @@ class ServerArgs:
         bool,
         "Enable async KV cache offloading on decode server (PD mode).",
     ] = False
+    disaggregation_decode_enable_conditional_agg: A[
+        bool,
+        "Enable conditional aggregation on the decode server (PD mode). Requests flagged with do_local_prefill are prefilled locally (aggregated inference) instead of receiving KV from a remote prefill worker. The router decides per request (e.g. short inputs prefill locally).",
+    ] = False
     num_reserved_decode_tokens: A[
         int,
         "Number of decode tokens that will have memory reserved when adding new request to the running batch.",

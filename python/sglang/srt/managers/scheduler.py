@@ -1123,6 +1123,11 @@ class Scheduler(
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
+        # Conditional aggregation: decode worker prefills `do_local_prefill` reqs locally.
+        self.conditional_agg_enabled = (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.server_args.disaggregation_decode_enable_conditional_agg
+        )
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
         draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
@@ -1187,6 +1192,10 @@ class Scheduler(
                 num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
+
+            # KV-transferred reqs awaiting decode merge; separate from waiting_queue
+            # so conditional-agg local-prefill reqs can use the standard scheduler.
+            self.disagg_decode_prebuilt_queue: deque[Req] = deque()
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -2088,6 +2097,7 @@ class Scheduler(
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
+                do_local_prefill=recv_req.do_local_prefill,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
@@ -2109,6 +2119,8 @@ class Scheduler(
                 if (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
+                    # local-prefill reqs legitimately carry no bootstrap room
+                    and not (self.conditional_agg_enabled and req.do_local_prefill)
                 ):
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
@@ -2318,11 +2330,20 @@ class Scheduler(
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
-            if not is_retracted:
-                req.time_stats.set_decode_prealloc_queue_entry_time()
+            if self.conditional_agg_enabled and req.do_local_prefill:
+                # Local prefill: route to waiting_queue like a non-disaggregated req.
+                self._prefetch_kvcache(req)
+                self.waiting_queue.append(req)
+                if is_retracted:
+                    req.time_stats.set_retract_time()
+                else:
+                    req.time_stats.set_wait_queue_entry_time()
             else:
-                req.time_stats.set_retract_time()
+                self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
+                if not is_retracted:
+                    req.time_stats.set_decode_prealloc_queue_entry_time()
+                else:
+                    req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
@@ -3607,6 +3628,8 @@ class Scheduler(
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+                # KV-transferred reqs awaiting decode merge (moved off waiting_queue).
+                idle &= len(self.disagg_decode_prebuilt_queue) == 0
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 
@@ -3896,8 +3919,11 @@ class Scheduler(
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
-            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
+            # Release KV only if a slot was allocated (local-prefill reqs have none yet).
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and req.req_pool_idx is not None
+            ):
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3958,6 +3984,23 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+
+            # Abort prebuilt-queue reqs (KV pre-allocated -> must release to avoid leak).
+            if self.disagg_decode_prebuilt_queue:
+                remaining_prebuilt = []
+                for req in self.disagg_decode_prebuilt_queue:
+                    if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                        logger.debug(f"Abort prebuilt queue request. {req.rid=}")
+                        if self.enable_hicache_storage:
+                            self.tree_cache.release_aborted_request(req.rid)
+                        self.ipc_channels.send_to_tokenizer.send_output(
+                            AbortReq(rid=req.rid), req
+                        )
+                        if req.req_pool_idx is not None:
+                            release_kv_cache(req, self.tree_cache)
+                    else:
+                        remaining_prebuilt.append(req)
+                self.disagg_decode_prebuilt_queue = remaining_prebuilt
 
             # Abort requests already retracted to CPU cache
             if self.disagg_decode_prealloc_queue.retracted_queue:
