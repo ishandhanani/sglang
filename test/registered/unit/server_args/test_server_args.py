@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.entrypoints.dynamo_sidecar import build_dynamo_sidecar_args
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -1385,6 +1386,24 @@ class TestGrpcServerArgs(CustomTestCase):
         with envs.SGLANG_GRPC_PORT.override(45000):
             sa._handle_deprecated_args()
         self.assertEqual(sa.grpc_port, 45000)
+
+    def test_enable_sidecar_uses_native_grpc_endpoint(self):
+        sa = self._args(enable_sidecar=True, grpc_port=50051)
+        sa._handle_deprecated_args()
+        self.assertEqual(
+            build_dynamo_sidecar_args(sa),
+            ["--sglang-endpoint", "http://127.0.0.1:50051"],
+        )
+
+    def test_enable_sidecar_requires_native_grpc(self):
+        sa = self._args(enable_sidecar=True)
+        with self.assertRaisesRegex(ValueError, "requires --grpc-port"):
+            sa._handle_deprecated_args()
+
+    def test_enable_sidecar_rejects_legacy_grpc(self):
+        sa = self._args(enable_sidecar=True, smg_grpc_mode=True)
+        with self.assertRaisesRegex(ValueError, "native gRPC server"):
+            sa._handle_deprecated_args()
 
     def test_legacy_smg_derives_grpc_port_from_http_port(self):
         sa = self._args(port=30000, smg_grpc_mode=True)

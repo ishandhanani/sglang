@@ -1053,6 +1053,11 @@ class ServerArgs:
         "default. In legacy --smg-grpc-mode this is the SMG server port and "
         "defaults to --port + 10000.",
     ] = None
+    enable_sidecar: A[
+        bool,
+        "Start Dynamo's SGLang sidecar against the native gRPC server. Requires "
+        "--grpc-port or SGLANG_GRPC_PORT.",
+    ] = False
     skip_server_warmup: A[bool, "If set, skip warmup."] = False
     warmups: A[
         Optional[str],
@@ -3234,6 +3239,16 @@ class ServerArgs:
         # Native gRPC is incompatible with launch paths it doesn't wire into.
         # Legacy takes precedence over grpc_port, keeping re-runs idempotent.
         native_grpc = self.grpc_port is not None and not legacy_grpc
+        if self.enable_sidecar:
+            if legacy_grpc:
+                raise ValueError(
+                    "--enable-sidecar requires SGLang's native gRPC server; "
+                    "it cannot be combined with --smg-grpc-mode/--grpc-mode."
+                )
+            if self.grpc_port is None:
+                raise ValueError(
+                    "--enable-sidecar requires --grpc-port or SGLANG_GRPC_PORT."
+                )
         if native_grpc:
             if self.use_ray:
                 raise ValueError(
