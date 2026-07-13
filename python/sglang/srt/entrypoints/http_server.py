@@ -263,6 +263,7 @@ async def init_multi_tokenizer() -> ServerArgs:
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
     grpc_handle = None
+    dynamo_sidecar = None
     warmup_thread = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
@@ -395,6 +396,10 @@ async def lifespan(fast_api_app: FastAPI):
                 template_manager=_global_state.template_manager,
                 scheduler_info=_global_state.scheduler_info,
             )
+            if server_args.enable_sidecar:
+                from sglang.srt.entrypoints.dynamo_sidecar import start_dynamo_sidecar
+
+                dynamo_sidecar = start_dynamo_sidecar(server_args)
 
         # Execute the general warmup
         warmup_thread = threading.Thread(
@@ -406,6 +411,8 @@ async def lifespan(fast_api_app: FastAPI):
         # Start the HTTP server
         yield
     finally:
+        if dynamo_sidecar is not None:
+            dynamo_sidecar.stop()
         _shutdown_native_grpc_server(grpc_handle)
         if tool_server is not None and hasattr(tool_server, "aclose"):
             await tool_server.aclose()
