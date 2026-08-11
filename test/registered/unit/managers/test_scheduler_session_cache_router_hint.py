@@ -82,6 +82,66 @@ class TestSessionCacheRouterHint(unittest.TestCase):
 
         tree_cache.set_session_cache_priority.assert_not_called()
 
+    def test_applies_storage_demotions(self):
+        tree_cache = MagicMock()
+        tree_cache.demote_session_to_storage.return_value = {
+            "state": "pending",
+            "selected_tokens": 128,
+            "message": "storage publish queued",
+        }
+        scheduler = types.SimpleNamespace(
+            enable_session_radix_cache=True,
+            tree_cache=tree_cache,
+        )
+
+        Scheduler._apply_router_session_storage_demotions(
+            scheduler,
+            {
+                "session_storage_demotions": [
+                    {
+                        "operation_id": "demote-1",
+                        "session_id": "session-a",
+                        "session_generation": 7,
+                    }
+                ]
+            },
+        )
+
+        tree_cache.demote_session_to_storage.assert_called_once_with(
+            "demote-1", "session-a", generation=7
+        )
+
+    def test_prefetch_hint_forces_storage_lookup(self):
+        tree_cache = MagicMock()
+        tree_cache.is_backuped.return_value = True
+        tree_cache.is_root.return_value = False
+        tree_cache.get_prefix_hash_values.return_value = ["prefix"]
+        tree_cache.get_last_hash_value.return_value = "last"
+        tree_cache.hicache_storage_pass_prefix_keys = True
+        scheduler = types.SimpleNamespace(
+            enable_hicache_storage=True,
+            tree_cache=tree_cache,
+        )
+        req = MagicMock()
+        req.router_hint = {"prefetch_from_storage": True}
+        req.last_host_node = 3
+        req.prefix_indices = [1, 2]
+        req.host_hit_length = 0
+        req.full_untruncated_fill_ids = [10, 11, 12, 13]
+        req._compute_max_prefix_len.return_value = 4
+        req.rid = "request-1"
+
+        Scheduler._prefetch_kvcache(scheduler, req)
+
+        tree_cache.prefetch_from_storage.assert_called_once_with(
+            "request-1",
+            3,
+            [12, 13],
+            "last",
+            ["prefix"],
+            force=True,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

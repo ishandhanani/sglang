@@ -486,7 +486,13 @@ class FlexKVRadixCache(RadixCache):
         self.flexkv_connector.cancel_prefetch(rid)
 
     def prefetch_from_storage(
-        self, rid: str, last_host_node: TreeNode, token_ids
+        self,
+        rid: str,
+        last_host_node: TreeNode,
+        token_ids,
+        last_hash=None,
+        prefix_keys=None,
+        force: bool = False,
     ) -> None:
         """Kick off an opportunistic prefetch (SSD/Remote → CPU)."""
         try:

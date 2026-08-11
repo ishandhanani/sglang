@@ -230,6 +230,35 @@ fn insert_router_hint(
         );
     }
 
+    let demotions = hint
+        .session_storage_demotions
+        .iter()
+        .filter_map(|demotion| {
+            if demotion.operation_id.is_empty() || demotion.session_id.is_empty() {
+                return None;
+            }
+            let mut demotion_value = serde_json::Map::new();
+            demotion_value.insert(
+                "operation_id".into(),
+                serde_json::json!(demotion.operation_id),
+            );
+            demotion_value.insert("session_id".into(), serde_json::json!(demotion.session_id));
+            if let Some(generation) = demotion.session_generation {
+                demotion_value.insert("session_generation".into(), serde_json::json!(generation));
+            }
+            Some(serde_json::Value::Object(demotion_value))
+        })
+        .collect::<Vec<_>>();
+    if !demotions.is_empty() {
+        value.insert(
+            "session_storage_demotions".into(),
+            serde_json::Value::Array(demotions),
+        );
+    }
+    if hint.prefetch_from_storage {
+        value.insert("prefetch_from_storage".into(), serde_json::json!(true));
+    }
+
     if !value.is_empty() {
         request.insert("router_hint".into(), serde_json::Value::Object(value));
     }
@@ -477,6 +506,12 @@ mod tests {
                     session_generation: None,
                 },
             ],
+            session_storage_demotions: vec![proto::SessionStorageDemotion {
+                operation_id: "demote-1".to_string(),
+                session_id: "session-c".to_string(),
+                session_generation: Some(9),
+            }],
+            prefetch_from_storage: true,
         });
         let text_req = proto::TextGenerateRequest {
             router_hint: router_hint.clone(),
@@ -507,6 +542,12 @@ mod tests {
                             "cache_priority": "protected",
                         },
                     ],
+                    "session_storage_demotions": [{
+                        "operation_id": "demote-1",
+                        "session_id": "session-c",
+                        "session_generation": 9,
+                    }],
+                    "prefetch_from_storage": true,
                 })
             );
         }
@@ -523,6 +564,8 @@ mod tests {
                     cache_priority: proto::SessionCachePriority::Unspecified as i32,
                     session_generation: None,
                 }],
+                session_storage_demotions: Vec::new(),
+                prefetch_from_storage: false,
             }),
             ..Default::default()
         };

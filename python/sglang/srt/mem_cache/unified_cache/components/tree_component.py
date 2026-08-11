@@ -134,6 +134,9 @@ class TreeComponent(ABC):
     def is_session_protected(self, session_id: str) -> bool:
         return session_id not in self._demoted_session_ids
 
+    def session_leaves(self, session_id: str) -> tuple[UnifiedTreeNode, ...]:
+        return tuple(self._session_leaves.get(session_id, ()))
+
     def session_ref(self, node: UnifiedTreeNode) -> int:
         return node.component_data[self.component_type].session_ref
 

@@ -622,7 +622,12 @@ class HiRadixCache(RadixCache):
                     # request was aborted while the storage query was in flight
                     self._revoke_pending_prefetch(req_id)
                     continue
-                if operation.storage_hit_count < self.prefetch_threshold:
+                min_prefetch_tokens = (
+                    self.page_size
+                    if getattr(operation, "force_prefetch", False)
+                    else self.prefetch_threshold
+                )
+                if operation.storage_hit_count < min_prefetch_tokens:
                     # not to prefetch if not enough benefits
                     self._revoke_pending_prefetch(req_id)
                     logger.debug(
@@ -642,7 +647,7 @@ class HiRadixCache(RadixCache):
                         operation.storage_hit_count,
                         available_size - (available_size % self.page_size),
                     )
-                    if alloc_len >= self.prefetch_threshold:
+                    if alloc_len >= min_prefetch_tokens:
                         host_indices = cc.mem_pool_host.alloc(alloc_len)
                 if host_indices is None:
                     self._revoke_pending_prefetch(req_id)
@@ -1768,6 +1773,7 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        force: bool = False,
     ):
         prefetch_key = RadixKey(
             new_input_tokens,
@@ -1779,8 +1785,14 @@ class HiRadixCache(RadixCache):
         prefetch_length = len(prefetch_key)
         if (
             not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
+            or prefetch_length == 0
+            or (
+                not force
+                and (
+                    prefetch_length < self.prefetch_threshold
+                    or self.cache_controller.prefetch_rate_limited()
+                )
+            )
         ):
             return
 
@@ -1795,6 +1807,7 @@ class HiRadixCache(RadixCache):
             prefix_keys,
             **self._get_extra_pools(),
         )
+        operation.force_prefetch = force
         self.ongoing_prefetch[req_id] = (
             last_host_node,
             prefetch_key,

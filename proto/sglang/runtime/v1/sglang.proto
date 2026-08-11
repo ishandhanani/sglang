@@ -53,6 +53,8 @@ message RouterHint {
   optional string source_control_endpoint = 1;
   repeated uint64 block_hashes = 2;
   repeated SessionCacheAction session_cache_actions = 3;
+  repeated SessionStorageDemotion session_storage_demotions = 4;
+  bool prefetch_from_storage = 5;
 }
 
 enum SessionCachePriority {
@@ -64,6 +66,12 @@ enum SessionCachePriority {
 message SessionCacheAction {
   string session_id = 1;
   SessionCachePriority cache_priority = 2;
+  optional uint64 session_generation = 3;
+}
+
+message SessionStorageDemotion {
+  string operation_id = 1;
+  string session_id = 2;
   optional uint64 session_generation = 3;
 }
 
