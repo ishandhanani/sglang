@@ -48,6 +48,25 @@ message DisaggregatedParams {
   int64 bootstrap_room = 3;
 }
 
+// Advisory metadata attached by an upstream router after worker selection.
+message RouterHint {
+  optional string source_control_endpoint = 1;
+  repeated uint64 block_hashes = 2;
+  repeated SessionCacheAction session_cache_actions = 3;
+}
+
+enum SessionCachePriority {
+  SESSION_CACHE_PRIORITY_UNSPECIFIED = 0;
+  SESSION_CACHE_PRIORITY_PROTECTED = 1;
+  SESSION_CACHE_PRIORITY_EVICTABLE = 2;
+}
+
+message SessionCacheAction {
+  string session_id = 1;
+  SessionCachePriority cache_priority = 2;
+  optional uint64 session_generation = 3;
+}
+
 // Sampling parameters shared across text and tokenized RPCs.
 message SamplingParams {
   optional float temperature = 1;
@@ -103,6 +122,7 @@ message TextGenerateRequest {
   optional int32 priority = 15;
   optional bool require_reasoning = 16;
   optional uint32 max_thinking_tokens = 17;
+  optional RouterHint router_hint = 18;
 }
 
 message TextGenerateResponse {
@@ -130,6 +150,7 @@ message GenerateRequest {
   optional int32 priority = 14;
   optional bool require_reasoning = 15;
   optional uint32 max_thinking_tokens = 16;
+  optional RouterHint router_hint = 17;
 }
 
 message GenerateResponse {

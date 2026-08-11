@@ -160,8 +160,6 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
-    SetSessionCachePriorityReqInput,
-    SetSessionCachePriorityReqOutput,
     ShutdownReq,
     SlowDownReqInput,
     SlowDownReqOutput,
@@ -1532,10 +1530,6 @@ class Scheduler(
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
                 (
-                    SetSessionCachePriorityReqInput,
-                    self.set_session_cache_priority,
-                ),
-                (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
                 ),
@@ -2361,6 +2355,65 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _apply_router_session_cache_actions(self, router_hint: Optional[dict]) -> None:
+        if not isinstance(router_hint, dict):
+            return
+        actions = router_hint.get("session_cache_actions")
+        if actions is None:
+            return
+        if not self.enable_session_radix_cache:
+            logger.warning(
+                "Ignoring router session-cache actions because session radix cache is disabled"
+            )
+            return
+        if not isinstance(actions, list) or len(actions) > 64:
+            logger.warning("Ignoring malformed router session-cache actions")
+            return
+
+        for index, action in enumerate(actions):
+            if not isinstance(action, dict):
+                logger.warning(
+                    "Ignoring malformed router session-cache action index=%s", index
+                )
+                continue
+            session_id = action.get("session_id")
+            cache_priority = action.get("cache_priority")
+            generation = action.get("session_generation")
+            if (
+                not isinstance(session_id, str)
+                or not session_id
+                or len(session_id) > 512
+                or cache_priority not in ("protected", "evictable")
+                or (
+                    generation is not None
+                    and (
+                        isinstance(generation, bool)
+                        or not isinstance(generation, int)
+                        or generation < 0
+                    )
+                )
+            ):
+                logger.warning(
+                    "Ignoring malformed router session-cache action index=%s", index
+                )
+                continue
+
+            result = self.tree_cache.set_session_cache_priority(
+                session_id,
+                protected=cache_priority == "protected",
+                generation=generation,
+            )
+            logger.info(
+                "Applied router session-cache action session_id=%s "
+                "cache_priority=%s status=%s generation=%s "
+                "indexed_component_leaves=%s",
+                session_id,
+                cache_priority,
+                result.status,
+                result.generation,
+                result.indexed_component_leaves,
+            )
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -2500,6 +2553,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        self._apply_router_session_cache_actions(recv_req.router_hint)
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
@@ -4835,56 +4889,6 @@ class Scheduler(
             or not self.enable_session_radix_cache
         ):
             self.session_controller.close(recv_req)
-
-    def set_session_cache_priority(
-        self, recv_req: SetSessionCachePriorityReqInput
-    ) -> SetSessionCachePriorityReqOutput:
-        dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
-        if recv_req.routed_dp_rank is not None and recv_req.routed_dp_rank != dp_rank:
-            return SetSessionCachePriorityReqOutput(
-                success=True,
-                status="not_targeted",
-                session_id=recv_req.session_id,
-                cache_priority=recv_req.cache_priority,
-                dp_rank=dp_rank,
-            )
-
-        if not self.enable_session_radix_cache:
-            return SetSessionCachePriorityReqOutput(
-                success=False,
-                status="disabled",
-                session_id=recv_req.session_id,
-                cache_priority=recv_req.cache_priority,
-                dp_rank=dp_rank,
-                message="Session radix cache is not enabled.",
-            )
-
-        result = self.tree_cache.set_session_cache_priority(
-            recv_req.session_id,
-            protected=recv_req.cache_priority == "protected",
-            generation=recv_req.session_generation,
-        )
-        success = result.status in ("updated", "unchanged")
-        logger.info(
-            "Set session cache priority session_id=%s cache_priority=%s "
-            "status=%s generation=%s indexed_component_leaves=%s dp_rank=%s",
-            recv_req.session_id,
-            recv_req.cache_priority,
-            result.status,
-            result.generation,
-            result.indexed_component_leaves,
-            dp_rank,
-        )
-        return SetSessionCachePriorityReqOutput(
-            success=success,
-            status=result.status,
-            session_id=recv_req.session_id,
-            cache_priority=recv_req.cache_priority,
-            dp_rank=dp_rank,
-            session_generation=result.generation,
-            indexed_component_leaves=result.indexed_component_leaves,
-            message="" if success else result.status.replace("_", " "),
-        )
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:

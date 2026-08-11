@@ -178,6 +178,63 @@ fn insert_disaggregated_params(
     }
 }
 
+fn insert_router_hint(
+    request: &mut HashMap<String, serde_json::Value>,
+    hint: &Option<proto::RouterHint>,
+) {
+    let Some(hint) = hint else {
+        return;
+    };
+
+    let mut value = serde_json::Map::new();
+    if let Some(endpoint) = hint
+        .source_control_endpoint
+        .as_ref()
+        .filter(|endpoint| !endpoint.is_empty())
+    {
+        value.insert(
+            "source_control_endpoint".into(),
+            serde_json::json!(endpoint),
+        );
+    }
+    if !hint.block_hashes.is_empty() {
+        value.insert("block_hashes".into(), serde_json::json!(hint.block_hashes));
+    }
+
+    let actions = hint
+        .session_cache_actions
+        .iter()
+        .filter_map(|action| {
+            if action.session_id.is_empty() {
+                return None;
+            }
+            let cache_priority = match proto::SessionCachePriority::try_from(action.cache_priority)
+            {
+                Ok(proto::SessionCachePriority::Protected) => "protected",
+                Ok(proto::SessionCachePriority::Evictable) => "evictable",
+                _ => return None,
+            };
+            let mut action_value = serde_json::Map::new();
+            action_value.insert("session_id".into(), serde_json::json!(action.session_id));
+            action_value.insert("cache_priority".into(), serde_json::json!(cache_priority));
+            if let Some(generation) = action.session_generation {
+                action_value.insert("session_generation".into(), serde_json::json!(generation));
+            }
+            Some(serde_json::Value::Object(action_value))
+        })
+        .collect::<Vec<_>>();
+    if !actions.is_empty() {
+        value.insert(
+            "session_cache_actions".into(),
+            serde_json::Value::Array(actions),
+        );
+    }
+
+    if !value.is_empty() {
+        request.insert("router_hint".into(), serde_json::Value::Object(value));
+    }
+}
+
 fn now_timestamp() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -250,6 +307,7 @@ pub(crate) fn build_text_generate_dict(
         req.max_thinking_tokens,
     );
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
+    insert_router_hint(&mut d, &req.router_hint);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
@@ -304,6 +362,7 @@ pub(crate) fn build_generate_dict(
         req.max_thinking_tokens,
     );
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
+    insert_router_hint(&mut d, &req.router_hint);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
@@ -398,6 +457,80 @@ mod tests {
                 .unwrap()
                 .get("session_id"),
             Some(&serde_json::json!("session-1"))
+        );
+    }
+
+    #[test]
+    fn generate_dicts_include_typed_router_hint() {
+        let router_hint = Some(proto::RouterHint {
+            source_control_endpoint: Some("tcp://source:23280".to_string()),
+            block_hashes: vec![11, 22],
+            session_cache_actions: vec![
+                proto::SessionCacheAction {
+                    session_id: "session-a".to_string(),
+                    cache_priority: proto::SessionCachePriority::Evictable as i32,
+                    session_generation: Some(7),
+                },
+                proto::SessionCacheAction {
+                    session_id: "session-b".to_string(),
+                    cache_priority: proto::SessionCachePriority::Protected as i32,
+                    session_generation: None,
+                },
+            ],
+        });
+        let text_req = proto::TextGenerateRequest {
+            router_hint: router_hint.clone(),
+            ..Default::default()
+        };
+        let token_req = proto::GenerateRequest {
+            router_hint,
+            ..Default::default()
+        };
+
+        for mapped in [
+            build_text_generate_dict("text-request", &text_req).unwrap(),
+            build_generate_dict("token-request", &token_req).unwrap(),
+        ] {
+            assert_eq!(
+                mapped["router_hint"],
+                serde_json::json!({
+                    "source_control_endpoint": "tcp://source:23280",
+                    "block_hashes": [11, 22],
+                    "session_cache_actions": [
+                        {
+                            "session_id": "session-a",
+                            "cache_priority": "evictable",
+                            "session_generation": 7,
+                        },
+                        {
+                            "session_id": "session-b",
+                            "cache_priority": "protected",
+                        },
+                    ],
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn generate_dicts_drop_invalid_router_actions() {
+        let request = proto::GenerateRequest {
+            router_hint: Some(proto::RouterHint {
+                source_control_endpoint: None,
+                block_hashes: Vec::new(),
+                session_cache_actions: vec![proto::SessionCacheAction {
+                    session_id: "session-a".to_string(),
+                    cache_priority: proto::SessionCachePriority::Unspecified as i32,
+                    session_generation: None,
+                }],
+            }),
+            ..Default::default()
+        };
+
+        assert!(
+            !build_generate_dict("request", &request)
+                .unwrap()
+                .contains_key("router_hint")
         );
     }
 

@@ -164,6 +164,9 @@ class GenerateReqInput:
     # Stable identity shared by requests in the same session. Unlike
     # session_params, this does not alter or reconstruct the prompt.
     session_id: Optional[str] = field(default=None, kw_only=True)
+    # Trusted advisory metadata attached by an upstream router after worker
+    # selection. Backends consume only the hint keys they understand.
+    router_hint: Optional[Dict[str, Any]] = field(default=None, kw_only=True)
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text.
@@ -774,6 +777,7 @@ class GenerateReqInput:
         sub = GenerateReqInput(
             rid=self.rid[i],
             session_id=self.session_id,
+            router_hint=self.router_hint,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=(
@@ -894,6 +898,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Session info for continual prompting
     session_id: Optional[str] = None
     session_params: Optional[SessionParams] = None
+    router_hint: Optional[Dict[str, Any]] = None
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
@@ -2044,31 +2049,6 @@ class OpenSessionReqInput(BaseReq, kw_only=True):
 
 class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
-
-
-class SetSessionCachePriorityReqInput(BaseReq, kw_only=True):
-    session_id: str
-    cache_priority: Literal["protected", "evictable"]
-    session_generation: Optional[int] = None
-    routed_dp_rank: Optional[int] = None
-
-
-class SetSessionCachePriorityReqOutput(BaseReq, kw_only=True):
-    success: bool
-    status: Literal[
-        "updated",
-        "unchanged",
-        "not_found",
-        "stale_generation",
-        "disabled",
-        "not_targeted",
-    ]
-    session_id: str
-    cache_priority: Literal["protected", "evictable"]
-    dp_rank: int
-    session_generation: Optional[int] = None
-    indexed_component_leaves: int = 0
-    message: str = ""
 
 
 class OpenSessionReqOutput(BaseReq, kw_only=True):

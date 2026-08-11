@@ -96,6 +96,7 @@ def generate(
     role: str,
     round_index: int,
     timeout: float,
+    router_hint: dict[str, Any] | None = None,
 ) -> GenerateResult:
     started = time.perf_counter()
     try:
@@ -105,6 +106,7 @@ def generate(
             body={
                 "input_ids": input_ids,
                 "session_id": session_id,
+                "router_hint": router_hint,
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": 1,
@@ -148,6 +150,7 @@ def run_batch(
     round_index: int,
     concurrency: int,
     timeout: float,
+    first_router_hint: dict[str, Any] | None = None,
 ) -> list[GenerateResult]:
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=min(concurrency, len(sessions))
@@ -162,8 +165,9 @@ def run_batch(
                 role=role,
                 round_index=round_index,
                 timeout=timeout,
+                router_hint=first_router_hint if index == 0 else None,
             )
-            for session_id, token_id in sessions
+            for index, (session_id, token_id) in enumerate(sessions)
         ]
         return [future.result() for future in futures]
 
@@ -286,22 +290,18 @@ def main() -> None:
         if not all(event.success for event in events):
             raise RuntimeError("low-session priming failed")
 
-        for session_id, _ in low_sessions:
-            result = request_json(
-                "POST",
-                base_url + "/set_session_cache_priority",
-                body={
+        priority_hint = {
+            "session_cache_actions": [
+                {
                     "session_id": session_id,
                     "cache_priority": (
                         "evictable" if args.arm == "demoted" else "protected"
                     ),
-                },
-                timeout=args.timeout,
-            )
-            controls.append({"session_id": session_id, "response": result})
-            targeted = [item for item in result if item["status"] != "not_targeted"]
-            if not targeted or not all(item["success"] for item in targeted):
-                raise RuntimeError(f"priority update failed for {session_id}: {result}")
+                }
+                for session_id, _ in low_sessions
+            ]
+        }
+        controls.append({"phase": "prime_high", "router_hint": priority_hint})
 
         events.extend(
             run_batch(
@@ -313,6 +313,7 @@ def main() -> None:
                 round_index=0,
                 concurrency=args.pressure_concurrency,
                 timeout=args.timeout,
+                first_router_hint=priority_hint,
             )
         )
         if not all(event.success for event in events):

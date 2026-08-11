@@ -31,4 +31,4 @@ python benchmark/session_cache/bench_priority_pressure.py \
   --output /tmp/session-priority-demoted.json
 ```
 
-The default workload primes eight low-value sessions, primes six high-value sessions so they are newer, then grows only the low-value sessions past the configured device-KV capacity. The expected signal is a higher `high_cached_fraction_mean` in the demoted arm with `all_requests_succeeded=true` in both arms. For a stable comparison, run fresh-server A/B and B/A pairs.
+The default workload primes eight low-value sessions, then attaches `router_hint.session_cache_actions` to the first high-value request before priming six high-value sessions. It grows only the low-value sessions past the configured device-KV capacity. The expected signal is a higher `high_cached_fraction_mean` in the demoted arm with `all_requests_succeeded=true` in both arms. For a stable comparison, run fresh-server A/B and B/A pairs.
