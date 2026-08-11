@@ -20,6 +20,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -395,23 +399,151 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
             self.cache.ongoing_backup[backup_id] = (node_id, MagicMock())
             return backup_id
 
-        with patch.object(
-            self.cache, "write_backup_storage", side_effect=queue_storage_backup
+        with (
+            patch.object(
+                self.cache, "write_backup_storage", side_effect=queue_storage_backup
+            ) as write_backup,
+            patch.object(
+                self.cache,
+                "writing_check",
+                side_effect=AssertionError("storage demotion must not block"),
+            ),
         ):
             result = self.cache.demote_session_to_storage("demote-1", "s1", generation)
 
-        self.assertEqual(result["state"], "pending")
-        self.cache._poll_session_storage_demotions()
-        self.assertFalse(leaf.evicted)
-        self.assertEqual(self.full.session_ref(leaf), 1)
+            self.assertEqual(result["state"], "pending")
+            self.cache._poll_session_storage_demotions()
+            self.assertFalse(leaf.evicted)
+            self.assertEqual(self.full.session_ref(leaf), 1)
 
-        state = self.cache.ongoing_session_storage_demotions["demote-1"]
-        state.backup_acks.update({backup_id: True for backup_id in state.backup_ids})
-        self.cache._poll_session_storage_demotions()
+            state = self.cache.ongoing_session_storage_demotions["demote-1"]
+            self.assertEqual(state.phase, "storage")
+            state.backup_acks.update(
+                {backup_id: True for backup_id in state.backup_ids}
+            )
+            self.cache._poll_session_storage_demotions()
+            self.assertEqual(state.phase, "commit")
+            self.assertFalse(leaf.evicted)
+            self.cache._poll_session_storage_demotions()
+
+            repeated = self.cache.demote_session_to_storage(
+                "demote-1", "s1", generation
+            )
 
         self.assertTrue(leaf.evicted)
         self.assertTrue(leaf.backuped)
         self.assertEqual(self.full.session_ref(leaf), 0)
+        self.assertEqual(repeated["state"], "completed")
+        self.assertEqual(write_backup.call_count, 1)
+
+    def test_storage_demote_waits_for_all_rank_commit_vote(self):
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        generation = self.cache.open_radix_session("s1")
+        register(self.cache, [1, 2, 3, 4], "s1", generation)
+        leaf.component_data[ComponentType.FULL].host_value = torch.arange(4)
+        self.cache.enable_storage = True
+        self.cache.cache_controller = MagicMock()
+
+        def queue_storage_backup(node_id):
+            self.cache.ongoing_backup[100] = (node_id, MagicMock())
+            return 100
+
+        with patch.object(
+            self.cache, "write_backup_storage", side_effect=queue_storage_backup
+        ):
+            self.cache.demote_session_to_storage("demote-1", "s1", generation)
+            self.cache._poll_session_storage_demotions()
+            state = self.cache.ongoing_session_storage_demotions["demote-1"]
+            state.backup_acks[100] = True
+
+            with patch.object(
+                self.cache,
+                "_all_reduce",
+                side_effect=lambda status, _op: status.__setitem__(0, 0),
+            ):
+                self.cache._poll_session_storage_demotions()
+            self.assertEqual(state.phase, "storage")
+
+            self.cache._poll_session_storage_demotions()
+            self.assertEqual(state.phase, "commit")
+            with patch.object(
+                self.cache,
+                "_all_reduce",
+                side_effect=lambda status, _op: status.__setitem__(1, 0),
+            ):
+                self.cache._poll_session_storage_demotions()
+            self.assertEqual(state.phase, "commit")
+            self.assertFalse(leaf.evicted)
+
+            self.cache._poll_session_storage_demotions()
+
+        self.assertTrue(leaf.evicted)
+
+    def test_storage_demote_preserves_shared_session_prefix(self):
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        generation_1 = self.cache.open_radix_session("s1")
+        generation_2 = self.cache.open_radix_session("s2")
+        register(self.cache, [1, 2, 3, 4], "s1", generation_1)
+        register(self.cache, [1, 2, 3, 4], "s2", generation_2)
+        leaf.component_data[ComponentType.FULL].host_value = torch.arange(4)
+        self.cache.enable_storage = True
+        self.cache.cache_controller = MagicMock()
+
+        def queue_storage_backup(node_id):
+            self.cache.ongoing_backup[100] = (node_id, MagicMock())
+            return 100
+
+        with patch.object(
+            self.cache, "write_backup_storage", side_effect=queue_storage_backup
+        ):
+            self.cache.demote_session_to_storage("demote-1", "s1", generation_1)
+            self.cache._poll_session_storage_demotions()
+            state = self.cache.ongoing_session_storage_demotions["demote-1"]
+            state.backup_acks[100] = True
+            self.cache._poll_session_storage_demotions()
+            self.cache._poll_session_storage_demotions()
+
+        self.assertFalse(leaf.evicted)
+        self.assertEqual(self.full.session_ref(leaf), 1)
+
+    def test_storage_readiness_requires_all_component_host_values(self):
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        leaf.component_data[ComponentType.FULL].host_value = torch.arange(4)
+
+        with patch.object(
+            self.cache.tree_core,
+            "build_backup_spec",
+            return_value=(torch.empty(0, dtype=torch.int64), {object(): [object()]}),
+        ):
+            self.assertFalse(self.cache._session_storage_nodes_ready((leaf.id,)))
+
+    def test_low_priority_load_does_not_evict_extra_pool(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        alloc = MagicMock(return_value=None)
+        evict = MagicMock()
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={
+                PoolName.SWA: SimpleNamespace(
+                    device_alloc_fn=alloc,
+                    device_pool=SimpleNamespace(alloc=alloc),
+                    device_free_fn=MagicMock(),
+                    device_evict_fn=evict,
+                )
+            }
+        )
+        transfer = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=torch.arange(1, dtype=torch.int64),
+        )
+
+        result = controller._resolve_pool_transfers_allocation(
+            [transfer],
+            alloc_host=False,
+            allow_protected_session_cache=False,
+        )
+
+        self.assertIsNone(result)
+        evict.assert_not_called()
 
     def test_forced_storage_prefetch_bypasses_benefit_threshold(self):
         self.cache.enable_storage = True

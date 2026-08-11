@@ -509,6 +509,7 @@ class HybridCacheController(BaseHiCacheController):
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        allow_protected_session_cache: bool = True,
     ) -> Optional[torch.Tensor]:
         need_load_kv = host_indices.numel() > 0
 
@@ -529,6 +530,7 @@ class HybridCacheController(BaseHiCacheController):
             alloc_host=False,
             kv_device_indices=device_indices,
             kv_host_indices=host_indices,
+            allow_protected_session_cache=allow_protected_session_cache,
         )
         if pool_transfers is None and extra_pools:
             if need_load_kv:
@@ -888,6 +890,7 @@ class HybridCacheController(BaseHiCacheController):
         alloc_host: bool,
         kv_device_indices: Optional[torch.Tensor] = None,
         kv_host_indices: Optional[torch.Tensor] = None,
+        allow_protected_session_cache: bool = True,
     ) -> Optional[list[PoolTransfer]]:
         """Auto-alloc host or device indices for PoolTransfers where they are None."""
         if not extra_pools:
@@ -929,7 +932,9 @@ class HybridCacheController(BaseHiCacheController):
                 evict_fn = entry.device_evict_fn
                 size = len(pool.host_indices)
             indices = alloc_fn(size)
-            if indices is None and evict_fn:
+            # ponytail: low-priority loads skip extra-pool eviction; add
+            # priority-aware callbacks only if this wastes material capacity.
+            if indices is None and evict_fn and allow_protected_session_cache:
                 evict_fn(size)
                 indices = alloc_fn(size)
             if indices is None:

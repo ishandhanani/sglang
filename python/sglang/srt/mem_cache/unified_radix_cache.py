@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -131,13 +133,16 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
-class _OngoingSessionStorageDemotion(NamedTuple):
+@dataclass
+class _OngoingSessionStorageDemotion:
     session_id: str
     generation: int
     node_ids: tuple[NodeId, ...]
     selected_tokens: int
-    backup_ids: set[int]
-    backup_acks: dict[int, bool]
+    phase: str = "staging"
+    backup_ids: set[int] = field(default_factory=set)
+    backup_acks: dict[int, bool] = field(default_factory=dict)
+    local_failed: bool = False
 
 
 class UnifiedRadixCache(BasePrefixCache):
@@ -324,6 +329,9 @@ class UnifiedRadixCache(BasePrefixCache):
             str, _OngoingSessionStorageDemotion
         ] = {}
         self.session_storage_demote_by_backup_id: dict[int, str] = {}
+        self._completed_session_storage_demotions: OrderedDict[str, dict] = (
+            OrderedDict()
+        )
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -822,12 +830,12 @@ class UnifiedRadixCache(BasePrefixCache):
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
-        assert (
-            req.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        assert new_prefix_len <= len(
-            new_indices
-        ), f"{new_prefix_len=}, {len(new_indices)=}"
+        assert req.cache_protected_len <= len(new_indices) + self.page_size - 1, (
+            f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        )
+        assert new_prefix_len <= len(new_indices), (
+            f"{new_prefix_len=}, {len(new_indices)=}"
+        )
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
@@ -1025,7 +1033,11 @@ class UnifiedRadixCache(BasePrefixCache):
             # Back up each fragment: after a split, lock_node only holds the
             # suffix; the prefix fragment must be persisted as well.
             for node_id in publish_node_ids:
-                self.write_backup_storage(node_id)
+                if not any(
+                    state.phase == "staging" and node_id in state.node_ids
+                    for state in self.ongoing_session_storage_demotions.values()
+                ):
+                    self.write_backup_storage(node_id)
 
     def load_back(
         self,
@@ -1091,6 +1103,9 @@ class UnifiedRadixCache(BasePrefixCache):
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
 
+        allow_protected_session_cache = (
+            req is None or self.request_can_evict_protected_session_cache(req)
+        )
         if self.supports_swa():
             avail = self.token_to_kv_pool_allocator.full_available_size()
         else:
@@ -1100,10 +1115,7 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.evict(
                 EvictParams(
                     num_tokens=needed,
-                    allow_protected_session_cache=(
-                        req is None
-                        or self.request_can_evict_protected_session_cache(req)
-                    ),
+                    allow_protected_session_cache=allow_protected_session_cache,
                 )
             )
             if result.num_tokens_evicted < needed:
@@ -1118,6 +1130,7 @@ class UnifiedRadixCache(BasePrefixCache):
             host_indices=kv_xfer.host_indices,
             node_id=node_id,
             extra_pools=aux_xfers or None,
+            allow_protected_session_cache=allow_protected_session_cache,
         )
 
         self.dec_lock_ref(node_id, ancestor_lock_params)
@@ -1218,6 +1231,8 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
         )
+        if operation_id is None:
+            return None
         self.ongoing_backup[operation_id] = (
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
@@ -1235,12 +1250,15 @@ class UnifiedRadixCache(BasePrefixCache):
             return {"state": "rejected", "message": "operation_id is required"}
         if not self.enable_storage or self.cache_controller is None:
             return {"state": "rejected", "message": "HiCache storage is disabled"}
+        completed = self._completed_session_storage_demotions.get(operation_id)
+        if completed is not None:
+            return dict(completed)
         pending = self.ongoing_session_storage_demotions.get(operation_id)
         if pending is not None:
             return {
                 "state": "pending",
                 "selected_tokens": pending.selected_tokens,
-                "message": "storage publish pending",
+                "message": f"storage {pending.phase} pending",
             }
         if any(
             state.session_id == session_id
@@ -1251,98 +1269,86 @@ class UnifiedRadixCache(BasePrefixCache):
         current_generation, node_ids = self.session_refs.snapshot_session_nodes(
             session_id, generation
         )
-        if current_generation is None:
-            return {"state": "noop", "message": "session has no local KV"}
-        if generation is not None and generation != current_generation:
-            return {
-                "state": "rejected",
-                "message": "session generation is stale",
-            }
-        if not node_ids:
-            return {"state": "noop", "message": "session has no local KV"}
-
-        nodes = [self.tree_core.node_by_id(node_id) for node_id in node_ids]
-        selected_tokens = sum(len(node.key) for node in nodes)
-        if any(node.key.extra_key is not None for node in nodes):
-            return {
-                "state": "rejected",
-                "selected_tokens": selected_tokens,
-                "message": "storage demotion does not support extra_key prefixes",
-            }
-        if self._session_storage_nodes_busy(nodes):
-            return {
-                "state": "rejected",
-                "selected_tokens": selected_tokens,
-                "message": "session KV is busy",
-            }
-
-        backup_ids_before = set(self.ongoing_backup)
-        device_node_ids = [
-            node.id
-            for node in sorted(nodes, key=self._session_storage_node_depth)
-            if not node.evicted
-        ]
-        if device_node_ids:
-            self._execute_and_commit_kv_backup(
-                BackupKV(node_ids=device_node_ids), write_back=True
-            )
-            self.writing_check(write_back=True)
-
-        local_started = all(node.backuped for node in nodes)
-        if local_started:
-            queued_nodes = {
-                node_id
-                for backup_id, (node_id, _lock_params) in self.ongoing_backup.items()
-                if backup_id not in backup_ids_before and node_id in node_ids
-            }
+        selected_tokens = 0
+        local_started = False
+        failure_message = "session has no local KV"
+        if (
+            current_generation is not None
+            and (generation is None or generation == current_generation)
+            and node_ids
+        ):
             try:
-                for node_id in node_ids:
-                    if node_id not in queued_nodes:
-                        self.write_backup_storage(node_id)
+                nodes = [self.tree_core.node_by_id(node_id) for node_id in node_ids]
+                selected_tokens = sum(len(node.key) for node in nodes)
+                if any(node.key.extra_key is not None for node in nodes):
+                    failure_message = (
+                        "storage demotion does not support extra_key prefixes"
+                    )
+                elif self._session_storage_nodes_busy(nodes):
+                    failure_message = "session KV is busy"
+                else:
+                    state = _OngoingSessionStorageDemotion(
+                        session_id=session_id,
+                        generation=current_generation,
+                        node_ids=node_ids,
+                        selected_tokens=selected_tokens,
+                    )
+                    self.ongoing_session_storage_demotions[operation_id] = state
+                    device_node_ids = [
+                        node.id
+                        for node in sorted(nodes, key=self._session_storage_node_depth)
+                        if not node.evicted
+                    ]
+                    if device_node_ids:
+                        self._execute_and_commit_kv_backup(
+                            BackupKV(node_ids=device_node_ids), write_back=True
+                        )
+                    local_started = self._session_storage_nodes_ready(node_ids)
+                    failure_message = "failed to stage complete host cache"
             except Exception:
                 logger.exception(
-                    "Failed to queue session storage demote operation_id=%s session_id=%s",
+                    "Failed to stage session storage demote operation_id=%s session_id=%s",
                     operation_id,
                     session_id,
                 )
-                local_started = False
+                failure_message = "failed to stage complete host cache"
+        elif current_generation is not None and generation != current_generation:
+            failure_message = "session generation is stale"
 
-        backup_ids = {
-            backup_id
-            for backup_id, (node_id, _lock_params) in self.ongoing_backup.items()
-            if backup_id not in backup_ids_before and node_id in node_ids
-        }
-        backed_node_ids = {
-            self.ongoing_backup[backup_id][0] for backup_id in backup_ids
-        }
-        local_started = (
-            local_started and bool(backup_ids) and backed_node_ids == set(node_ids)
-        )
         started = torch.tensor(int(local_started), dtype=torch.int, device="cpu")
         self._all_reduce(started, torch.distributed.ReduceOp.MIN)
         if not started.item():
-            return {
-                "state": "failed",
-                "selected_tokens": selected_tokens,
-                "message": "failed to stage and queue complete storage publish",
-            }
+            return self._finish_session_storage_demotion(
+                operation_id,
+                succeeded=False,
+                message=failure_message,
+                selected_tokens=selected_tokens,
+            )
 
-        state = _OngoingSessionStorageDemotion(
-            session_id=session_id,
-            generation=current_generation,
-            node_ids=node_ids,
-            selected_tokens=selected_tokens,
-            backup_ids=backup_ids,
-            backup_acks={},
-        )
-        self.ongoing_session_storage_demotions[operation_id] = state
-        for backup_id in backup_ids:
-            self.session_storage_demote_by_backup_id[backup_id] = operation_id
         return {
             "state": "pending",
             "selected_tokens": selected_tokens,
-            "message": "storage publish queued",
+            "message": "host staging queued",
         }
+
+    def _session_storage_nodes_ready(self, node_ids: Sequence[NodeId]) -> bool:
+        try:
+            for node_id in node_ids:
+                node = self.tree_core.node_by_id(node_id)
+                if not node.evicted:
+                    device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
+                    if device_value.numel() > 0 or comp_xfers:
+                        return False
+                if (
+                    self.tree_core.build_storage_backup_spec(
+                        node_id, self.hicache_storage_pass_prefix_keys
+                    )
+                    is None
+                ):
+                    return False
+        except (AssertionError, KeyError):
+            return False
+        return True
 
     @staticmethod
     def _session_storage_nodes_busy(nodes: Sequence[UnifiedTreeNode]) -> bool:
@@ -1390,68 +1396,172 @@ class UnifiedRadixCache(BasePrefixCache):
                 succeeded = succeeded and actual == expected
         state.backup_acks[operation.id] = succeeded
 
-    def _finish_session_storage_demotion(self, operation_id: str) -> None:
+    def _finish_session_storage_demotion(
+        self,
+        operation_id: str,
+        *,
+        succeeded: bool,
+        message: str,
+        selected_tokens: int = 0,
+        affected_tokens: int = 0,
+    ) -> dict:
         state = self.ongoing_session_storage_demotions.pop(operation_id, None)
-        if state is None:
-            return
-        for backup_id in state.backup_ids:
-            self.session_storage_demote_by_backup_id.pop(backup_id, None)
+        if state is not None:
+            selected_tokens = state.selected_tokens
+            for backup_id in state.backup_ids:
+                self.session_storage_demote_by_backup_id.pop(backup_id, None)
+        result = {
+            "state": "completed" if succeeded else "failed",
+            "selected_tokens": selected_tokens,
+            "affected_tokens": affected_tokens,
+            "message": message,
+        }
+        self._completed_session_storage_demotions[operation_id] = result
+        self._completed_session_storage_demotions.move_to_end(operation_id)
+        while len(self._completed_session_storage_demotions) > 8192:
+            self._completed_session_storage_demotions.popitem(last=False)
+        return result
 
     def _poll_session_storage_demotions(self) -> None:
-        for operation_id in sorted(self.ongoing_session_storage_demotions):
+        for operation_id in sorted(tuple(self.ongoing_session_storage_demotions)):
             state = self.ongoing_session_storage_demotions[operation_id]
-            local_done = len(state.backup_acks) == len(state.backup_ids)
-            local_success = local_done and all(state.backup_acks.values())
-            status = torch.tensor(
-                [int(local_done), int(local_success)], dtype=torch.int, device="cpu"
-            )
-            self._all_reduce(status, torch.distributed.ReduceOp.MIN)
-            if not status[0].item():
-                continue
-            if not status[1].item():
-                logger.warning(
-                    "Session storage demote failed operation_id=%s session_id=%s; device KV retained",
-                    operation_id,
-                    state.session_id,
+            if state.phase == "staging":
+                local_done = not any(
+                    node_id in pending.publish_node_ids
+                    for pending in self.ongoing_write_through.values()
+                    for node_id in state.node_ids
                 )
-                self._finish_session_storage_demotion(operation_id)
+                local_success = local_done and self._session_storage_nodes_ready(
+                    state.node_ids
+                )
+                status = torch.tensor(
+                    [int(local_done), int(local_success)],
+                    dtype=torch.int,
+                    device="cpu",
+                )
+                self._all_reduce(status, torch.distributed.ReduceOp.MIN)
+                if not status[0].item():
+                    continue
+                if not status[1].item():
+                    self._finish_session_storage_demotion(
+                        operation_id,
+                        succeeded=False,
+                        message="host staging failed; device KV retained",
+                    )
+                    continue
+                try:
+                    for node_id in state.node_ids:
+                        backup_id = self.write_backup_storage(node_id)
+                        if backup_id is None:
+                            state.local_failed = True
+                            continue
+                        state.backup_ids.add(backup_id)
+                        self.session_storage_demote_by_backup_id[backup_id] = (
+                            operation_id
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed to queue session storage demote operation_id=%s session_id=%s",
+                        operation_id,
+                        state.session_id,
+                    )
+                    state.local_failed = True
+                state.phase = "storage"
+                continue
+
+            if state.phase == "storage":
+                local_done = len(state.backup_acks) == len(state.backup_ids)
+                local_success = (
+                    local_done
+                    and not state.local_failed
+                    and len(state.backup_ids) == len(state.node_ids)
+                    and all(state.backup_acks.values())
+                )
+                status = torch.tensor(
+                    [int(local_done), int(local_success)],
+                    dtype=torch.int,
+                    device="cpu",
+                )
+                self._all_reduce(status, torch.distributed.ReduceOp.MIN)
+                if not status[0].item():
+                    continue
+                if not status[1].item():
+                    self._finish_session_storage_demotion(
+                        operation_id,
+                        succeeded=False,
+                        message="storage publish failed; device KV retained",
+                    )
+                    continue
+                state.phase = "commit"
                 continue
 
             generation, node_ids = self.session_refs.snapshot_session_nodes(
                 state.session_id, state.generation
             )
-            if generation != state.generation or node_ids != state.node_ids:
-                logger.warning(
-                    "Session storage demote raced with session mutation operation_id=%s session_id=%s; device KV retained",
+            local_valid = generation == state.generation and node_ids == state.node_ids
+            nodes = []
+            if local_valid:
+                try:
+                    nodes = [
+                        self.tree_core.node_by_id(node_id) for node_id in state.node_ids
+                    ]
+                    local_valid = self._session_storage_nodes_ready(state.node_ids)
+                except KeyError:
+                    local_valid = False
+            local_ready = local_valid and not self._session_storage_nodes_busy(nodes)
+            status = torch.tensor(
+                [int(local_valid), int(local_ready)], dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(status, torch.distributed.ReduceOp.MIN)
+            if not status[0].item():
+                self._finish_session_storage_demotion(
+                    operation_id,
+                    succeeded=False,
+                    message="session changed during storage publish; device KV retained",
+                )
+                continue
+            if not status[1].item():
+                continue
+
+            try:
+                priority_result = self.set_session_cache_priority(
+                    state.session_id,
+                    protected=False,
+                    generation=state.generation,
+                )
+                if priority_result.status not in ("updated", "unchanged"):
+                    raise RuntimeError(
+                        f"session priority update returned {priority_result.status}"
+                    )
+
+                tracker = {component_type: 0 for component_type in self.tree_components}
+                for node in sorted(
+                    nodes,
+                    key=lambda node: (
+                        self._session_storage_node_depth(node),
+                        node.id,
+                    ),
+                    reverse=True,
+                ):
+                    if node.evicted or not node.backuped:
+                        continue
+                    if any(data.session_ref > 0 for data in node.component_data):
+                        continue
+                    if not self.tree_core._is_device_leaf(node):
+                        continue
+                    self._demote(node.id, tracker)
+            except Exception:
+                logger.exception(
+                    "Failed to release session device KV operation_id=%s session_id=%s",
                     operation_id,
                     state.session_id,
                 )
-                self._finish_session_storage_demotion(operation_id)
+                self._finish_session_storage_demotion(
+                    operation_id,
+                    succeeded=False,
+                    message="device release failed",
+                )
                 continue
-
-            nodes = [self.tree_core.node_by_id(node_id) for node_id in node_ids]
-            if self._session_storage_nodes_busy(nodes):
-                continue
-
-            self.set_session_cache_priority(
-                state.session_id,
-                protected=False,
-                generation=state.generation,
-            )
-            tracker = {component_type: 0 for component_type in self.tree_components}
-
-            for node in sorted(
-                nodes,
-                key=lambda node: (self._session_storage_node_depth(node), node.id),
-                reverse=True,
-            ):
-                if node.evicted or not node.backuped:
-                    continue
-                if any(data.session_ref > 0 for data in node.component_data):
-                    continue
-                if not self.tree_core._is_device_leaf(node):
-                    continue
-                self._demote(node.id, tracker)
 
             affected_tokens = tracker[BASE_COMPONENT_TYPE]
             logger.info(
@@ -1461,7 +1571,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 state.selected_tokens,
                 affected_tokens,
             )
-            self._finish_session_storage_demotion(operation_id)
+            self._finish_session_storage_demotion(
+                operation_id,
+                succeeded=True,
+                affected_tokens=affected_tokens,
+                message="storage publish complete; device KV released",
+            )
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -2135,9 +2250,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
-        assert (
-            count_values[-2] == -count_values[-1]
-        ), "write_back duplicate-reclaim victims diverged across TP ranks"
+        assert count_values[-2] == -count_values[-1], (
+            "write_back duplicate-reclaim victims diverged across TP ranks"
+        )
         return (
             count_values[0],
             count_values[1],
@@ -2221,9 +2336,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
             finish_count = int(sync_tensor[0].item())
-            assert (
-                sync_tensor[1].item() == -sync_tensor[2].item()
-            ), "write_back duplicate-reclaim victims diverged across TP ranks"
+            assert sync_tensor[1].item() == -sync_tensor[2].item(), (
+                "write_back duplicate-reclaim victims diverged across TP ranks"
+            )
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
