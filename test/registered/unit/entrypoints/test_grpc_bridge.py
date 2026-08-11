@@ -110,6 +110,33 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
         )
         self.assertEqual([call[1] for call in callback.calls], [False, False, True])
 
+    def test_streaming_waits_for_lazy_request_normalization(self):
+        callback = _RecordingCallback()
+        handle = _make_runtime_handle([])
+        obj = SimpleNamespace(rid="logical")
+
+        def generate_request(obj, request=None):
+            async def generate():
+                obj.batch_size = 1
+                obj.parallel_sample_num = 1
+                yield {
+                    "index": 0,
+                    "output_ids": [1],
+                    "meta_info": {
+                        "id": "choice-0",
+                        "finish_reason": {"type": "stop"},
+                    },
+                }
+
+            return generate()
+
+        handle.tokenizer_manager.generate_request = generate_request
+
+        asyncio.run(handle._run_generate(obj, callback, stream=True, request=None))
+
+        self.assertEqual(callback.calls[0][0]["output_ids"], [1])
+        self.assertTrue(callback.calls[0][1])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

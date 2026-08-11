@@ -21,6 +21,12 @@ from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 logger = logging.getLogger(__name__)
 
 
+async def _prepend_async(first, remainder):
+    yield first
+    async for item in remainder:
+        yield item
+
+
 class _BadOpenAIRequest(ValueError):
     pass
 
@@ -298,9 +304,15 @@ class RuntimeHandle:
             ready_event = self._install_on_ready(chunk_callback)
             gen = self.tokenizer_manager.generate_request(obj, request=request)
             if stream:
+                try:
+                    first_chunk = await gen.__anext__()
+                except StopAsyncIteration:
+                    self._safe_callback(chunk_callback, {}, finished=True)
+                    return
                 completed_choices = set()
                 expected_choices = obj.batch_size * obj.parallel_sample_num
-                async for chunk in gen:
+                chunks = _prepend_async(first_chunk, gen)
+                async for chunk in chunks:
                     choice_finished = (
                         chunk.get("meta_info", {}).get("finish_reason") is not None
                     )
