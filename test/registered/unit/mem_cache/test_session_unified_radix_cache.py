@@ -382,6 +382,28 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         self.assertEqual(result.status, "updated")
         self.assertEqual(result.indexed_component_leaves, 0)
 
+    def test_storage_demote_poll_is_noop_without_operations(self):
+        with patch.object(self.cache, "_all_reduce") as all_reduce:
+            self.cache._poll_session_storage_demotions()
+
+        all_reduce.assert_not_called()
+
+    def test_storage_demote_failure_stays_in_collective_order(self):
+        self.cache.enable_storage = True
+        self.cache.cache_controller = MagicMock()
+
+        with patch.object(self.cache, "_all_reduce") as all_reduce:
+            result = self.cache.demote_session_to_storage("demote-1", "missing")
+            all_reduce.assert_not_called()
+            self.assertEqual(result["state"], "pending")
+
+            self.cache._poll_session_storage_demotions()
+
+        all_reduce.assert_called_once()
+        self.assertNotIn("demote-1", self.cache.ongoing_session_storage_demotions)
+        repeated = self.cache.demote_session_to_storage("demote-1", "missing")
+        self.assertEqual(repeated["state"], "failed")
+
     def test_storage_demote_waits_for_ack_before_releasing_device_kv(self):
         leaf = insert(self.cache, [1, 2, 3, 4])
         generation = self.cache.open_radix_session("s1")
