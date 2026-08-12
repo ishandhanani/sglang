@@ -240,6 +240,29 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         self.assertEqual(result.status, "stale_generation")
         self.assertEqual(result.generation, generation)
 
+    def test_non_deferred_eviction_releases_session_immediately(self):
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        generation = self.cache.open_radix_session("s1")
+        register(self.cache, [1, 2, 3, 4], "s1", generation)
+        req = SimpleNamespace(
+            session_id="s1",
+            session_generation=generation,
+            session=None,
+        )
+
+        result = self.cache.session_refs.complete_request(
+            req,
+            has_reusable_leaf=False,
+            evict_session=True,
+            defer_eviction=False,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.status, "evicted")
+        self.assertEqual(self.full.session_ref(leaf), 0)
+        self.assertGreater(result.generation, generation)
+        self.assertEqual(self.cache.session_refs._pending_session_evictions, {})
+
     def test_compaction_defers_eviction_until_next_successful_request(self):
         old_leaf = insert(self.cache, [1, 2, 3, 4])
         old_generation = self.cache.open_radix_session("s1")
@@ -265,6 +288,7 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         req.extra_key = None
         req.session_generation = old_generation
         req.evict_session_after_finish = True
+        req.defer_session_eviction_after_finish = True
         req.finished_reason = FINISH_LENGTH(length=1)
 
         with patch.object(
@@ -380,6 +404,7 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         req.extra_key = None
         req.session_generation = generation
         req.evict_session_after_finish = True
+        req.defer_session_eviction_after_finish = True
         req.finished_reason = FINISH_ABORT("client disconnected")
 
         with patch.object(

@@ -882,6 +882,7 @@ class Req(ReqDllmMixin):
         self.session_generation: Optional[int] = None
         # A one-shot router action applied only after this request finishes successfully.
         self.evict_session_after_finish = False
+        self.defer_session_eviction_after_finish = False
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices

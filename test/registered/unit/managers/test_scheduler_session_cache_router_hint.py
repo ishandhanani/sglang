@@ -23,15 +23,38 @@ class TestSessionCacheRouterHint(unittest.TestCase):
             session_id="session-a",
             session_generation=7,
             evict_session_after_finish=False,
+            defer_session_eviction_after_finish=False,
+        )
+
+        Scheduler._schedule_router_session_eviction(
+            scheduler,
+            {"evict_session": True, "defer_session_eviction": True},
+            req,
+        )
+
+        tree_cache.evict_radix_session.assert_not_called()
+        self.assertEqual(req.session_generation, 7)
+        self.assertTrue(req.evict_session_after_finish)
+        self.assertTrue(req.defer_session_eviction_after_finish)
+
+    def test_session_final_eviction_remains_immediate(self):
+        scheduler = types.SimpleNamespace(
+            enable_session_radix_cache=True,
+            tree_cache=MagicMock(),
+        )
+        req = types.SimpleNamespace(
+            session_id="session-a",
+            session_generation=7,
+            evict_session_after_finish=False,
+            defer_session_eviction_after_finish=False,
         )
 
         Scheduler._schedule_router_session_eviction(
             scheduler, {"evict_session": True}, req
         )
 
-        tree_cache.evict_radix_session.assert_not_called()
-        self.assertEqual(req.session_generation, 7)
         self.assertTrue(req.evict_session_after_finish)
+        self.assertFalse(req.defer_session_eviction_after_finish)
 
     def test_session_eviction_hint_fails_open(self):
         tree_cache = MagicMock()
@@ -43,6 +66,7 @@ class TestSessionCacheRouterHint(unittest.TestCase):
             session_id="session-a",
             session_generation=7,
             evict_session_after_finish=False,
+            defer_session_eviction_after_finish=False,
         )
 
         for hint in (None, {}, {"evict_session": False}, {"evict_session": "true"}):
@@ -50,6 +74,7 @@ class TestSessionCacheRouterHint(unittest.TestCase):
 
         tree_cache.evict_radix_session.assert_not_called()
         self.assertFalse(req.evict_session_after_finish)
+        self.assertFalse(req.defer_session_eviction_after_finish)
 
     def test_applies_valid_actions(self):
         tree_cache = MagicMock()

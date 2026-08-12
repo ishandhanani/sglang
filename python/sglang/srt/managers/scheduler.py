@@ -2434,11 +2434,15 @@ class Scheduler(
             return
 
         req.evict_session_after_finish = True
+        req.defer_session_eviction_after_finish = (
+            router_hint.get("defer_session_eviction") is True
+        )
         logger.info(
-            "Scheduled router session eviction handoff after request completion "
-            "session_id=%s generation=%s",
+            "Scheduled router session eviction after request completion "
+            "session_id=%s generation=%s deferred=%s",
             req.session_id,
             req.session_generation,
+            req.defer_session_eviction_after_finish,
         )
 
     def _apply_router_session_storage_demotions(

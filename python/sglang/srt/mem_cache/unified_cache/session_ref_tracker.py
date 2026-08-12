@@ -275,9 +275,16 @@ class UnifiedSessionRefTracker:
         req: Req,
         *,
         has_reusable_leaf: bool,
+        evict_session: bool,
         defer_eviction: bool,
     ) -> Optional[SessionCacheEvictResult]:
         """Update session references after one successful request."""
+        if evict_session and not defer_eviction:
+            session_id = self.session_id_for_req(req)
+            if session_id is None:
+                return None
+            return self.evict_radix_session(session_id, req.session_generation)
+
         if defer_eviction:
             if has_reusable_leaf:
                 self.register_session_ref(req)

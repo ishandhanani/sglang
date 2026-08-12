@@ -261,6 +261,9 @@ fn insert_router_hint(
     if hint.evict_session {
         value.insert("evict_session".into(), serde_json::json!(true));
     }
+    if hint.defer_session_eviction {
+        value.insert("defer_session_eviction".into(), serde_json::json!(true));
+    }
 
     if !value.is_empty() {
         request.insert("router_hint".into(), serde_json::Value::Object(value));
@@ -516,6 +519,7 @@ mod tests {
             }],
             prefetch_from_storage: true,
             evict_session: true,
+            defer_session_eviction: true,
         });
         let text_req = proto::TextGenerateRequest {
             router_hint: router_hint.clone(),
@@ -553,6 +557,7 @@ mod tests {
                     }],
                     "prefetch_from_storage": true,
                     "evict_session": true,
+                    "defer_session_eviction": true,
                 })
             );
         }
@@ -572,6 +577,7 @@ mod tests {
                 session_storage_demotions: Vec::new(),
                 prefetch_from_storage: false,
                 evict_session: false,
+                defer_session_eviction: false,
             }),
             ..Default::default()
         };
