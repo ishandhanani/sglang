@@ -240,7 +240,7 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         self.assertEqual(result.status, "stale_generation")
         self.assertEqual(result.generation, generation)
 
-    def test_finished_request_registers_then_evicts_session(self):
+    def test_finished_request_skips_registration_before_evicting_session(self):
         old_leaf = insert(self.cache, [1, 2, 3, 4])
         old_generation = self.cache.open_radix_session("s1")
         register(self.cache, [1, 2, 3, 4], "s1", old_generation)
@@ -268,11 +268,11 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         req.finished_reason = FINISH_LENGTH(length=1)
 
         evict_results = []
-        registered_leaf_ids = []
+        indexed_leaf_ids = []
         evict_radix_session = self.cache.session_refs.evict_radix_session
 
         def capture_evict(*args, **kwargs):
-            registered_leaf_ids.append(
+            indexed_leaf_ids.append(
                 tuple(node.id for node in self.full.session_leaves("s1"))
             )
             result = evict_radix_session(*args, **kwargs)
@@ -290,8 +290,8 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
 
         self.assertEqual(len(evict_results), 1)
         result = evict_results[0]
-        self.assertEqual(registered_leaf_ids, [(req.last_node,)])
         self.assertNotEqual(req.last_node, old_leaf.id)
+        self.assertEqual(indexed_leaf_ids, [(old_leaf.id,)])
         self.assertEqual(result.status, "evicted")
         self.assertEqual(result.indexed_component_leaves, 1)
         self.assertGreater(result.generation, old_generation)

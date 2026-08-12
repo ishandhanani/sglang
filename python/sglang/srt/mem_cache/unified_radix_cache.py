@@ -770,9 +770,10 @@ class UnifiedRadixCache(BasePrefixCache):
             if req.finished_reason is not None and not isinstance(
                 req.finished_reason, FINISH_ABORT
             ):
-                if result is not None:
+                should_evict_session = getattr(req, "evict_session_after_finish", False)
+                if result is not None and not should_evict_session:
                     self.session_refs.register_session_ref(req)
-                if getattr(req, "evict_session_after_finish", False):
+                if should_evict_session:
                     evict_result = self.session_refs.evict_radix_session(
                         req.session_id, generation=req.session_generation
                     )
