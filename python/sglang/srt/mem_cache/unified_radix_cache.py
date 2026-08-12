@@ -773,21 +773,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 if req.finished_reason is not None and not isinstance(
                     req.finished_reason, FINISH_ABORT
                 ):
-                    should_evict_session = getattr(
-                        req, "evict_session_after_finish", False
-                    )
-                    should_defer_eviction = should_evict_session and getattr(
-                        req, "defer_session_eviction_after_finish", False
-                    )
                     evict_result = self.session_refs.complete_request(
                         req,
                         has_reusable_leaf=result is not None,
-                        evict_session=should_evict_session,
-                        defer_eviction=should_defer_eviction,
+                        deref_apply_on=getattr(req, "deref_apply_on", None),
                     )
                     if evict_result is not None:
                         logger.info(
-                            "Applied router session eviction "
+                            "Applied KV DEREF "
                             "session_id=%s status=%s generation=%s "
                             "indexed_component_leaves=%s",
                             req.session_id,

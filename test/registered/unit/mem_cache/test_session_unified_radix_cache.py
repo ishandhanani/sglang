@@ -250,11 +250,12 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
             session=None,
         )
 
+        from sglang.srt.kv_hints import DerefApplyOn
+
         result = self.cache.session_refs.complete_request(
             req,
             has_reusable_leaf=False,
-            evict_session=True,
-            defer_eviction=False,
+            deref_apply_on=DerefApplyOn.CURRENT_SUCCESS,
         )
 
         self.assertIsNotNone(result)
@@ -287,8 +288,9 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         req.last_node = self.cache.root_node.id
         req.extra_key = None
         req.session_generation = old_generation
-        req.evict_session_after_finish = True
-        req.defer_session_eviction_after_finish = True
+        from sglang.srt.kv_hints import DerefApplyOn
+
+        req.deref_apply_on = DerefApplyOn.NEXT_SUCCESS
         req.finished_reason = FINISH_LENGTH(length=1)
 
         with patch.object(
@@ -403,8 +405,9 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         req.last_node = self.cache.root_node.id
         req.extra_key = None
         req.session_generation = generation
-        req.evict_session_after_finish = True
-        req.defer_session_eviction_after_finish = True
+        from sglang.srt.kv_hints import DerefApplyOn
+
+        req.deref_apply_on = DerefApplyOn.NEXT_SUCCESS
         req.finished_reason = FINISH_ABORT("client disconnected")
 
         with patch.object(

@@ -425,10 +425,15 @@ class RuntimeHandle:
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
+        from sglang.srt.kv_hints import supported_kv_hint_capabilities
+
         result: Dict[str, Any] = self.tokenizer_manager.resolved_config_dict(
             dataclasses.asdict(self.tokenizer_manager.server_args)
         )
         result.update(self.scheduler_info)
+        result["kv_hint_capabilities"] = supported_kv_hint_capabilities(
+            enable_session_radix_cache=self.tokenizer_manager.server_args.enable_session_radix_cache
+        )
         return json.dumps(msgspec_to_builtins(result), default=str)
 
     def health_check(self) -> bool:

@@ -781,6 +781,8 @@ async def get_server_info():
 @app.get("/server_info")
 async def server_info():
     """Get the server information."""
+    from sglang.srt.kv_hints import supported_kv_hint_capabilities
+
     # Returns internal states per DP.
     internal_states: List[Dict[Any, Any]] = (
         await _global_state.tokenizer_manager.get_internal_state()
@@ -795,6 +797,9 @@ async def server_info():
                 dataclasses.asdict(server_args)
             ),
             **_global_state.scheduler_info,
+            "kv_hint_capabilities": supported_kv_hint_capabilities(
+                enable_session_radix_cache=server_args.enable_session_radix_cache
+            ),
             "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,
             "version": __version__,

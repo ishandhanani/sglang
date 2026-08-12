@@ -1328,6 +1328,8 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
     def get_server_info(self):
+        from sglang.srt.kv_hints import supported_kv_hint_capabilities
+
         internal_states = self.loop.run_until_complete(
             self.tokenizer_manager.get_internal_state()
         )
@@ -1337,6 +1339,9 @@ class Engine(EngineScoreMixin, EngineBase):
                     dataclasses.asdict(self.tokenizer_manager.server_args)
                 ),
                 **self._scheduler_init_result.scheduler_infos[0],
+                "kv_hint_capabilities": supported_kv_hint_capabilities(
+                    enable_session_radix_cache=self.tokenizer_manager.server_args.enable_session_radix_cache
+                ),
                 "startup_time": self.tokenizer_manager.startup_time,
                 "internal_states": internal_states,
                 "version": __version__,

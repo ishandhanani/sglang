@@ -48,33 +48,29 @@ message DisaggregatedParams {
   int64 bootstrap_room = 3;
 }
 
-// Advisory metadata attached by an upstream router after worker selection.
-message RouterHint {
-  optional string source_control_endpoint = 1;
+// Versioned KV-cache actions attached by an upstream dispatcher.
+message KvHints {
+  optional DerefHint deref = 1;
+  optional MigrateHint migrate = 2;
+}
+
+enum DerefApplyOn {
+  DEREF_APPLY_ON_UNSPECIFIED = 0;
+  DEREF_APPLY_ON_CURRENT_SUCCESS = 1;
+  DEREF_APPLY_ON_NEXT_SUCCESS = 2;
+}
+
+message DerefHint {
+  DerefApplyOn apply_on = 1;
+}
+
+message MigrateHint {
+  KvTransferPlan transfer_plan = 1;
+}
+
+message KvTransferPlan {
+  string source_control_endpoint = 1;
   repeated uint64 block_hashes = 2;
-  repeated SessionCacheAction session_cache_actions = 3;
-  repeated SessionStorageDemotion session_storage_demotions = 4;
-  bool prefetch_from_storage = 5;
-  bool evict_session = 6;
-  bool defer_session_eviction = 7;
-}
-
-enum SessionCachePriority {
-  SESSION_CACHE_PRIORITY_UNSPECIFIED = 0;
-  SESSION_CACHE_PRIORITY_PROTECTED = 1;
-  SESSION_CACHE_PRIORITY_EVICTABLE = 2;
-}
-
-message SessionCacheAction {
-  string session_id = 1;
-  SessionCachePriority cache_priority = 2;
-  optional uint64 session_generation = 3;
-}
-
-message SessionStorageDemotion {
-  string operation_id = 1;
-  string session_id = 2;
-  optional uint64 session_generation = 3;
 }
 
 // Sampling parameters shared across text and tokenized RPCs.
@@ -132,7 +128,7 @@ message TextGenerateRequest {
   optional int32 priority = 15;
   optional bool require_reasoning = 16;
   optional uint32 max_thinking_tokens = 17;
-  optional RouterHint router_hint = 18;
+  optional KvHints kv_hints = 18;
 }
 
 message TextGenerateResponse {
@@ -160,7 +156,7 @@ message GenerateRequest {
   optional int32 priority = 14;
   optional bool require_reasoning = 15;
   optional uint32 max_thinking_tokens = 16;
-  optional RouterHint router_hint = 17;
+  optional KvHints kv_hints = 17;
 }
 
 message GenerateResponse {

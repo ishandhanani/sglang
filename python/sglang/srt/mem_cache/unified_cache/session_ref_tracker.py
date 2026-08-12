@@ -10,6 +10,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Optional
 
+from sglang.srt.kv_hints import DerefApplyOn
 from sglang.srt.mem_cache.unified_cache.component_type import BASE_COMPONENT_TYPE
 
 if TYPE_CHECKING:
@@ -275,17 +276,16 @@ class UnifiedSessionRefTracker:
         req: Req,
         *,
         has_reusable_leaf: bool,
-        evict_session: bool,
-        defer_eviction: bool,
+        deref_apply_on: Optional[DerefApplyOn],
     ) -> Optional[SessionCacheEvictResult]:
         """Update session references after one successful request."""
-        if evict_session and not defer_eviction:
+        if deref_apply_on == DerefApplyOn.CURRENT_SUCCESS:
             session_id = self.session_id_for_req(req)
             if session_id is None:
                 return None
             return self.evict_radix_session(session_id, req.session_generation)
 
-        if defer_eviction:
+        if deref_apply_on == DerefApplyOn.NEXT_SUCCESS:
             if has_reusable_leaf:
                 self.register_session_ref(req)
             self.defer_radix_session_eviction(req)

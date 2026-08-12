@@ -103,6 +103,7 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
+from sglang.srt.kv_hints import KvHints
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
@@ -2355,163 +2356,23 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
-    def _apply_router_session_cache_actions(self, router_hint: Optional[dict]) -> None:
-        if not isinstance(router_hint, dict):
-            return
-        actions = router_hint.get("session_cache_actions")
-        if actions is None:
+    def _apply_kv_hints(self, kv_hints: Optional[KvHints], req: Req) -> None:
+        if kv_hints is None or kv_hints.deref is None:
             return
         if not self.enable_session_radix_cache:
-            logger.warning(
-                "Ignoring router session-cache actions because session radix cache is disabled"
-            )
-            return
-        if not isinstance(actions, list) or len(actions) > 64:
-            logger.warning("Ignoring malformed router session-cache actions")
-            return
-
-        for index, action in enumerate(actions):
-            if not isinstance(action, dict):
-                logger.warning(
-                    "Ignoring malformed router session-cache action index=%s", index
-                )
-                continue
-            session_id = action.get("session_id")
-            cache_priority = action.get("cache_priority")
-            generation = action.get("session_generation")
-            if (
-                not isinstance(session_id, str)
-                or not session_id
-                or len(session_id) > 512
-                or cache_priority not in ("protected", "evictable")
-                or (
-                    generation is not None
-                    and (
-                        isinstance(generation, bool)
-                        or not isinstance(generation, int)
-                        or generation < 0
-                    )
-                )
-            ):
-                logger.warning(
-                    "Ignoring malformed router session-cache action index=%s", index
-                )
-                continue
-
-            result = self.tree_cache.set_session_cache_priority(
-                session_id,
-                protected=cache_priority == "protected",
-                generation=generation,
-            )
-            logger.info(
-                "Applied router session-cache action session_id=%s "
-                "cache_priority=%s status=%s generation=%s "
-                "indexed_component_leaves=%s",
-                session_id,
-                cache_priority,
-                result.status,
-                result.generation,
-                result.indexed_component_leaves,
-            )
-
-    def _schedule_router_session_eviction(
-        self, router_hint: Optional[dict], req: Req
-    ) -> None:
-        if (
-            not isinstance(router_hint, dict)
-            or router_hint.get("evict_session") is not True
-        ):
-            return
-        if not self.enable_session_radix_cache:
-            logger.warning(
-                "Ignoring router session eviction because session radix cache is disabled"
-            )
+            logger.warning("Ignoring KV DEREF because session radix cache is disabled")
             return
         if req.session_id is None or req.session_generation is None:
-            logger.warning(
-                "Ignoring router session eviction without a radix-native session"
-            )
+            logger.warning("Ignoring KV DEREF without a radix-native session")
             return
 
-        req.evict_session_after_finish = True
-        req.defer_session_eviction_after_finish = (
-            router_hint.get("defer_session_eviction") is True
-        )
+        req.deref_apply_on = kv_hints.deref.apply_on
         logger.info(
-            "Scheduled router session eviction after request completion "
-            "session_id=%s generation=%s deferred=%s",
+            "Scheduled KV DEREF session_id=%s generation=%s apply_on=%s",
             req.session_id,
             req.session_generation,
-            req.defer_session_eviction_after_finish,
+            req.deref_apply_on.value,
         )
-
-    def _apply_router_session_storage_demotions(
-        self, router_hint: Optional[dict]
-    ) -> None:
-        if not isinstance(router_hint, dict):
-            return
-        demotions = router_hint.get("session_storage_demotions")
-        if demotions is None:
-            return
-        if not self.enable_session_radix_cache:
-            logger.warning(
-                "Ignoring router session storage demotions because session radix cache is disabled"
-            )
-            return
-        if not isinstance(demotions, list) or len(demotions) > 64:
-            logger.warning("Ignoring malformed router session storage demotions")
-            return
-
-        for index, demotion in enumerate(demotions):
-            if not isinstance(demotion, dict):
-                logger.warning(
-                    "Ignoring malformed router session storage demotion index=%s", index
-                )
-                continue
-            operation_id = demotion.get("operation_id")
-            session_id = demotion.get("session_id")
-            generation = demotion.get("session_generation")
-            if (
-                not isinstance(operation_id, str)
-                or not operation_id
-                or len(operation_id) > 512
-                or not isinstance(session_id, str)
-                or not session_id
-                or len(session_id) > 512
-                or (
-                    generation is not None
-                    and (
-                        isinstance(generation, bool)
-                        or not isinstance(generation, int)
-                        or generation < 0
-                    )
-                )
-            ):
-                logger.warning(
-                    "Ignoring malformed router session storage demotion index=%s", index
-                )
-                continue
-            try:
-                result = self.tree_cache.demote_session_to_storage(
-                    operation_id,
-                    session_id,
-                    generation=generation,
-                )
-            except Exception:
-                logger.exception(
-                    "Router session storage demotion failed open operation_id=%s session_id=%s",
-                    operation_id,
-                    session_id,
-                )
-                continue
-            logger.info(
-                "Applied router session storage demotion operation_id=%s session_id=%s state=%s selected_tokens=%s message=%s",
-                operation_id,
-                session_id,
-                result.get("state"),
-                result.get("selected_tokens", 0),
-                result.get("message", ""),
-            )
 
     def handle_generate_request(
         self,
@@ -2652,10 +2513,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        self._schedule_router_session_eviction(recv_req.router_hint, req)
-        self._apply_router_session_cache_actions(recv_req.router_hint)
-        self._apply_router_session_storage_demotions(recv_req.router_hint)
-        req.router_hint = recv_req.router_hint
+        self._apply_kv_hints(recv_req.kv_hints, req)
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
@@ -2845,10 +2703,6 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
-            router_hint = getattr(req, "router_hint", None)
-            force_prefetch = isinstance(router_hint, dict) and (
-                router_hint.get("prefetch_from_storage") is True
-            )
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             if tree_cache.is_backuped(req.last_host_node) or tree_cache.is_root(
@@ -2870,7 +2724,7 @@ class Scheduler(
                     new_input_tokens,
                     tree_cache.get_last_hash_value(req.last_host_node),
                     prefix_keys,
-                    force=force_prefetch,
+                    force=False,
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
