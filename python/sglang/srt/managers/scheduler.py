@@ -2435,7 +2435,7 @@ class Scheduler(
 
         req.evict_session_after_finish = True
         logger.info(
-            "Scheduled router session eviction after request completion "
+            "Scheduled router session eviction handoff after request completion "
             "session_id=%s generation=%s",
             req.session_id,
             req.session_generation,

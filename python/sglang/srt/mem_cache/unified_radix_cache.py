@@ -701,6 +701,7 @@ class UnifiedRadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_len_to_handle
         ]
+        locked_node_id = req.last_node
 
         result = None
         insert_params = None
@@ -753,39 +754,52 @@ class UnifiedRadixCache(BasePrefixCache):
                 start_pos=req.cache_protected_len,
             )
 
-        self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
-
         if is_insert and result is not None and result.last_device_node is not None:
             req.last_node = result.last_device_node
 
-        # cleanup
-        for comp in self._components_tuple:
-            comp.cleanup_after_caching_req(
-                req, is_finished=True, insert_result=result, insert_params=insert_params
+        try:
+            # cleanup
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(
+                    req,
+                    is_finished=True,
+                    insert_result=result,
+                    insert_params=insert_params,
+                )
+
+            if self.enable_session_radix_cache:
+                from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+                if req.finished_reason is not None and not isinstance(
+                    req.finished_reason, FINISH_ABORT
+                ):
+                    should_defer_eviction = getattr(
+                        req, "evict_session_after_finish", False
+                    )
+                    evict_result = self.session_refs.complete_request(
+                        req,
+                        has_reusable_leaf=result is not None,
+                        defer_eviction=should_defer_eviction,
+                    )
+                    if evict_result is not None:
+                        logger.info(
+                            "Applied pending router session eviction "
+                            "session_id=%s status=%s generation=%s "
+                            "indexed_component_leaves=%s",
+                            req.session_id,
+                            evict_result.status,
+                            evict_result.generation,
+                            evict_result.indexed_component_leaves,
+                        )
+        finally:
+            self.dec_lock_ref(
+                locked_node_id,
+                DecLockRefParams(
+                    swa_uuid_for_lock=req.swa_uuid_for_lock,
+                    skip_lock_node_ids=req.skip_lock_node_ids,
+                ),
+                skip_swa=req.swa_prefix_lock_released,
             )
-
-        if self.enable_session_radix_cache:
-            from sglang.srt.managers.schedule_batch import FINISH_ABORT
-
-            if req.finished_reason is not None and not isinstance(
-                req.finished_reason, FINISH_ABORT
-            ):
-                should_evict_session = getattr(req, "evict_session_after_finish", False)
-                if result is not None and not should_evict_session:
-                    self.session_refs.register_session_ref(req)
-                if should_evict_session:
-                    evict_result = self.session_refs.evict_radix_session(
-                        req.session_id, generation=req.session_generation
-                    )
-                    logger.info(
-                        "Applied deferred router session eviction "
-                        "session_id=%s status=%s generation=%s "
-                        "indexed_component_leaves=%s",
-                        req.session_id,
-                        evict_result.status,
-                        evict_result.generation,
-                        evict_result.indexed_component_leaves,
-                    )
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):

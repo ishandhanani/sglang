@@ -240,7 +240,7 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         self.assertEqual(result.status, "stale_generation")
         self.assertEqual(result.generation, generation)
 
-    def test_finished_request_skips_registration_before_evicting_session(self):
+    def test_compaction_defers_eviction_until_next_successful_request(self):
         old_leaf = insert(self.cache, [1, 2, 3, 4])
         old_generation = self.cache.open_radix_session("s1")
         register(self.cache, [1, 2, 3, 4], "s1", old_generation)
@@ -267,14 +267,67 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         req.evict_session_after_finish = True
         req.finished_reason = FINISH_LENGTH(length=1)
 
+        with patch.object(
+            self.cache.session_refs,
+            "evict_radix_session",
+            wraps=self.cache.session_refs.evict_radix_session,
+        ) as evict:
+            self.cache.cache_finished_req(
+                req, is_insert=True, kv_len_to_handle=len(token_ids)
+            )
+
+        evict.assert_not_called()
+        self.assertNotEqual(req.last_node, old_leaf.id)
+        compaction_leaf = self.cache.tree_core.node_by_id(req.last_node)
+        self.assertEqual(self.full.session_ref(old_leaf), 1)
+        self.assertEqual(self.full.session_ref(compaction_leaf), 1)
+        self.assertEqual(self.full.session_leaves("s1"), (compaction_leaf,))
+        self.assertEqual(
+            self.cache.session_refs._pending_session_evictions,
+            {"s1": old_generation},
+        )
+
+        # Create a radix boundary for the shared prefix. The real next request
+        # matches and locks this prefix before it allocates its new suffix.
+        insert(self.cache, [1, 2, 99])
+        next_token_ids = [1, 2, 9, 10]
+        match_result = self.cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", next_token_ids)))
+        )
+        shared = self.cache.tree_core.node_by_id(match_result.last_device_node)
+        self.assertEqual(len(match_result.device_indices), 2)
+        self.assertEqual(self.full.session_ref(shared), 1)
+
+        next_req = Req(
+            rid="post-compaction",
+            origin_input_text="",
+            origin_input_ids=array("q", next_token_ids),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            session_id="s1",
+        )
+        self.cache.req_to_token_pool.alloc([next_req])
+        suffix_indices = self.cache.token_to_kv_pool_allocator.alloc(2)
+        self.cache.req_to_token_pool.write(
+            (next_req.req_pool_idx, slice(0, 2)), match_result.device_indices
+        )
+        self.cache.req_to_token_pool.write(
+            (next_req.req_pool_idx, slice(2, 4)), suffix_indices
+        )
+        next_req.kv = ReqKvInfo(kv_allocated_len=4, swa_evicted_seqlen=0)
+        next_req.kv_committed_len = 4
+        next_req.cache_protected_len = 2
+        next_req.last_node = shared.id
+        next_req.extra_key = None
+        next_req.session_generation = old_generation
+        next_req.finished_reason = FINISH_LENGTH(length=1)
+        self.cache.inc_lock_ref(shared.id)
+
+        shared_lock_refs = []
         evict_results = []
-        indexed_leaf_ids = []
         evict_radix_session = self.cache.session_refs.evict_radix_session
 
         def capture_evict(*args, **kwargs):
-            indexed_leaf_ids.append(
-                tuple(node.id for node in self.full.session_leaves("s1"))
-            )
+            shared_lock_refs.append(shared.component_data[ComponentType.FULL].lock_ref)
             result = evict_radix_session(*args, **kwargs)
             evict_results.append(result)
             return result
@@ -285,18 +338,22 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
             side_effect=capture_evict,
         ):
             self.cache.cache_finished_req(
-                req, is_insert=True, kv_len_to_handle=len(token_ids)
+                next_req,
+                is_insert=True,
+                kv_len_to_handle=len(next_token_ids),
             )
 
+        self.assertEqual(shared_lock_refs, [1])
+        self.assertEqual(shared.component_data[ComponentType.FULL].lock_ref, 0)
         self.assertEqual(len(evict_results), 1)
-        result = evict_results[0]
-        self.assertNotEqual(req.last_node, old_leaf.id)
-        self.assertEqual(indexed_leaf_ids, [(old_leaf.id,)])
-        self.assertEqual(result.status, "evicted")
-        self.assertEqual(result.indexed_component_leaves, 1)
-        self.assertGreater(result.generation, old_generation)
-        self.assertEqual(self.full.session_ref(old_leaf), 0)
-        self.assertEqual(self.full.session_leaves("s1"), ())
+        self.assertEqual(evict_results[0].status, "evicted")
+        self.assertGreater(next_req.session_generation, old_generation)
+        self.assertEqual(self.cache.session_refs._pending_session_evictions, {})
+        next_leaf = self.cache.tree_core.node_by_id(next_req.last_node)
+        self.assertEqual(self.full.session_ref(compaction_leaf), 0)
+        self.assertEqual(self.full.session_ref(shared), 1)
+        self.assertEqual(self.full.session_ref(next_leaf), 1)
+        self.assertEqual(self.full.session_leaves("s1"), (next_leaf,))
 
     def test_aborted_request_does_not_evict_session(self):
         leaf = insert(self.cache, [1, 2, 3, 4])
@@ -336,6 +393,112 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
 
         evict.assert_not_called()
         self.assertEqual(self.cache.ensure_session_generation("s1"), generation)
+        self.assertEqual(self.full.session_ref(leaf), 1)
+        self.assertEqual(self.cache.session_refs._pending_session_evictions, {})
+
+    def test_aborted_post_compaction_request_keeps_pending_eviction(self):
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        generation = self.cache.open_radix_session("s1")
+        register(self.cache, [1, 2, 3, 4], "s1", generation)
+        compaction_req = SimpleNamespace(
+            session_id="s1",
+            session_generation=generation,
+            session=None,
+        )
+        self.assertTrue(
+            self.cache.session_refs.defer_radix_session_eviction(compaction_req)
+        )
+
+        req = Req(
+            rid="aborted-post-compaction",
+            origin_input_text="",
+            origin_input_ids=array("q", [1, 2, 3, 4]),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            session_id="s1",
+        )
+        self.cache.req_to_token_pool.alloc([req])
+        kv_indices = self.cache.token_to_kv_pool_allocator.alloc(4)
+        self.cache.req_to_token_pool.write((req.req_pool_idx, slice(0, 4)), kv_indices)
+        req.kv = ReqKvInfo(kv_allocated_len=4, swa_evicted_seqlen=0)
+        req.kv_committed_len = 4
+        req.cache_protected_len = 0
+        req.last_node = self.cache.root_node.id
+        req.extra_key = None
+        req.session_generation = generation
+        req.finished_reason = FINISH_ABORT("client disconnected")
+
+        self.cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=4)
+
+        self.assertEqual(
+            self.cache.session_refs._pending_session_evictions,
+            {"s1": generation},
+        )
+        self.assertEqual(self.full.session_ref(leaf), 1)
+
+        self.cache.release_radix_session("s1")
+        self.assertEqual(self.cache.session_refs._pending_session_evictions, {})
+        self.assertEqual(self.full.session_ref(leaf), 0)
+
+    def test_success_without_new_leaf_keeps_pending_eviction(self):
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        generation = self.cache.open_radix_session("s1")
+        register(self.cache, [1, 2, 3, 4], "s1", generation)
+        compaction_req = SimpleNamespace(
+            session_id="s1",
+            session_generation=generation,
+            session=None,
+        )
+        self.cache.session_refs.defer_radix_session_eviction(compaction_req)
+
+        req = Req(
+            rid="uncached-post-compaction",
+            origin_input_text="",
+            origin_input_ids=array("q", [1, 2, 3, 4]),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            session_id="s1",
+        )
+        self.cache.req_to_token_pool.alloc([req])
+        kv_indices = self.cache.token_to_kv_pool_allocator.alloc(4)
+        self.cache.req_to_token_pool.write((req.req_pool_idx, slice(0, 4)), kv_indices)
+        req.kv = ReqKvInfo(kv_allocated_len=4, swa_evicted_seqlen=0)
+        req.kv_committed_len = 4
+        req.cache_protected_len = 0
+        req.last_node = self.cache.root_node.id
+        req.extra_key = None
+        req.session_generation = generation
+        req.finished_reason = FINISH_LENGTH(length=1)
+
+        self.cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=4)
+
+        self.assertEqual(
+            self.cache.session_refs._pending_session_evictions,
+            {"s1": generation},
+        )
+        self.assertEqual(self.full.session_ref(leaf), 1)
+
+    def test_stale_request_does_not_consume_pending_eviction(self):
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        generation = self.cache.open_radix_session("s1")
+        register(self.cache, [1, 2, 3, 4], "s1", generation)
+        current_req = SimpleNamespace(
+            session_id="s1",
+            session_generation=generation,
+            session=None,
+        )
+        self.cache.session_refs.defer_radix_session_eviction(current_req)
+        stale_req = SimpleNamespace(
+            session_id="s1",
+            session_generation=generation - 1,
+            session=None,
+        )
+
+        result = self.cache.session_refs.apply_pending_radix_session_eviction(stale_req)
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            self.cache.session_refs._pending_session_evictions,
+            {"s1": generation},
+        )
         self.assertEqual(self.full.session_ref(leaf), 1)
 
     def test_reopen_rejects_stale_generation(self):
