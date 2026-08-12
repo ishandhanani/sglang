@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
+    SessionCacheEvictResult,
     SessionCachePriorityResult,
     UnifiedSessionRefTracker,
 )
@@ -763,13 +764,27 @@ class UnifiedRadixCache(BasePrefixCache):
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
 
-        if self.enable_session_radix_cache and result is not None:
+        if self.enable_session_radix_cache:
             from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
             if req.finished_reason is not None and not isinstance(
                 req.finished_reason, FINISH_ABORT
             ):
-                self.session_refs.register_session_ref(req)
+                if result is not None:
+                    self.session_refs.register_session_ref(req)
+                if getattr(req, "evict_session_after_finish", False):
+                    evict_result = self.session_refs.evict_radix_session(
+                        req.session_id, generation=req.session_generation
+                    )
+                    logger.info(
+                        "Applied deferred router session eviction "
+                        "session_id=%s status=%s generation=%s "
+                        "indexed_component_leaves=%s",
+                        req.session_id,
+                        evict_result.status,
+                        evict_result.generation,
+                        evict_result.indexed_component_leaves,
+                    )
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
@@ -2511,6 +2526,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def request_can_evict_protected_session_cache(self, req: Req) -> bool:
         return self.session_refs.request_can_evict_protected_session_cache(req)
+
+    def evict_radix_session(
+        self, session_id: str, generation: Optional[int] = None
+    ) -> SessionCacheEvictResult:
+        return self.session_refs.evict_radix_session(session_id, generation)
 
     def release_radix_session(self, session_id: str) -> int:
         return self.session_refs.release_radix_session(session_id)

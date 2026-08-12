@@ -2414,6 +2414,33 @@ class Scheduler(
                 result.indexed_component_leaves,
             )
 
+    def _schedule_router_session_eviction(
+        self, router_hint: Optional[dict], req: Req
+    ) -> None:
+        if (
+            not isinstance(router_hint, dict)
+            or router_hint.get("evict_session") is not True
+        ):
+            return
+        if not self.enable_session_radix_cache:
+            logger.warning(
+                "Ignoring router session eviction because session radix cache is disabled"
+            )
+            return
+        if req.session_id is None or req.session_generation is None:
+            logger.warning(
+                "Ignoring router session eviction without a radix-native session"
+            )
+            return
+
+        req.evict_session_after_finish = True
+        logger.info(
+            "Scheduled router session eviction after request completion "
+            "session_id=%s generation=%s",
+            req.session_id,
+            req.session_generation,
+        )
+
     def _apply_router_session_storage_demotions(
         self, router_hint: Optional[dict]
     ) -> None:
@@ -2621,6 +2648,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        self._schedule_router_session_eviction(recv_req.router_hint, req)
         self._apply_router_session_cache_actions(recv_req.router_hint)
         self._apply_router_session_storage_demotions(recv_req.router_hint)
         req.router_hint = recv_req.router_hint

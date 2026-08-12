@@ -880,6 +880,8 @@ class Req(ReqDllmMixin):
         self.session_id = session_id
         # Used by the session radix cache to reject registration after a close/reopen.
         self.session_generation: Optional[int] = None
+        # A one-shot router action applied only after this request finishes successfully.
+        self.evict_session_after_finish = False
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices

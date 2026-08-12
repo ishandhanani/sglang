@@ -29,11 +29,21 @@ _CLOSED_SESSION_TOMBSTONE_LIMIT = 8192
 SessionCachePriorityStatus = Literal[
     "updated", "unchanged", "not_found", "stale_generation", "disabled"
 ]
+SessionCacheEvictStatus = Literal[
+    "evicted", "not_found", "stale_generation", "disabled"
+]
 
 
 @dataclass(frozen=True, kw_only=True)
 class SessionCachePriorityResult:
     status: SessionCachePriorityStatus
+    generation: Optional[int]
+    indexed_component_leaves: int = 0
+
+
+@dataclass(frozen=True, kw_only=True)
+class SessionCacheEvictResult:
+    status: SessionCacheEvictStatus
     generation: Optional[int]
     indexed_component_leaves: int = 0
 
@@ -194,6 +204,49 @@ class UnifiedSessionRefTracker:
                 node = node.parent
         return current_generation, tuple(sorted(node.id for node in nodes))
 
+    def _release_session_refs(self, session_id: str) -> int:
+        indexed = 0
+        for component in self.components:
+            indexed += component.release_session(session_id)
+        self._demoted_session_ids.discard(session_id)
+        return indexed
+
+    def evict_radix_session(
+        self, session_id: str, generation: Optional[int] = None
+    ) -> SessionCacheEvictResult:
+        """Release one session's references without forcing physical eviction.
+
+        The generation rotates so requests that started before this action cannot
+        register the old context again. The session remains open and future
+        requests use the new generation with normal protection.
+        """
+        if not self.enable_session_radix_cache:
+            return SessionCacheEvictResult(status="disabled", generation=None)
+
+        current_generation = self._session_generations.get(session_id)
+        if current_generation is None or session_id in self._closed_session_ids:
+            return SessionCacheEvictResult(status="not_found", generation=None)
+        if generation is not None and generation != current_generation:
+            return SessionCacheEvictResult(
+                status="stale_generation", generation=current_generation
+            )
+
+        indexed = self._release_session_refs(session_id)
+        self._session_incarnation_counter += 1
+        new_generation = self._session_incarnation_counter
+        self._session_generations[session_id] = new_generation
+        logger.info(
+            "evict_session %s: dereferenced %d component leaves generation=%d",
+            session_id,
+            indexed,
+            new_generation,
+        )
+        return SessionCacheEvictResult(
+            status="evicted",
+            generation=new_generation,
+            indexed_component_leaves=indexed,
+        )
+
     def release_radix_session(self, session_id: str) -> int:
         if not self.enable_session_radix_cache or session_id is None:
             return 0
@@ -203,11 +256,8 @@ class UnifiedSessionRefTracker:
 
         self._remember_closed_session(session_id)
         self._session_generations.pop(session_id, None)
-        self._demoted_session_ids.discard(session_id)
 
-        indexed = 0
-        for component in self.components:
-            indexed += component.release_session(session_id)
+        indexed = self._release_session_refs(session_id)
 
         logger.info(
             "release_session %s: indexed %d component leaves",

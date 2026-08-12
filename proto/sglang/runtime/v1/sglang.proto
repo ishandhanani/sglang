@@ -55,6 +55,7 @@ message RouterHint {
   repeated SessionCacheAction session_cache_actions = 3;
   repeated SessionStorageDemotion session_storage_demotions = 4;
   bool prefetch_from_storage = 5;
+  bool evict_session = 6;
 }
 
 enum SessionCachePriority {

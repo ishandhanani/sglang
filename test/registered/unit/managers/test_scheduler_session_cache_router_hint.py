@@ -13,6 +13,44 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestSessionCacheRouterHint(unittest.TestCase):
+    def test_schedules_session_eviction_after_request_completion(self):
+        tree_cache = MagicMock()
+        scheduler = types.SimpleNamespace(
+            enable_session_radix_cache=True,
+            tree_cache=tree_cache,
+        )
+        req = types.SimpleNamespace(
+            session_id="session-a",
+            session_generation=7,
+            evict_session_after_finish=False,
+        )
+
+        Scheduler._schedule_router_session_eviction(
+            scheduler, {"evict_session": True}, req
+        )
+
+        tree_cache.evict_radix_session.assert_not_called()
+        self.assertEqual(req.session_generation, 7)
+        self.assertTrue(req.evict_session_after_finish)
+
+    def test_session_eviction_hint_fails_open(self):
+        tree_cache = MagicMock()
+        scheduler = types.SimpleNamespace(
+            enable_session_radix_cache=True,
+            tree_cache=tree_cache,
+        )
+        req = types.SimpleNamespace(
+            session_id="session-a",
+            session_generation=7,
+            evict_session_after_finish=False,
+        )
+
+        for hint in (None, {}, {"evict_session": False}, {"evict_session": "true"}):
+            Scheduler._schedule_router_session_eviction(scheduler, hint, req)
+
+        tree_cache.evict_radix_session.assert_not_called()
+        self.assertFalse(req.evict_session_after_finish)
+
     def test_applies_valid_actions(self):
         tree_cache = MagicMock()
         tree_cache.set_session_cache_priority.side_effect = [

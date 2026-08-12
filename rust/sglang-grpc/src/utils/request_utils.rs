@@ -258,6 +258,9 @@ fn insert_router_hint(
     if hint.prefetch_from_storage {
         value.insert("prefetch_from_storage".into(), serde_json::json!(true));
     }
+    if hint.evict_session {
+        value.insert("evict_session".into(), serde_json::json!(true));
+    }
 
     if !value.is_empty() {
         request.insert("router_hint".into(), serde_json::Value::Object(value));
@@ -512,6 +515,7 @@ mod tests {
                 session_generation: Some(9),
             }],
             prefetch_from_storage: true,
+            evict_session: true,
         });
         let text_req = proto::TextGenerateRequest {
             router_hint: router_hint.clone(),
@@ -548,6 +552,7 @@ mod tests {
                         "session_generation": 9,
                     }],
                     "prefetch_from_storage": true,
+                    "evict_session": true,
                 })
             );
         }
@@ -566,6 +571,7 @@ mod tests {
                 }],
                 session_storage_demotions: Vec::new(),
                 prefetch_from_storage: false,
+                evict_session: false,
             }),
             ..Default::default()
         };
