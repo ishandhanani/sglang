@@ -50,12 +50,30 @@ message DisaggregatedParams {
 
 // Versioned KV-cache actions attached by an upstream dispatcher.
 message KvHints {
-  optional DerefHint deref = 1;
+  string protocol_version = 1;
+  string message_id = 2;
+  repeated KvHintAction actions = 3;
 }
 
-message DerefHint {
+message KvHintAction {
   string action_id = 1;
+  string action_type = 2;
+  string action_version = 3;
+  oneof payload {
+    KvDerefPayload deref = 4;
+    KvDemotePayload demote = 5;
+    KvPrefetchPayload prefetch = 6;
+  }
 }
+
+message KvDerefPayload {}
+
+message KvDemotePayload {
+  string session_id = 1;
+  optional uint64 session_generation = 2;
+}
+
+message KvPrefetchPayload {}
 
 // Sampling parameters shared across text and tokenized RPCs.
 message SamplingParams {

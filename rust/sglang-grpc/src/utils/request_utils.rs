@@ -187,13 +187,46 @@ fn insert_kv_hints(
     request: &mut HashMap<String, serde_json::Value>,
     hints: &Option<proto::KvHints>,
 ) {
-    let Some(deref) = hints.as_ref().and_then(|hints| hints.deref.as_ref()) else {
+    let Some(hints) = hints else {
         return;
     };
 
+    let actions = hints
+        .actions
+        .iter()
+        .filter_map(|action| {
+            use proto::kv_hint_action::Payload;
+
+            let payload = match action.payload.as_ref()? {
+                Payload::Deref(_) | Payload::Prefetch(_) => serde_json::json!({}),
+                Payload::Demote(demote) => {
+                    let mut payload = serde_json::Map::new();
+                    payload.insert("session_id".into(), serde_json::json!(demote.session_id));
+                    if let Some(generation) = demote.session_generation {
+                        payload.insert("session_generation".into(), serde_json::json!(generation));
+                    }
+                    serde_json::Value::Object(payload)
+                }
+            };
+            Some(serde_json::json!({
+                "action_id": action.action_id,
+                "action_type": action.action_type,
+                "action_version": action.action_version,
+                "payload": payload,
+            }))
+        })
+        .collect::<Vec<_>>();
+    if actions.is_empty() {
+        return;
+    }
+
     request.insert(
         "kv_hints".into(),
-        serde_json::json!({"deref": {"action_id": deref.action_id}}),
+        serde_json::json!({
+            "protocol_version": hints.protocol_version,
+            "message_id": hints.message_id,
+            "actions": actions,
+        }),
     );
 }
 
@@ -423,11 +456,39 @@ mod tests {
     }
 
     #[test]
-    fn generate_dicts_include_typed_deref_hint() {
+    fn generate_dicts_include_typed_kv_hints() {
         let kv_hints = Some(proto::KvHints {
-            deref: Some(proto::DerefHint {
-                action_id: "session-1:turn-1:window-1".to_string(),
-            }),
+            protocol_version: "0.1".to_string(),
+            message_id: "request-1".to_string(),
+            actions: vec![
+                proto::KvHintAction {
+                    action_id: "deref-1".to_string(),
+                    action_type: "kv.deref".to_string(),
+                    action_version: "1.0".to_string(),
+                    payload: Some(proto::kv_hint_action::Payload::Deref(
+                        proto::KvDerefPayload {},
+                    )),
+                },
+                proto::KvHintAction {
+                    action_id: "demote-1".to_string(),
+                    action_type: "kv.demote".to_string(),
+                    action_version: "1.0".to_string(),
+                    payload: Some(proto::kv_hint_action::Payload::Demote(
+                        proto::KvDemotePayload {
+                            session_id: "session-1".to_string(),
+                            session_generation: Some(7),
+                        },
+                    )),
+                },
+                proto::KvHintAction {
+                    action_id: "prefetch-1".to_string(),
+                    action_type: "kv.prefetch".to_string(),
+                    action_version: "1.0".to_string(),
+                    payload: Some(proto::kv_hint_action::Payload::Prefetch(
+                        proto::KvPrefetchPayload {},
+                    )),
+                },
+            ],
         });
         let text_req = proto::TextGenerateRequest {
             kv_hints: kv_hints.clone(),
@@ -444,7 +505,30 @@ mod tests {
         ] {
             assert_eq!(
                 mapped["kv_hints"],
-                serde_json::json!({"deref": {"action_id": "session-1:turn-1:window-1"}})
+                serde_json::json!({
+                    "protocol_version": "0.1",
+                    "message_id": "request-1",
+                    "actions": [
+                        {
+                            "action_id": "deref-1",
+                            "action_type": "kv.deref",
+                            "action_version": "1.0",
+                            "payload": {},
+                        },
+                        {
+                            "action_id": "demote-1",
+                            "action_type": "kv.demote",
+                            "action_version": "1.0",
+                            "payload": {"session_id": "session-1", "session_generation": 7},
+                        },
+                        {
+                            "action_id": "prefetch-1",
+                            "action_type": "kv.prefetch",
+                            "action_version": "1.0",
+                            "payload": {},
+                        },
+                    ],
+                })
             );
         }
     }

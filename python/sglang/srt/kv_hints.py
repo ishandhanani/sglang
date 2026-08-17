@@ -6,7 +6,8 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Optional
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 
@@ -22,7 +23,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+KV_HINT_PROTOCOL_VERSION = "0.1"
 KV_HINT_DEREF_V1 = "kv_hint.deref.v1"
+KV_HINT_DEMOTE_V1 = "kv_hint.demote.v1"
+KV_HINT_PREFETCH_V1 = "kv_hint.prefetch.v1"
+_MAX_ACTIONS_PER_ENVELOPE = 64
+_MAX_ACTION_ID_LENGTH = 512
+_MAX_SESSION_ID_LENGTH = 512
 _DEREF_NEXT_REQUEST_LIMIT = 8192
 _DEREF_ACTION_LIMIT = 8192
 
@@ -33,57 +40,106 @@ class KvHintStruct(msgspec.Struct, kw_only=True):
         return msgspec_struct_pydantic_core_schema(cls, handler)
 
 
-class DerefHint(KvHintStruct):
-    action_id: str = ""
+class KvHintAction(KvHintStruct):
+    action_id: str
+    action_type: str
+    action_version: str
+    payload: dict[str, Any] = msgspec.field(default_factory=dict)
+
+
+class KvDerefPayload(KvHintStruct):
+    pass
+
+
+class KvDemotePayload(KvHintStruct):
+    session_id: str
+    session_generation: Optional[int] = None
+
+
+class KvPrefetchPayload(KvHintStruct):
+    pass
 
 
 class KvHints(KvHintStruct):
-    deref: Optional[DerefHint] = None
+    protocol_version: str
+    message_id: str
+    actions: list[KvHintAction] = msgspec.field(default_factory=list)
 
 
 class KvHintManager:
-    """Owns supported KV hint handlers and their request lifecycle hooks."""
+    """Dispatches typed router actions at cache-owned lifecycle hooks."""
 
     def __init__(
         self,
         session_refs: Optional[UnifiedSessionRefTracker] = None,
         metrics_collector: Optional[RadixCacheMetricsCollector] = None,
+        demote_session_to_storage: Optional[
+            Callable[[str, str, Optional[int]], dict[str, Any]]
+        ] = None,
+        storage_enabled: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._session_refs = session_refs
         self._metrics_collector = metrics_collector
+        self._demote_session_to_storage = demote_session_to_storage
+        self._storage_enabled = storage_enabled or (lambda: False)
         self._deref_next_sessions: OrderedDict[str, int] = OrderedDict()
         self._deref_next_requests: OrderedDict[str, str] = OrderedDict()
         self._applied_deref_actions: OrderedDict[tuple[str, str], None] = OrderedDict()
 
     def capabilities(self) -> list[str]:
-        if self._session_refs is None:
-            return []
-        return [KV_HINT_DEREF_V1]
+        capabilities = []
+        if self._session_refs is not None:
+            capabilities.append(KV_HINT_DEREF_V1)
+        if self._storage_enabled():
+            capabilities.append(KV_HINT_PREFETCH_V1)
+            if (
+                self._session_refs is not None
+                and self._demote_session_to_storage is not None
+            ):
+                capabilities.append(KV_HINT_DEMOTE_V1)
+        return capabilities
 
     def on_request(self, req: Req, hints: KvHints) -> None:
-        """Accept supported hints after the request's session is resolved."""
-        if hints.deref is None:
+        """Accept advisory actions after the request's session is resolved."""
+        if hints.protocol_version != KV_HINT_PROTOCOL_VERSION:
+            logger.warning(
+                "Ignoring KV hints with unsupported protocol version=%s",
+                hints.protocol_version,
+            )
             return
-        if self._session_refs is None:
-            logger.warning("Ignoring KV DEREF because session radix cache is disabled")
-            return
-        if req.session_id is None or req.session_generation is None:
-            logger.warning("Ignoring KV DEREF without a radix-native session")
+        if len(hints.actions) > _MAX_ACTIONS_PER_ENVELOPE:
+            logger.warning(
+                "Ignoring KV hints with too many actions=%s", len(hints.actions)
+            )
             return
 
-        req.kv_hints = hints
-        logger.info(
-            "Accepted KV DEREF session_id=%s generation=%s",
-            req.session_id,
-            req.session_generation,
-        )
+        accepted = False
+        for action in hints.actions:
+            if not self._valid_action_id(action):
+                continue
+            if action.action_type == "kv.deref" and action.action_version == "1.0":
+                accepted |= self._accept_deref(req, action)
+            elif action.action_type == "kv.demote" and action.action_version == "1.0":
+                accepted |= self._apply_demote(action)
+            elif action.action_type == "kv.prefetch" and action.action_version == "1.0":
+                accepted |= self._accept_prefetch(req, action)
+            else:
+                logger.debug(
+                    "Ignoring unsupported KV action action_id=%s action_type=%s action_version=%s",
+                    action.action_id,
+                    action.action_type,
+                    action.action_version,
+                )
+
+        if accepted:
+            req.kv_hints = hints
 
     def on_request_success(self, req: Req, *, has_reusable_leaf: bool) -> None:
-        """Apply DEREF on request success and track ordinary request leaves."""
+        """Apply the successful request's lifecycle action, then track normal leaves."""
         if self._session_refs is None:
             return
 
-        deref = req.kv_hints.deref if req.kv_hints is not None else None
+        deref = self._deref_action(req)
         if deref is not None:
             action_key = self._deref_action_key(req, deref)
             if action_key is not None and action_key in self._applied_deref_actions:
@@ -109,10 +165,8 @@ class KvHintManager:
             self._log_deref_result(req, result)
             return
 
-        if not has_reusable_leaf:
-            return
-
-        self._session_refs.register_session_ref(req)
+        if has_reusable_leaf:
+            self._session_refs.register_session_ref(req)
 
     def on_request_match(self, req: Optional[Req]) -> None:
         """Track the first matching request after a successful DEREF."""
@@ -127,7 +181,7 @@ class KvHintManager:
         self._remember_deref_request(req.rid, req.session_id)
 
     def on_request_prefill_ready(self, req: Req) -> None:
-        """Record the next DEREF session request after its L3 prefetch resolves."""
+        """Record the next DEREF request after its L3 prefetch resolves."""
         session_id = self._deref_next_requests.pop(req.rid, None)
         if session_id is None:
             return
@@ -143,6 +197,122 @@ class KvHintManager:
             storage_tokens=req.storage_hit_length,
         )
 
+    def _accept_deref(self, req: Req, action: KvHintAction) -> bool:
+        if self._session_refs is None:
+            logger.warning("Ignoring KV DEREF because session radix cache is disabled")
+            return False
+        if req.session_id is None or req.session_generation is None:
+            logger.warning("Ignoring KV DEREF without a radix-native session")
+            return False
+        if self._decode_payload(action, KvDerefPayload) is None:
+            return False
+        req.kv_hint_deref_action_id = action.action_id
+        logger.info(
+            "Accepted KV DEREF session_id=%s generation=%s action_id=%s",
+            req.session_id,
+            req.session_generation,
+            action.action_id,
+        )
+        return True
+
+    def _apply_demote(self, action: KvHintAction) -> bool:
+        if self._session_refs is None or self._demote_session_to_storage is None:
+            logger.warning("Ignoring KV DEMOTE because session radix cache is disabled")
+            return False
+        if not self._storage_enabled():
+            logger.warning("Ignoring KV DEMOTE because HiCache storage is disabled")
+            return False
+        payload = self._decode_payload(action, KvDemotePayload)
+        if (
+            payload is None
+            or not payload.session_id
+            or len(payload.session_id) > _MAX_SESSION_ID_LENGTH
+        ):
+            logger.warning(
+                "Ignoring malformed KV DEMOTE action_id=%s", action.action_id
+            )
+            return False
+        if payload.session_generation is not None and payload.session_generation < 0:
+            logger.warning(
+                "Ignoring malformed KV DEMOTE generation action_id=%s", action.action_id
+            )
+            return False
+
+        try:
+            result = self._demote_session_to_storage(
+                action.action_id,
+                payload.session_id,
+                payload.session_generation,
+            )
+        except Exception:
+            logger.exception(
+                "KV DEMOTE failed open action_id=%s session_id=%s",
+                action.action_id,
+                payload.session_id,
+            )
+            return False
+
+        logger.info(
+            "Applied KV DEMOTE action_id=%s session_id=%s state=%s selected_tokens=%s message=%s",
+            action.action_id,
+            payload.session_id,
+            result.get("state"),
+            result.get("selected_tokens", 0),
+            result.get("message", ""),
+        )
+        return True
+
+    def _accept_prefetch(self, req: Req, action: KvHintAction) -> bool:
+        if not self._storage_enabled():
+            logger.warning("Ignoring KV PREFETCH because HiCache storage is disabled")
+            return False
+        if self._decode_payload(action, KvPrefetchPayload) is None:
+            return False
+        req.kv_hint_force_prefetch = True
+        logger.info(
+            "Accepted KV PREFETCH request_id=%s action_id=%s", req.rid, action.action_id
+        )
+        return True
+
+    @staticmethod
+    def _valid_action_id(action: KvHintAction) -> bool:
+        if action.action_id and len(action.action_id) <= _MAX_ACTION_ID_LENGTH:
+            return True
+        logger.warning(
+            "Ignoring malformed KV action action_type=%s action_version=%s",
+            action.action_type,
+            action.action_version,
+        )
+        return False
+
+    @staticmethod
+    def _decode_payload(
+        action: KvHintAction, payload_type: type[KvHintStruct]
+    ) -> Optional[KvHintStruct]:
+        try:
+            return msgspec.convert(action.payload, type=payload_type, strict=True)
+        except (msgspec.ValidationError, TypeError):
+            logger.warning(
+                "Ignoring malformed KV action payload action_id=%s action_type=%s",
+                action.action_id,
+                action.action_type,
+            )
+            return None
+
+    @staticmethod
+    def _deref_action(req: Req) -> Optional[KvHintAction]:
+        hints = req.kv_hints
+        if hints is None:
+            return None
+        for action in hints.actions:
+            if (
+                action.action_id == getattr(req, "kv_hint_deref_action_id", None)
+                and action.action_type == "kv.deref"
+                and action.action_version == "1.0"
+            ):
+                return action
+        return None
+
     def _remember_deref_session(self, session_id: str, generation: int) -> None:
         self._deref_next_sessions[session_id] = generation
         self._deref_next_sessions.move_to_end(session_id)
@@ -156,8 +326,8 @@ class KvHintManager:
             self._deref_next_requests.popitem(last=False)
 
     @staticmethod
-    def _deref_action_key(req: Req, deref: DerefHint) -> Optional[tuple[str, str]]:
-        if not deref.action_id:
+    def _deref_action_key(req: Req, deref: KvHintAction) -> Optional[tuple[str, str]]:
+        if not deref.action_id or req.session_id is None:
             return None
         return (req.session_id, deref.action_id)
 
@@ -190,8 +360,7 @@ class KvHintManager:
     @staticmethod
     def _log_deref_result(req: Req, result: SessionCacheEvictResult) -> None:
         logger.info(
-            "Applied KV DEREF session_id=%s status=%s generation=%s "
-            "indexed_component_leaves=%s",
+            "Applied KV DEREF session_id=%s status=%s generation=%s indexed_component_leaves=%s",
             req.session_id,
             result.status,
             result.generation,
