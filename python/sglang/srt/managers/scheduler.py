@@ -1637,6 +1637,7 @@ class Scheduler(
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
+            "kv_hint_capabilities": self.tree_cache.kv_hint_capabilities(),
         }
 
         return result_dict
@@ -2494,6 +2495,8 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if recv_req.kv_hints is not None:
+            self.tree_cache.on_kv_hints(req, recv_req.kv_hints)
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
@@ -2704,6 +2707,7 @@ class Scheduler(
                     new_input_tokens,
                     tree_cache.get_last_hash_value(req.last_host_node),
                     prefix_keys,
+                    force=getattr(req, "kv_hint_force_prefetch", False),
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
@@ -3314,6 +3318,7 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
+            self.tree_cache.on_kv_hint_prefill_ready(req)
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,

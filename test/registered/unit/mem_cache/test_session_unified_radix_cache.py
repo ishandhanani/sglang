@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.kv_hints import DerefHint, KvHints
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -195,6 +196,26 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
 
         self.cache.release_radix_session("s1")
         self.assertEqual(self.full.session_ref(leaf), 0)
+
+    def test_current_success_dereferences_without_closing_session(self):
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        generation = self.cache.open_radix_session("s1")
+        register(self.cache, [1, 2, 3, 4], "s1", generation)
+        req = SimpleNamespace(
+            session_id="s1",
+            session_generation=generation,
+            session=None,
+            kv_hints=None,
+        )
+        self.cache.on_kv_hints(
+            req,
+            KvHints(deref=DerefHint()),
+        )
+
+        self.cache.kv_hint_manager.on_request_success(req, has_reusable_leaf=False)
+
+        self.assertEqual(self.full.session_ref(leaf), 0)
+        self.assertGreater(self.cache.ensure_session_generation("s1"), generation)
 
     def test_reopen_rejects_stale_generation(self):
         leaf = insert(self.cache, [1, 2, 3, 4])

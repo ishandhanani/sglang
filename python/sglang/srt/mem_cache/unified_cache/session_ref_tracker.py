@@ -8,7 +8,9 @@ from __future__ import annotations
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Literal, Optional
+
+from sglang.srt.mem_cache.unified_cache.components import BASE_COMPONENT_TYPE
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -23,6 +25,17 @@ logger = logging.getLogger(__name__)
 # out of this LRU after 8192 later closes, an extremely late finish can tag
 # again; explicit register_session clears the tombstone for intentional id reuse.
 _CLOSED_SESSION_TOMBSTONE_LIMIT = 8192
+
+SessionCacheEvictStatus = Literal[
+    "evicted", "not_found", "stale_generation", "disabled"
+]
+
+
+@dataclass(frozen=True, kw_only=True)
+class SessionCacheEvictResult:
+    status: SessionCacheEvictStatus
+    generation: Optional[int]
+    indexed_component_leaves: int = 0
 
 
 @dataclass(kw_only=True)
@@ -96,6 +109,63 @@ class UnifiedSessionRefTracker:
             generation = self.open_radix_session(session_id)
         return generation
 
+    def snapshot_session_nodes(
+        self, session_id: str, generation: Optional[int] = None
+    ) -> tuple[Optional[int], tuple[int, ...]]:
+        """Return the current generation and the full-KV path owned by a session."""
+        current_generation = self._session_generations.get(session_id)
+        if (
+            current_generation is None
+            or session_id in self._closed_session_ids
+            or (generation is not None and generation != current_generation)
+        ):
+            return current_generation, ()
+
+        full = next(
+            component
+            for component in self.components
+            if component.component_type == BASE_COMPONENT_TYPE
+        )
+        nodes = set()
+        root = self.tree_core.root_node
+        for leaf in full.session_leaves(session_id):
+            node = leaf
+            while node is not root:
+                nodes.add(node)
+                node = node.parent
+        return current_generation, tuple(sorted(node.id for node in nodes))
+
+    def _release_session_refs(self, session_id: str) -> int:
+        indexed = 0
+        for component in self.components:
+            indexed += component.release_session(session_id)
+        return indexed
+
+    def evict_radix_session(
+        self, session_id: str, generation: Optional[int] = None
+    ) -> SessionCacheEvictResult:
+        """Release references without closing the session and rotate its generation."""
+        if not self.enable_session_radix_cache:
+            return SessionCacheEvictResult(status="disabled", generation=None)
+
+        current_generation = self._session_generations.get(session_id)
+        if current_generation is None or session_id in self._closed_session_ids:
+            return SessionCacheEvictResult(status="not_found", generation=None)
+        if generation is not None and generation != current_generation:
+            return SessionCacheEvictResult(
+                status="stale_generation", generation=current_generation
+            )
+
+        indexed = self._release_session_refs(session_id)
+        self._session_incarnation_counter += 1
+        new_generation = self._session_incarnation_counter
+        self._session_generations[session_id] = new_generation
+        return SessionCacheEvictResult(
+            status="evicted",
+            generation=new_generation,
+            indexed_component_leaves=indexed,
+        )
+
     def release_radix_session(self, session_id: str) -> int:
         if not self.enable_session_radix_cache or session_id is None:
             return 0
@@ -106,9 +176,7 @@ class UnifiedSessionRefTracker:
         self._remember_closed_session(session_id)
         self._session_generations.pop(session_id, None)
 
-        indexed = 0
-        for component in self.components:
-            indexed += component.release_session(session_id)
+        indexed = self._release_session_refs(session_id)
 
         logger.info(
             "release_session %s: indexed %d component leaves",

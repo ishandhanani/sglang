@@ -45,9 +45,14 @@ fn sampling_params_to_map(
             if let Some(v) = p.repetition_penalty {
                 map.insert("repetition_penalty".into(), serde_json::json!(v));
             }
-            if let Some(v) = p.max_new_tokens {
-                map.insert("max_new_tokens".into(), serde_json::json!(v));
-            }
+            // An omitted protobuf field is distinct from SGLang's Python
+            // constructor default (128). Preserve that distinction so callers
+            // that omit the limit use the engine's context-aware default.
+            map.insert(
+                "max_new_tokens".into(),
+                p.max_new_tokens
+                    .map_or(serde_json::Value::Null, serde_json::Value::from),
+            );
             if let Some(v) = p.min_new_tokens {
                 map.insert("min_new_tokens".into(), serde_json::json!(v));
             }
@@ -178,6 +183,53 @@ fn insert_disaggregated_params(
     }
 }
 
+fn insert_kv_hints(
+    request: &mut HashMap<String, serde_json::Value>,
+    hints: &Option<proto::KvHints>,
+) {
+    let Some(hints) = hints else {
+        return;
+    };
+
+    let actions = hints
+        .actions
+        .iter()
+        .filter_map(|action| {
+            use proto::kv_hint_action::Payload;
+
+            let payload = match action.payload.as_ref()? {
+                Payload::Deref(_) | Payload::Prefetch(_) => serde_json::json!({}),
+                Payload::Demote(demote) => {
+                    let mut payload = serde_json::Map::new();
+                    payload.insert("session_id".into(), serde_json::json!(demote.session_id));
+                    if let Some(generation) = demote.session_generation {
+                        payload.insert("session_generation".into(), serde_json::json!(generation));
+                    }
+                    serde_json::Value::Object(payload)
+                }
+            };
+            Some(serde_json::json!({
+                "action_id": action.action_id,
+                "action_type": action.action_type,
+                "action_version": action.action_version,
+                "payload": payload,
+            }))
+        })
+        .collect::<Vec<_>>();
+    if actions.is_empty() {
+        return;
+    }
+
+    request.insert(
+        "kv_hints".into(),
+        serde_json::json!({
+            "protocol_version": hints.protocol_version,
+            "message_id": hints.message_id,
+            "actions": actions,
+        }),
+    );
+}
+
 fn now_timestamp() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -250,6 +302,7 @@ pub(crate) fn build_text_generate_dict(
         req.max_thinking_tokens,
     );
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
+    insert_kv_hints(&mut d, &req.kv_hints);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
@@ -304,6 +357,7 @@ pub(crate) fn build_generate_dict(
         req.max_thinking_tokens,
     );
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
+    insert_kv_hints(&mut d, &req.kv_hints);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
@@ -399,6 +453,104 @@ mod tests {
                 .get("session_id"),
             Some(&serde_json::json!("session-1"))
         );
+    }
+
+    #[test]
+    fn generate_dicts_include_typed_kv_hints() {
+        let kv_hints = Some(proto::KvHints {
+            protocol_version: "0.1".to_string(),
+            message_id: "request-1".to_string(),
+            actions: vec![
+                proto::KvHintAction {
+                    action_id: "deref-1".to_string(),
+                    action_type: "kv.deref".to_string(),
+                    action_version: "1.0".to_string(),
+                    payload: Some(proto::kv_hint_action::Payload::Deref(
+                        proto::KvDerefPayload {},
+                    )),
+                },
+                proto::KvHintAction {
+                    action_id: "demote-1".to_string(),
+                    action_type: "kv.demote".to_string(),
+                    action_version: "1.0".to_string(),
+                    payload: Some(proto::kv_hint_action::Payload::Demote(
+                        proto::KvDemotePayload {
+                            session_id: "session-1".to_string(),
+                            session_generation: Some(7),
+                        },
+                    )),
+                },
+                proto::KvHintAction {
+                    action_id: "prefetch-1".to_string(),
+                    action_type: "kv.prefetch".to_string(),
+                    action_version: "1.0".to_string(),
+                    payload: Some(proto::kv_hint_action::Payload::Prefetch(
+                        proto::KvPrefetchPayload {},
+                    )),
+                },
+            ],
+        });
+        let text_req = proto::TextGenerateRequest {
+            kv_hints: kv_hints.clone(),
+            ..Default::default()
+        };
+        let token_req = proto::GenerateRequest {
+            kv_hints,
+            ..Default::default()
+        };
+
+        for mapped in [
+            build_text_generate_dict("text-request", &text_req).unwrap(),
+            build_generate_dict("token-request", &token_req).unwrap(),
+        ] {
+            assert_eq!(
+                mapped["kv_hints"],
+                serde_json::json!({
+                    "protocol_version": "0.1",
+                    "message_id": "request-1",
+                    "actions": [
+                        {
+                            "action_id": "deref-1",
+                            "action_type": "kv.deref",
+                            "action_version": "1.0",
+                            "payload": {},
+                        },
+                        {
+                            "action_id": "demote-1",
+                            "action_type": "kv.demote",
+                            "action_version": "1.0",
+                            "payload": {"session_id": "session-1", "session_generation": 7},
+                        },
+                        {
+                            "action_id": "prefetch-1",
+                            "action_type": "kv.prefetch",
+                            "action_version": "1.0",
+                            "payload": {},
+                        },
+                    ],
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn generate_dicts_preserve_an_omitted_output_limit() {
+        let sampling_params = Some(proto::SamplingParams::default());
+        let text_req = proto::TextGenerateRequest {
+            sampling_params: sampling_params.clone(),
+            ..Default::default()
+        };
+        let token_req = proto::GenerateRequest {
+            sampling_params,
+            ..Default::default()
+        };
+
+        for mapped in [
+            build_text_generate_dict("text-request", &text_req).unwrap(),
+            build_generate_dict("token-request", &token_req).unwrap(),
+        ] {
+            assert!(mapped["sampling_params"]["max_new_tokens"].is_null());
+        }
     }
 
     #[test]
