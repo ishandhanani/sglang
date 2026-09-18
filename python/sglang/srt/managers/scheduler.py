@@ -4938,10 +4938,13 @@ class Scheduler(
                 )
             if (
                 self.enable_hicache_storage
+                or self.enable_unified_cache_external_linker
                 or self.disaggregation_mode != DisaggregationMode.NULL
             ):
-                # Storage and transfer workers need the GIL between I/O calls.
-                # Singleton PD polls no longer yield through a collective.
+                # Storage and transfer workers and the external linker's owner
+                # and progress threads need the GIL between I/O calls. Yield
+                # while there is no GPU batch so polling cannot starve their
+                # acks. Singleton PD polls no longer yield through a collective.
                 time.sleep(0)
             return
         self.metrics_reporter.record_scheduler_idle()
