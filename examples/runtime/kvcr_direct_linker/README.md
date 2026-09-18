@@ -69,7 +69,9 @@ Other options (all optional): `operation_timeout_ms`, `abandon_timeout_ms`,
 `pin_local_dram`, `poll_interval_ms`, `stats_log_interval_s`, `device_copy`
 (CUDA runtime copies for offload inside KVCR; `false` forces NIXL loopback),
 `direct_restore` (layer-wise restore from claimed slots; `false` uses KVCR
-`deliver`).
+`deliver`), `direct_restore_min_batch_bytes` (merge consecutive layers whose
+restore operands total less than this into one copy batch; default 4 MiB, `0`
+keeps one batch per layer).
 
 ## Explicit-hint peer reuse check
 
