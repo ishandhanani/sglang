@@ -54,6 +54,12 @@ host with InfiniBand devices but without GPUDirect RDMA peer memory
 `UCX_TLS=cuda_copy,cuda_ipc,sm,tcp`, or enable GPUDirect RDMA for cross-node
 peer transfers.
 
+The linker's owner thread and KVCR's progress thread run in the scheduler
+process and need the GIL between I/O calls; the scheduler yields to them on
+every idle pass while a request waits for preparation. `--sleep-on-idle` also
+keeps a fully idle server from spinning while it serves peer writes, but its
+one-second idle poll stalls DP-attention ranks, so do not combine the two.
+
 ### Configuration
 
 | Option | Default | Meaning |
