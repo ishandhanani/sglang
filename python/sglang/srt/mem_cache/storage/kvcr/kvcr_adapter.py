@@ -156,7 +156,16 @@ class KVCRAdapter:
                     continue
                 faults = 0
                 if not worked:
-                    time.sleep(self._poll_interval_s)
+                    # Block on the command queue instead of sleeping so a
+                    # posted command runs at once; completions of in-flight
+                    # operations are still polled every interval.
+                    try:
+                        item = self._commands.get(timeout=self._poll_interval_s)
+                    except queue.Empty:
+                        continue
+                    if item is _STOP:
+                        return
+                    item(self)
         except BaseException as error:  # noqa: BLE001 - surfaced to the scheduler
             self._failure = error
             logger.error("KVCR linker owner thread stopped", exc_info=True)

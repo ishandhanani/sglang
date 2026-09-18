@@ -411,13 +411,41 @@ def test_offload_prepare_lookup_load_round_trip_moves_bytes(harness):
 def test_unprepared_and_unknown_pages_never_hit(harness):
     h = harness()
     hashes = _hashes("b", 3)
-    # Nothing offloaded: preparation completes as a miss with no claims.
+    # Nothing offloaded: the first tail page is not resident, so the miss is
+    # decided on the calling thread and the request is admissible at once.
     handle = h.prepare("r2", hashes)
-    h.wait_ready(handle)
+    assert h.linker.preparation_ready(handle)
     assert h.linker.lookup("r2", h.lookup_transfers(hashes)) == []
     assert h.public_claims() == 0
+    stats = h.linker.snapshot_stats()
+    assert stats["miss_no_local_candidates"] == 1
+    assert stats.get("prepared_requests", 0) == 0
     # A lookup for a request that was never prepared is a miss, not a hang.
     assert h.linker.lookup("never-prepared", h.lookup_transfers(hashes)) == []
+
+
+def test_resident_first_page_takes_the_owner_thread_path(harness):
+    h = harness()
+    hashes = _hashes("b2", 3)
+    h.fill(0, 3, seed=2)
+    h.offload(hashes, first_page=0)
+    assert h.wait_offloads(1) == [True]
+    # Only the tail beyond a resident first page is a candidate: a request
+    # starting at a page KVCR never saw is a certain miss, one starting at a
+    # resident page is prepared through KVCR and confirmed by fetch.
+    stale = h.prepare("r2a", _hashes("b3", 2) + hashes[:1])
+    assert h.linker.preparation_ready(stale)
+    handle = h.prepare("r2b", hashes[1:])
+    h.wait_ready(handle)
+    assert h.linker.lookup("r2b", h.lookup_transfers(hashes[1:])) == [1, 2]
+    stats = h.linker.snapshot_stats()
+    assert stats["miss_no_local_candidates"] == 1
+    assert stats["prepared_requests"] == 1
+    h.linker.reset()
+    # A rebuilt core holds nothing, so the resident set must be empty too.
+    after = h.prepare("r2c", hashes)
+    assert h.linker.preparation_ready(after)
+    assert h.linker.snapshot_stats()["miss_no_local_candidates"] == 2
 
 
 def test_hinted_but_absent_pages_never_become_hits(harness):
