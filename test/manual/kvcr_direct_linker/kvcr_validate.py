@@ -564,6 +564,26 @@ def scenario_peer(args, workdir: Path) -> dict:
                 entry["wall_s"] = time.monotonic() - started
                 entry["matches_source"] = entry["text"] == source_text
                 steady.append(entry)
+            # Pipeline floors on the same target: the hinted prompts again
+            # (device radix hit, only the tail page recomputes) and a short
+            # prompt (no meaningful prefill), both streamed for TTFT.
+            device_hit = []
+            for tokens in served:
+                started = time.monotonic()
+                entry = _summary(
+                    target.generate(tokens, args.max_new_tokens, stream=True)
+                )
+                entry["wall_s"] = time.monotonic() - started
+                device_hit.append(entry)
+            short = []
+            for index in range(3):
+                tokens = _prompt(random.Random(args.seed + 10 + index), 16, args.vocab)
+                started = time.monotonic()
+                entry = _summary(
+                    target.generate(tokens, args.max_new_tokens, stream=True)
+                )
+                entry["wall_s"] = time.monotonic() - started
+                short.append(entry)
             recompute = []
             for tokens in fresh:
                 started = time.monotonic()
@@ -573,6 +593,8 @@ def scenario_peer(args, workdir: Path) -> dict:
                 entry["wall_s"] = time.monotonic() - started
                 recompute.append(entry)
             runs["steady_hinted"] = steady
+            runs["steady_device_hit"] = device_hit
+            runs["steady_short"] = short
             runs["steady_recompute"] = recompute
             if profiler is not None:
                 # py-spy writes its output on SIGINT; sampling many threads can
@@ -604,6 +626,10 @@ def scenario_peer(args, workdir: Path) -> dict:
         "steady_recompute_ttft_s": [
             e.get("ttft_s") for e in runs.get("steady_recompute", [])
         ],
+        "steady_device_hit_ttft_s": [
+            e.get("ttft_s") for e in runs.get("steady_device_hit", [])
+        ],
+        "steady_short_ttft_s": [e.get("ttft_s") for e in runs.get("steady_short", [])],
         "hinted_restored": (runs["hinted"]["cached_tokens"] or 0) > 0,
         "no_hint_recomputed": runs["no_hint"]["cached_tokens"] in (0, None),
         "stale_hint_recomputed": runs["stale_hint"]["cached_tokens"] in (0, None),

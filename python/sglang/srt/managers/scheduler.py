@@ -5003,6 +5003,11 @@ class Scheduler(
 
         # sleep until next event
         self.maybe_sleep_on_idle()
+        if self.idle_sleeper is None and self.enable_unified_cache_external_linker:
+            # Without a sleeper this loop spins through the checks above. An
+            # idle worker still serves peer reads through the linker's owner
+            # and progress threads, which need the GIL between I/O calls.
+            time.sleep(0)
         self.metrics_reporter.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
