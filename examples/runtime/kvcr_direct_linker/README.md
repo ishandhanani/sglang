@@ -66,7 +66,9 @@ Other options (all optional): `operation_timeout_ms`, `abandon_timeout_ms`,
 `max_inflight_prepare_requests`, `max_inflight_prepare_bytes`,
 `max_prepare_bytes_per_request`, `max_inflight_offload_bytes`,
 `max_abandoned_bytes`, `fetch_chunk_pages`, `policy` (`lru` or `fifo`),
-`pin_local_dram`, `poll_interval_ms`, `stats_log_interval_s`, `device_copy`
+`pin_local_dram`, `poll_interval_ms` (owner-thread poll while KVCR operations
+are in flight), `idle_poll_interval_ms` (owner-thread wake interval with nothing
+in flight; default 10 ms), `stats_log_interval_s`, `device_copy`
 (CUDA runtime copies for offload inside KVCR; `false` forces NIXL loopback),
 `direct_restore` (layer-wise restore from claimed slots; `false` uses KVCR
 `deliver`), `direct_restore_min_batch_bytes` (merge consecutive layers whose

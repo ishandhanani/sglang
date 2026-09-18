@@ -77,6 +77,7 @@ one-second idle poll stalls DP-attention ranks, so do not combine the two.
 | `fetch_chunk_pages` | `32` | Pages per KVCR operation. |
 | `device_copy` | `true` | Offload GPU pages into KVCR DRAM with the CUDA runtime inside KVCR. `false` forces NIXL loopback (diagnostics only; an order of magnitude slower). |
 | `direct_restore` | `true` | Restore claimed KVCR slots into GPU pages from this process, layer by layer. `false` routes restores through KVCR `deliver` and completes every layer at the end. |
+| `poll_interval_ms`, `idle_poll_interval_ms` | `0.5`, `10` | Owner-thread wake cadence while KVCR operations are in flight, and with nothing in flight (deadline and statistics ticks only; posted work wakes it immediately). Each wake costs the scheduler a GIL hand-off, which matters most with one owner per DP-attention rank. |
 | `direct_restore_min_batch_bytes` | `4 MiB` | Consecutive layers whose restore operands total less than this share one copy batch; the layer-wise counter still completes them in order. Models with many small spans per page (DeepSeek V4) otherwise pay one launch per layer. `0` keeps one batch per layer. |
 
 ## How admission works
