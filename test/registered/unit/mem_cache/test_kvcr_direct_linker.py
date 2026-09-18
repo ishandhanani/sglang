@@ -167,6 +167,9 @@ def _publish_args(extra: dict) -> None:
         "abandon_timeout_ms": 1000,
         "poll_interval_ms": 0.2,
         "fetch_chunk_pages": 2,
+        # Fake pages are a few bytes; keep one copy batch per layer so the
+        # layer-ordering tests see every layer land separately.
+        "direct_restore_min_batch_bytes": 0,
     }
     config.update(extra)
     args = ServerArgs(
@@ -503,6 +506,36 @@ def test_direct_restore_lands_layers_in_order_from_claimed_slots(harness):
     assert stats.get("load_batches", 0) == 1
     h.close()
     assert engine.closed
+
+
+def test_direct_restore_merges_small_layers_into_one_batch(harness):
+    # Layers whose operands stay under the threshold share one copy batch;
+    # the counter still releases every layer and the bytes still land.
+    engine = FakeCopyEngine(latency=1)
+    h = harness(copy_engine=engine, extra={"direct_restore_min_batch_bytes": 1 << 30})
+    hashes = _hashes("dm", 4)
+    h.fill(0, 4, seed=24)
+    expected = h.snapshot(0, 4)
+    h.offload(hashes, first_page=0)
+    assert h.wait_offloads(1) == [True]
+    handle = h.prepare("rm", hashes)
+    h.wait_ready(handle)
+    assert h.linker.lookup("rm", h.lookup_transfers(hashes)) == [1, 2, 3, 4]
+    index = h.load("rm", hashes, first_page=8)
+    h.linker.layer_done_counter.set_consumer(index)
+    assert h.wait_loads(1) == [["rm"]]
+    assert len(engine.submitted) == 1
+    assert engine.submitted[0].request is None
+    h.linker.layer_done_counter.wait_until(LAYERS - 1)
+    restored = h.snapshot(8, 4)
+    for name in expected:
+        for got, want in zip(restored[name], expected[name]):
+            assert torch.equal(got, want), name
+    h.wait(lambda: h.public_claims() == 0)
+    stats = h.linker.snapshot_stats()
+    assert stats["restore_direct_batches"] == 1
+    assert stats["gpu_restore_bytes"] == stats["offload_bytes"]
+    h.close()
 
 
 def test_direct_restore_layer_lands_before_later_layers(harness):

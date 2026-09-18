@@ -1557,18 +1557,35 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     f"KVCR load spans several devices: {sorted(device_ids)}"
                 )
             device_id = device_ids.pop()
-            for layer in sorted(per_layer):
+            # Consecutive layers whose operands are small are merged into one
+            # batch: each submission costs a launch and an event regardless of
+            # size, and a merged batch still completes in layer order.
+            min_bytes = self.config.direct_restore_min_batch_bytes
+            group_layers: list[int] = []
+            group_parts: list[tuple[np.ndarray, ...]] = []
+            group_bytes = 0
+            ordered_layers = sorted(per_layer)
+            for position, layer in enumerate(ordered_layers):
                 parts = per_layer[layer]
-                if len(parts) == 1:
-                    dst, src, sizes = parts[0]
+                group_layers.append(layer)
+                group_parts.extend(parts)
+                group_bytes += int(sum(int(part[2].sum()) for part in parts))
+                last = position == len(ordered_layers) - 1
+                if group_bytes < min_bytes and not last:
+                    continue
+                if len(group_parts) == 1:
+                    dst, src, sizes = group_parts[0]
                 else:
-                    dst = np.concatenate([part[0] for part in parts])
-                    src = np.concatenate([part[1] for part in parts])
-                    sizes = np.concatenate([part[2] for part in parts])
+                    dst = np.concatenate([part[0] for part in group_parts])
+                    src = np.concatenate([part[1] for part in group_parts])
+                    sizes = np.concatenate([part[2] for part in group_parts])
                 request = engine.request(device_id, dst, sizes, src, sizes)
                 if isinstance(request, str):
-                    raise RuntimeError(f"KVCR load layer={layer}: {request}")
-                batch.handles.append(([layer], engine.submit(request)))
+                    raise RuntimeError(f"KVCR load layers={group_layers}: {request}")
+                batch.handles.append((list(group_layers), engine.submit(request)))
+                group_layers = []
+                group_parts = []
+                group_bytes = 0
             with self._lock:
                 self.stats["restore_direct_batches"] += 1
                 self.stats["restore_build_s_sum"] += time.perf_counter() - started

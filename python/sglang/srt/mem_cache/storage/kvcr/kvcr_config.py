@@ -47,6 +47,13 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     # False routes restores through KVCR deliver and completes all layers at
     # the end.
     direct_restore: bool = True
+    # Direct restores submit one copy batch per model layer so the forward
+    # pass can start on layer 0 early; consecutive layers whose operands total
+    # less than this many bytes are merged into one batch, because for models
+    # with many small spans per page (DeepSeek V4: 147 spans of 1.7 KB to
+    # 146 KB per page) the per-batch launch cost exceeds the copy itself.
+    # 0 keeps one batch per layer.
+    direct_restore_min_batch_bytes: int = 4 << 20
 
     # Peer control channel. control_port is a base; each rank adds its
     # engine-global attention rank so colocated ranks never collide.
@@ -114,6 +121,8 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError("KVCR poll_interval_ms must be positive.")
         if self.gil_switch_interval_ms is not None and self.gil_switch_interval_ms <= 0:
             raise ValueError("KVCR gil_switch_interval_ms must be positive.")
+        if self.direct_restore_min_batch_bytes < 0:
+            raise ValueError("KVCR direct_restore_min_batch_bytes must be >= 0.")
         self._validate_remote_hint_endpoint()
 
     def _validate_remote_hint_endpoint(self) -> None:
