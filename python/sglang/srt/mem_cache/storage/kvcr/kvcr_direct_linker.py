@@ -276,6 +276,9 @@ class _Preparation:
         "miss_reason",
         "ready_observed",
         "spans",
+        "owner_started_at",
+        "fetch_issued_at",
+        "fetched_at",
     )
 
     def __init__(
@@ -309,6 +312,11 @@ class _Preparation:
         self.peer_hinted = hint is not None
         self.miss_reason: Optional[str] = None
         self.ready_observed = False
+        # Timeline for the per-request log: owner pickup, last fetch issued,
+        # last fetch completed.
+        self.owner_started_at = 0.0
+        self.fetch_issued_at = 0.0
+        self.fetched_at = 0.0
 
 
 class _LoadPool:
@@ -1030,6 +1038,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         from kvcr.types import QueryStatus
 
         kvcr = self._adapter.kvcr
+        prep.owner_started_at = time.monotonic()
         if prep.hint is not None:
             try:
                 kvcr.submit_hint(prep.hint.to_kvcr_hint(), request_id=prep.request_id)
@@ -1079,6 +1088,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 )
                 prep.outstanding_ops += 1
                 self._adapter.track(op, self._fetch_completion(prep, pool, pages, keys))
+        prep.fetch_issued_at = time.monotonic()
         if prep.outstanding_ops == 0:
             with self._lock:
                 self._finish_preparation_locked(prep, reason="no_candidates")
@@ -1119,6 +1129,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 prep.bytes_confirmed += confirmed * self.layouts[pool].object_bytes
                 prep.outstanding_ops -= 1
                 if prep.outstanding_ops == 0:
+                    prep.fetched_at = time.monotonic()
                     self._finish_preparation_locked(prep, reason=None)
                     finished = True
                 else:
@@ -1277,16 +1288,29 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 self.stats["admission_wait_s_max"] = max(
                     self.stats["admission_wait_s_max"], waited
                 )
-                if self.stats["prepare_requests"] <= 3:
+                if self.stats["prepare_requests"] <= 3 or prep.peer_hinted:
+                    # Peer-hinted requests log their whole timeline: enqueue to
+                    # owner pickup, owner work until the last fetch is issued,
+                    # fetch completion, and the scheduler's observation lag.
+                    now = time.monotonic()
+                    marks = (
+                        prep.started_at,
+                        prep.owner_started_at or now,
+                        prep.fetch_issued_at or now,
+                        prep.fetched_at or now,
+                        now,
+                    )
                     logger.info(
                         "KVCR linker preparation observed ready: rid=%s state=%s "
-                        "pages=%d restorable=%d waited=%.3fs reason=%s",
+                        "pages=%d restorable=%d waited=%.3fs reason=%s "
+                        "queue=%.3fs issue=%.3fs fetch=%.3fs observe=%.3fs",
                         prep.handle.rid,
                         prep.state,
                         len(prep.page_hashes),
                         prep.restorable[-1] if prep.restorable else 0,
                         waited,
                         prep.miss_reason,
+                        *(max(0.0, b - a) for a, b in zip(marks, marks[1:])),
                     )
             return ready
 
