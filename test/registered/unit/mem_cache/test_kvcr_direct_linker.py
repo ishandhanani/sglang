@@ -182,8 +182,15 @@ def _publish_args(extra: dict) -> None:
 class Harness:
     """A linker over fake pools plus the fake agent it talks to."""
 
-    def __init__(self, *, with_swa: bool = False, extra: dict | None = None):
+    def __init__(
+        self,
+        *,
+        with_swa: bool = False,
+        extra: dict | None = None,
+        copy_engine=None,
+    ):
         _publish_args(extra or {})
+        self.copy_engine = copy_engine
         self.agent = FakeNixlAgent()
         self.group, self.buffers = _pool_group(with_swa=with_swa)
         params = SimpleNamespace(
@@ -224,6 +231,9 @@ class Harness:
                 components=set(),
                 _kvcr_factory=factory,
                 _nixl_probe=lambda backend: {"DRAM_SEG", "VRAM_SEG"},
+                _copy_engine_factory=(
+                    (lambda regions: copy_engine) if copy_engine is not None else None
+                ),
             )
 
     # -- helpers --------------------------------------------------------
@@ -406,6 +416,150 @@ def test_offload_prepare_lookup_load_round_trip_moves_bytes(harness):
     assert stats["restored_pages"] == 4
     assert stats["offload_bytes"] > 0
     assert stats["gpu_restore_bytes"] == stats["offload_bytes"]
+
+
+class FakeCopyEngine:
+    """Stand-in for KVCR's CUDA copy engine over CPU buffers.
+
+    Copies land with ``memmove`` when a handle has been polled ``latency``
+    times, so layers become visible one request at a time in submission order.
+    """
+
+    def __init__(self, *, latency: int = 1, fail_layer: int | None = None):
+        self.latency = latency
+        self.fail_layer = fail_layer
+        self.submitted: list = []
+        self.closed = False
+        # When set, requests beyond this submission index stay in flight.
+        self.release_up_to: int | None = None
+
+    @staticmethod
+    def request(device_id, dst_addresses, dst_sizes, src_addresses, src_sizes):
+        from kvcr.device_copy import DeviceCopyEngine
+
+        return DeviceCopyEngine.request(
+            device_id, dst_addresses, dst_sizes, src_addresses, src_sizes
+        )
+
+    def submit(self, request):
+        handle = SimpleNamespace(
+            request=request, remaining=self.latency, index=len(self.submitted)
+        )
+        self.submitted.append(handle)
+        return handle
+
+    def poll(self, handle):
+        if self.release_up_to is not None and handle.index > self.release_up_to:
+            return None
+        if handle.remaining > 0:
+            handle.remaining -= 1
+            return None
+        if handle.index == self.fail_layer:
+            return False
+        request = handle.request
+        if request is not None:
+            for dst, src, size in zip(
+                request.dst_addresses.tolist(),
+                request.src_addresses.tolist(),
+                request.sizes.tolist(),
+            ):
+                ctypes.memmove(dst, src, size)
+            handle.request = None
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+def test_direct_restore_lands_layers_in_order_from_claimed_slots(harness):
+    engine = FakeCopyEngine(latency=2)
+    h = harness(copy_engine=engine)
+    hashes = _hashes("dr", 4)
+    h.fill(0, 4, seed=21)
+    expected = h.snapshot(0, 4)
+    h.offload(hashes, first_page=0)
+    assert h.wait_offloads(1) == [True]
+    handle = h.prepare("rd", hashes)
+    h.wait_ready(handle)
+    assert h.linker.lookup("rd", h.lookup_transfers(hashes)) == [1, 2, 3, 4]
+    index = h.load("rd", hashes, first_page=8)
+    h.linker.layer_done_counter.set_consumer(index)
+    assert h.wait_loads(1) == [["rd"]]
+    # One request per logical layer, ascending, each covering every page's
+    # K and V span of that layer.
+    assert len(engine.submitted) == LAYERS
+    for layer, submitted in enumerate(engine.submitted):
+        assert submitted.request is None, f"layer {layer} never landed"
+    h.linker.layer_done_counter.wait_until(LAYERS - 1)
+    restored = h.snapshot(8, 4)
+    for name in expected:
+        for got, want in zip(restored[name], expected[name]):
+            assert torch.equal(got, want), name
+    h.wait(lambda: h.public_claims() == 0)
+    stats = h.linker.snapshot_stats()
+    assert stats["restore_direct_batches"] == 1
+    assert stats["restored_pages"] == 4
+    assert stats["gpu_restore_bytes"] == stats["offload_bytes"]
+    assert stats.get("load_batches", 0) == 1
+    h.close()
+    assert engine.closed
+
+
+def test_direct_restore_layer_lands_before_later_layers(harness):
+    # Only the first layer's copy is allowed to land, so the counter must
+    # release layer 0 while the last layer is still in flight.
+    engine = FakeCopyEngine(latency=1)
+    engine.release_up_to = 0
+    h = harness(copy_engine=engine)
+    hashes = _hashes("dl", 2)
+    h.fill(0, 2, seed=22)
+    h.offload(hashes, first_page=0)
+    assert h.wait_offloads(1) == [True]
+    handle = h.prepare("rl", hashes)
+    h.wait_ready(handle)
+    assert h.linker.lookup("rl", h.lookup_transfers(hashes)) == [1, 2]
+    index = h.load("rl", hashes, first_page=4)
+    h.linker.layer_done_counter.set_consumer(index)
+    h.wait(lambda: len(engine.submitted) == LAYERS)
+    futures = h.linker.layer_done_counter.futures[index]
+    h.wait(lambda: futures[0].done())
+    assert not futures[LAYERS - 1].done(), "later layers must not complete early"
+    assert h.linker.num_completed_loads() == 0
+    engine.release_up_to = None
+    assert h.wait_loads(1) == [["rl"]]
+    h.linker.layer_done_counter.wait_until(LAYERS - 1)
+    h.wait(lambda: h.public_claims() == 0)
+
+
+def test_direct_restore_failure_fails_the_counter_and_awaits_remaining_copies(
+    harness,
+):
+    engine = FakeCopyEngine(latency=1, fail_layer=1)
+    h = harness(copy_engine=engine)
+    hashes = _hashes("df", 2)
+    h.fill(0, 2, seed=23)
+    h.offload(hashes, first_page=0)
+    assert h.wait_offloads(1) == [True]
+    handle = h.prepare("rf", hashes)
+    h.wait_ready(handle)
+    assert h.linker.lookup("rf", h.lookup_transfers(hashes)) == [1, 2]
+    index = h.load("rf", hashes, first_page=4)
+    h.linker.layer_done_counter.set_consumer(index)
+    assert h.wait_loads(1) == [["rf"]]
+    with pytest.raises(RuntimeError):
+        h.linker.layer_done_counter.wait_until(LAYERS - 1)
+    # Every layer's copy was awaited before the claims were released.
+    assert all(handle.remaining == 0 for handle in engine.submitted)
+    h.wait(lambda: h.public_claims() == 0)
+    stats = h.linker.snapshot_stats()
+    assert stats["uncertain_loads"] == 1
+    assert not h.linker.offload(
+        [
+            PoolTransfer(
+                name=PoolName.KV, device_indices=h.page_indices(0, 1), keys=hashes[:1]
+            )
+        ]
+    ), "an unhealthy linker declines new work"
 
 
 def test_unprepared_and_unknown_pages_never_hit(harness):

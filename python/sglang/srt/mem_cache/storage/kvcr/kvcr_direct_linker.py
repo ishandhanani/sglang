@@ -26,6 +26,7 @@ from concurrent.futures import Future
 from typing import Any, Optional
 
 import msgspec
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
@@ -211,6 +212,7 @@ class _Preparation:
         "peer_hinted",
         "miss_reason",
         "ready_observed",
+        "spans",
     )
 
     def __init__(
@@ -233,6 +235,10 @@ class _Preparation:
         self.outstanding_ops = 0
         # (pool, page index) -> KVCR release handle.
         self.claims: dict[tuple[str, int], int] = {}
+        # (pool, page index) -> the claimed slots' descriptors, in subpool
+        # order, as fetch reported them. A claim pins the residency, so these
+        # spans stay readable until the handle is released.
+        self.spans: dict[tuple[str, int], list] = {}
         self.restorable: list[int] = []
         self.started_at = time.monotonic()
         self.bytes_requested = 0
@@ -243,7 +249,7 @@ class _Preparation:
 
 
 class _LoadPool:
-    __slots__ = ("pool", "page_hashes", "indices", "claims")
+    __slots__ = ("pool", "page_hashes", "indices", "claims", "spans")
 
     def __init__(
         self,
@@ -251,11 +257,14 @@ class _LoadPool:
         page_hashes: list[str],
         indices: torch.Tensor,
         claims: list[int],
+        spans: list,
     ):
         self.pool = pool
         self.page_hashes = page_hashes
         self.indices = indices
         self.claims = claims
+        # Claimed slot descriptors per page (None when fetch reported none).
+        self.spans = spans
 
 
 class _LoadBatch:
@@ -268,6 +277,8 @@ class _LoadBatch:
         "success",
         "bytes",
         "started_at",
+        "handles",
+        "next_handle",
     )
 
     def __init__(
@@ -281,6 +292,9 @@ class _LoadBatch:
         self.success = True
         self.bytes = 0
         self.started_at = time.monotonic()
+        # Direct restore: (logical layers, copy handle) in submission order.
+        self.handles: list[tuple[list[int], Any]] = []
+        self.next_handle = 0
 
 
 class _OffloadTask:
@@ -328,6 +342,65 @@ def _pool_policy(transfer: PoolTransfer) -> tuple[str, int]:
     return ("all_pages", 0)
 
 
+def _default_copy_engine_factory(regions):
+    """KVCR's CUDA copy engine over this rank's registered GPU pools."""
+    from kvcr.device_copy import create_device_copy_engine
+
+    return create_device_copy_engine(regions)
+
+
+class _RestorePlan(msgspec.Struct, frozen=True):
+    """Per-pool span geometry for direct restores, in layout span order.
+
+    ``layer_columns`` maps a logical layer to the span indices that land it.
+    A span shared by several logical layers (packed draft mappings) sits under
+    the smallest one, so no layer completes before every span it reads landed;
+    spans no layer maps to are landed with the last layer.
+    """
+
+    device_id: int
+    bases: np.ndarray
+    strides: np.ndarray
+    sizes: np.ndarray
+    layer_columns: dict[int, np.ndarray]
+
+
+def _build_restore_plans(
+    pool_group, layouts, num_layers: int
+) -> dict[str, _RestorePlan]:
+    plans: dict[str, _RestorePlan] = {}
+    for entry in pool_group.entries:
+        layout = layouts[str(entry.name)]
+        by_buffer: dict[int, int] = {}
+        for logical, mapped in entry.layer_mapping.items():
+            for buffer_index in [mapped] if isinstance(mapped, int) else mapped:
+                by_buffer[buffer_index] = min(
+                    by_buffer.get(buffer_index, logical), logical
+                )
+        span_layers: list[int] = []
+        for component in entry.buffer_meta:
+            for buffer_index in range(len(component)):
+                span_layers.append(by_buffer.get(buffer_index, num_layers - 1))
+        if len(span_layers) != len(layout.spans):
+            raise ValueError(
+                f"KVCR linker pool {entry.name} layout has {len(layout.spans)} spans "
+                f"but its buffers describe {len(span_layers)}."
+            )
+        columns: dict[int, np.ndarray] = {}
+        for layer in sorted(set(span_layers)):
+            columns[layer] = np.fromiter(
+                (i for i, l in enumerate(span_layers) if l == layer), dtype=np.intp
+            )
+        plans[str(entry.name)] = _RestorePlan(
+            device_id=layout.device_id,
+            bases=np.fromiter((b for b, _, _ in layout.spans), dtype=np.uint64),
+            strides=np.fromiter((s for _, s, _ in layout.spans), dtype=np.uint64),
+            sizes=np.fromiter((z for _, _, z in layout.spans), dtype=np.uint64),
+            layer_columns=columns,
+        )
+    return plans
+
+
 class KVCRDirectLinker(UnifiedCacheLinker):
     prepares_requests = True
     publishes_external_events = True
@@ -340,6 +413,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         components,
         _kvcr_factory: Optional[Callable[..., Any]] = None,
         _nixl_probe: Optional[Callable[[str], set[str]]] = None,
+        _copy_engine_factory: Optional[Callable[[Any], Any]] = None,
     ) -> None:
         from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             HybridCacheController,
@@ -386,6 +460,20 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._key_adapter = KVCRLinkerKeyAdapter()
         self._pinning = _NoFrameworkPinning()
         self._control = self._build_control_channel()
+        # Restores copy claimed KVCR slots straight into GPU pages from this
+        # process, one logical layer at a time, so compute can start on a
+        # layer while later ones are still landing. Without an engine (no CUDA
+        # runtime, or disabled) restores go through KVCR deliver instead.
+        self._copy_engine = (
+            (_copy_engine_factory or _default_copy_engine_factory)(
+                self._framework_regions
+            )
+            if self.config.direct_restore
+            else None
+        )
+        self._restore_plans = _build_restore_plans(
+            self.pool_group, self.layouts, self.num_layers
+        )
 
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         # Reentrant: owner-thread completions hold it while releasing claims,
@@ -407,6 +495,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         # without a round trip through the owner thread. Staleness only ever
         # costs a hit, never correctness: presence is still confirmed by fetch.
         self._resident_pages: set[str] = set()
+        # Direct restores whose copies are still landing (owner thread only).
+        self._direct_batches: list[_LoadBatch] = []
         self._inflight_prepare_bytes = 0
         self._inflight_offload_bytes = 0
         self._abandoned_bytes = 0
@@ -620,6 +710,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             local_dram=LocalDramOptions(
                 carve_local_dram(self.plan, self._local_dram),
                 backend=self.config.nixl_backend,
+                device_copy=self.config.device_copy,
             ),
             remote_fw_dram=RemoteFWDramOptions(
                 eager_ctrl_connect=self.config.eager_ctrl_connect,
@@ -891,6 +982,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                         self.stats["late_claims_released"] += 1
                         continue
                     prep.claims[(pool, page)] = entry.release_handle
+                    if entry.descriptors:
+                        prep.spans[(pool, page)] = entry.descriptors
                     prep.pools[pool].present[page] = True
                     if pool == str(PoolName.KV):
                         self._resident_pages.add(prep.page_hashes[page])
@@ -1024,6 +1117,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 worked = worked or remaining > 0
         for prep in expired:
             self._discard_hint(prep)
+        if self._direct_batches:
+            # Restores are the TTFT-critical path: poll their events every
+            # iteration instead of sleeping until the next command.
+            self._poll_direct_batches()
+            worked = True
         if self._deferred:
             still = []
             for event, submit in self._deferred:
@@ -1139,6 +1237,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 if not pages or transfer.host_indices is None:
                     continue
                 claims = []
+                spans = []
                 for page in pages:
                     index = prep.page_index.get(page)
                     claim = (
@@ -1152,7 +1251,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                             "claim; residency was not prepared for this page."
                         )
                     claims.append(claim)
-                pools.append(_LoadPool(pool, pages, transfer.host_indices, claims))
+                    spans.append(prep.spans.pop((pool, index), None))
+                pools.append(
+                    _LoadPool(pool, pages, transfer.host_indices, claims, spans)
+                )
             leftover = list(prep.claims.values())
             prep.claims = {}
             prep.state = _State.MISS
@@ -1207,6 +1309,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._deferred.append((event, submit))
 
     def _submit_load(self, batch: _LoadBatch) -> None:
+        if self._copy_engine is not None and all(
+            span is not None for pool in batch.pools for span in pool.spans
+        ):
+            self._submit_direct_load(batch)
+            return
         kvcr = self._adapter.kvcr
         try:
             chunk = self.config.fetch_chunk_pages
@@ -1243,6 +1350,104 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 self._finish_load(batch)
 
         return completion
+
+    def _submit_direct_load(self, batch: _LoadBatch) -> None:
+        """Copy claimed slots into GPU pages, one logical layer per request.
+
+        Layers are submitted in ascending order, so their completion events
+        fire in the order attention waits for them and the forward pass can
+        begin on layer 0 while later layers are still landing.
+        """
+        engine = self._copy_engine
+        started = time.perf_counter()
+        try:
+            per_layer: dict[int, list[tuple[np.ndarray, ...]]] = {}
+            device_ids: set[int] = set()
+            for pool in batch.pools:
+                plan = self._restore_plans[pool.pool]
+                device_ids.add(plan.device_id)
+                rows = np.asarray(self._rows(pool.pool, pool.indices), dtype=np.uint64)
+                pages = len(pool.page_hashes)
+                if len(rows) != pages:
+                    raise RuntimeError(
+                        f"KVCR load pool={pool.pool} rows={len(rows)} pages={pages}"
+                    )
+                span_count = len(plan.sizes)
+                dst = plan.bases[None, :] + rows[:, None] * plan.strides[None, :]
+                src = np.fromiter(
+                    (span.addr for spans in pool.spans for span in spans),
+                    dtype=np.uint64,
+                    count=pages * span_count,
+                ).reshape(pages, span_count)
+                sizes = np.fromiter(
+                    (span.size for spans in pool.spans for span in spans),
+                    dtype=np.uint64,
+                    count=pages * span_count,
+                ).reshape(pages, span_count)
+                if not np.array_equal(sizes, np.broadcast_to(plan.sizes, sizes.shape)):
+                    raise RuntimeError(
+                        f"KVCR load pool={pool.pool}: claimed spans do not match "
+                        "the pool layout"
+                    )
+                for layer, columns in plan.layer_columns.items():
+                    per_layer.setdefault(layer, []).append(
+                        (
+                            dst[:, columns].ravel(),
+                            src[:, columns].ravel(),
+                            np.tile(plan.sizes[columns], pages),
+                        )
+                    )
+            if len(device_ids) != 1:
+                raise RuntimeError(
+                    f"KVCR load spans several devices: {sorted(device_ids)}"
+                )
+            device_id = device_ids.pop()
+            for layer in sorted(per_layer):
+                parts = per_layer[layer]
+                dst = np.concatenate([part[0] for part in parts])
+                src = np.concatenate([part[1] for part in parts])
+                sizes = np.concatenate([part[2] for part in parts])
+                request = engine.request(device_id, dst, sizes, src, sizes)
+                if isinstance(request, str):
+                    raise RuntimeError(f"KVCR load layer={layer}: {request}")
+                batch.handles.append(([layer], engine.submit(request)))
+            with self._lock:
+                self.stats["restore_direct_batches"] += 1
+                self.stats["restore_build_s_sum"] += time.perf_counter() - started
+            self._direct_batches.append(batch)
+            self._poll_direct_batches()
+        except Exception as error:  # noqa: BLE001 - propagated through the counter
+            batch.success = False
+            logger.exception("KVCR direct restore submission failed")
+            self._finish_load(batch, error=error)
+
+    def _poll_direct_batches(self) -> bool:
+        """Advance in-flight direct restores; True while any is still landing.
+
+        Layers complete as their events fire. A failed layer fails the batch,
+        but the remaining copies are still awaited so no slot is released
+        while a DMA can read it.
+        """
+        engine = self._copy_engine
+        still: list[_LoadBatch] = []
+        for batch in self._direct_batches:
+            while batch.next_handle < len(batch.handles):
+                layers, handle = batch.handles[batch.next_handle]
+                result = engine.poll(handle)
+                if result is None:
+                    break
+                batch.next_handle += 1
+                if not result:
+                    batch.success = False
+                elif batch.success:
+                    for layer in layers:
+                        self.layer_done_counter.complete(batch.counter_index, layer)
+            if batch.next_handle >= len(batch.handles):
+                self._finish_load(batch)
+            else:
+                still.append(batch)
+        self._direct_batches = still
+        return bool(still)
 
     def _finish_load(
         self, batch: _LoadBatch, error: Optional[BaseException] = None
@@ -1356,9 +1561,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self, task: _OffloadTask, keys: list, pages: list[str], pool: str
     ):
         def completion(entries: Mapping[Any, Any]) -> None:
-            results = [
-                (e := entries.get(k)) is not None and e.success for k in keys
-            ]
+            results = [(e := entries.get(k)) is not None and e.success for k in keys]
             task.success = task.success and all(results)
             if pool == str(PoolName.KV) and not all(results):
                 with self._lock:
@@ -1465,10 +1668,14 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         while time.monotonic() < deadline:
             if not self._adapter.healthy:
                 return False
-            if self._adapter.pending_ops == 0 and not self._deferred:
+            if (
+                self._adapter.pending_ops == 0
+                and not self._deferred
+                and not self._direct_batches
+            ):
                 return True
             time.sleep(_DRAIN_POLL_S)
-        return self._adapter.pending_ops == 0
+        return self._adapter.pending_ops == 0 and not self._direct_batches
 
     def _release_everything(self) -> None:
         with self._lock:
@@ -1507,6 +1714,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._release_everything()
         self.layer_done_counter.reset()
         self._adapter.stop(timeout_s=5.0)
+        # The owner thread is stopped; anything still listed missed the drain
+        # and its counter was already reset above.
+        self._direct_batches.clear()
         old_kvcr = self._kvcr
         quiescent = drained and self._close_core(old_kvcr)
         if not quiescent:
@@ -1549,6 +1759,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._closed = True
         self.log_stats()
         self._adapter.stop(timeout_s=5.0)
+        self._direct_batches.clear()
+        if self._copy_engine is not None and drained:
+            self._copy_engine.close()
         if not (drained and self._close_core(self._kvcr)):
             logger.error(
                 "KVCR linker close left the core in place: outstanding transfers "

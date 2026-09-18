@@ -39,6 +39,14 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     local_dram_bytes_per_worker: int
     pin_local_dram: bool = True
     nixl_backend: str = "UCX"
+    # Offload copies GPU pages into KVCR DRAM with the CUDA runtime inside
+    # KVCR; False forces them through NIXL loopback (diagnostics only).
+    device_copy: bool = True
+    # Restore copies claimed KVCR slots into GPU pages directly from this
+    # process, layer by layer, so compute starts as soon as a layer lands;
+    # False routes restores through KVCR deliver and completes all layers at
+    # the end.
+    direct_restore: bool = True
 
     # Peer control channel. control_port is a base; each rank adds its
     # engine-global attention rank so colocated ranks never collide.

@@ -5,14 +5,21 @@ description: "Offload GPU KV pages into KVCR-owned DRAM over NIXL and reuse pref
 
 The KVCR direct linker connects `UnifiedRadixCache` device pools straight to
 [KVCR](https://github.com/ai-dynamo/kvcr), the KV Cache Runner. Pages move
-between GPU memory and KVCR-owned DRAM through NIXL; SGLang allocates no host
-cache tier in this mode.
+between GPU memory and KVCR-owned DRAM with one DMA each way; SGLang allocates
+no host cache tier in this mode.
 
 ```text
-Local offload:  SGLang GPU -> KVCR DRAM
-Local restore:  KVCR DRAM  -> SGLang GPU
-Peer restore:   source KVCR DRAM -> target KVCR DRAM -> target GPU
+Local offload:  SGLang GPU -> KVCR DRAM        (CUDA runtime copy inside KVCR)
+Local restore:  KVCR DRAM  -> SGLang GPU       (CUDA runtime copy, layer by layer)
+Peer restore:   source KVCR DRAM -> target KVCR DRAM -> target GPU   (NIXL, then local)
 ```
+
+Local copies never leave the process, so they use the CUDA runtime rather than
+a NIXL transfer to the agent itself (whose UCX loopback has no device-memory
+lane). NIXL carries only peer traffic. A restore copies the claimed KVCR slots
+into the GPU pages one logical layer at a time and releases each layer to the
+forward pass as soon as it lands, so compute on early layers overlaps the
+transfer of later ones.
 
 The peer path hydrates the target's own KVCR tier first, so residency is
 confirmed and claimed before a GPU cache hit is admitted. It includes the
@@ -62,13 +69,18 @@ peer transfers.
 | `operation_timeout_ms`, `abandon_timeout_ms` | `20000`, `60000` | KVCR core deadlines. |
 | `policy` | `lru` | Local tier placement policy (`lru` or `fifo`). |
 | `fetch_chunk_pages` | `32` | Pages per KVCR operation. |
+| `device_copy` | `true` | Offload GPU pages into KVCR DRAM with the CUDA runtime inside KVCR. `false` forces NIXL loopback (diagnostics only; an order of magnitude slower). |
+| `direct_restore` | `true` | Restore claimed KVCR slots into GPU pages from this process, layer by layer. `false` routes restores through KVCR `deliver` and completes every layer at the end. |
 
 ## How admission works
 
 A source hint is not a cache hit. At enqueue the scheduler runs the ordinary
 device prefix match and hands the uncached tail to the linker, which queries
 KVCR, submits `fetch` for useful local or hinted candidates (acquiring residency
-claims), and reports readiness. Each prefill scheduling pass reduces readiness
+claims), and reports readiness. A request without a hint whose first tail page
+was never deposited or fetched on this rank is a certain miss under the
+all-pages policy and is marked so on the scheduler thread, without a round trip
+through the KVCR owner thread. Each prefill scheduling pass reduces readiness
 with MIN across the attention group so every rank agrees; requests still
 preparing are skipped while others proceed. Once ready, the normal prefix match
 runs and `lookup` exposes only pages whose claims are held. Claims are released
