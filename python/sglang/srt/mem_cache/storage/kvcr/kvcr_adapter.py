@@ -38,9 +38,18 @@ class KVCRAdapter:
         poll_interval_s: float,
         name: str,
         on_unhealthy: Callable[[BaseException], None] | None = None,
+        idle_poll_interval_s: float | None = None,
     ) -> None:
         self._kvcr = kvcr
         self._poll_interval_s = poll_interval_s
+        # With no tracked operation in flight nothing completes without a
+        # posted command, which wakes the queue at once; the only periodic
+        # work is the tickers (deadlines, statistics). Waking every
+        # poll_interval_s then only costs the scheduler thread GIL hand-offs,
+        # which on DP-attention deployments slowed every request.
+        self._idle_poll_interval_s = (
+            poll_interval_s if idle_poll_interval_s is None else idle_poll_interval_s
+        )
         self._commands: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self._completions: dict[int, Completion] = {}
         # Work re-checked every loop iteration (device events, deadlines).
@@ -162,9 +171,15 @@ class KVCRAdapter:
                 if not worked:
                     # Block on the command queue instead of sleeping so a
                     # posted command runs at once; completions of in-flight
-                    # operations are still polled every interval.
+                    # operations are still polled every interval, and an idle
+                    # loop wakes only for its tickers.
+                    timeout = (
+                        self._poll_interval_s
+                        if self._pending_ops
+                        else self._idle_poll_interval_s
+                    )
                     try:
-                        item = self._commands.get(timeout=self._poll_interval_s)
+                        item = self._commands.get(timeout=timeout)
                     except queue.Empty:
                         continue
                     if item is _STOP:

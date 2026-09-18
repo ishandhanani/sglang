@@ -82,8 +82,15 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     max_inflight_offload_bytes: int = 8 << 30
     # Late (abandoned) work above this stops new preparation until it drains.
     max_abandoned_bytes: int = 4 << 30
-    # Owner-thread idle poll interval; shorter finishes small transfers sooner.
+    # Owner-thread poll interval while KVCR operations are in flight; shorter
+    # finishes small transfers sooner.
     poll_interval_ms: float = 0.5
+    # Owner-thread wake interval with nothing in flight (deadline and stats
+    # ticks only; posted commands wake it at once). Every wake costs the
+    # scheduler thread a GIL hand-off, and with one owner per DP-attention
+    # rank a 0.5 ms cadence added about 0.2 s to every request's TTFT on a
+    # four-rank DeepSeek V4 deployment.
+    idle_poll_interval_ms: float = 10.0
     stats_log_interval_s: float = 30.0
     # Interpreter switch interval to apply in the scheduler process. The owner
     # thread and the scheduler share one GIL; a shorter interval caps how long
@@ -119,6 +126,10 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
                 raise ValueError(f"KVCR {name} must be positive.")
         if self.poll_interval_ms <= 0:
             raise ValueError("KVCR poll_interval_ms must be positive.")
+        if self.idle_poll_interval_ms < self.poll_interval_ms:
+            raise ValueError(
+                "KVCR idle_poll_interval_ms must be at least poll_interval_ms."
+            )
         if self.gil_switch_interval_ms is not None and self.gil_switch_interval_ms <= 0:
             raise ValueError("KVCR gil_switch_interval_ms must be positive.")
         if self.direct_restore_min_batch_bytes < 0:

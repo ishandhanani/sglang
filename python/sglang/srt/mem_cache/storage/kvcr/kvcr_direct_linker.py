@@ -860,6 +860,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             poll_interval_s=self.config.poll_interval_ms / 1000.0,
             name=f"r{self.world_rank}",
             on_unhealthy=self._on_unhealthy,
+            idle_poll_interval_s=self.config.idle_poll_interval_ms / 1000.0,
         )
         adapter.add_ticker(self._tick)
         # The ticker reads self._adapter and the stats clock from the owner
@@ -1269,10 +1270,12 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             for event, submit in self._deferred:
                 if event is None or event.query():
                     submit()
-                    worked = True
                 else:
                     still.append((event, submit))
             self._deferred = still
+            # A restore waiting on its ready event is TTFT-critical: keep
+            # polling instead of parking for the idle interval.
+            worked = True
         if now >= self._next_stats_log:
             self._next_stats_log = now + self.config.stats_log_interval_s
             self.log_stats()
