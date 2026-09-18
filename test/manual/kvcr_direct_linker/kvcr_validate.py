@@ -350,6 +350,12 @@ def scenario_peer(args, workdir: Path) -> dict:
     try:
         source.wait_ready()
         target.wait_ready()
+        # Each server's very first request can differ numerically (kernel JIT
+        # and warmup paths); keep it out of the compared runs.
+        warm = _prompt(random.Random(args.seed + 1), 256, args.vocab)
+        source.generate(warm, 1)
+        target.generate(warm, 1)
+        time.sleep(args.settle_s)
         control = source.generate(prompt, args.max_new_tokens)
         time.sleep(args.settle_s)
         source_endpoint = f"tcp://127.0.0.1:{source_control}"
@@ -396,6 +402,11 @@ def scenario_peer(args, workdir: Path) -> dict:
         "dead_peer_recomputed": runs["dead_peer"]["cached_tokens"] in (0, None),
         "dead_peer_bounded_wait_s": runs["dead_peer"]["wall_s"],
         "outputs_identical": len(set(texts.values())) == 1,
+        # The comparison that judges the transfer: bytes restored from the
+        # peer must produce what the target's own recompute produces.
+        "hinted_matches_recompute": texts["hinted"]
+        == texts["no_hint"]
+        == texts["control_source"],
     }
     return report
 
