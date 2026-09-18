@@ -73,13 +73,23 @@ class Server:
         linker_config: dict | None,
         extra_args: list[str],
         dp_rank: int | None = None,
+        numa_node: int | None = None,
     ) -> None:
         self.name = name
         self.port = port
         self.base = f"http://127.0.0.1:{port}"
         self.log_path = workdir / f"{name}.log"
         self.linker_config = linker_config
-        command = [
+        command = []
+        if numa_node is not None:
+            # Keep the server's threads and DRAM tier on one socket so the
+            # peer copy and GIL handoffs do not straddle the interconnect.
+            command += [
+                "numactl",
+                f"--cpunodebind={numa_node}",
+                f"--membind={numa_node}",
+            ]
+        command += [
             sys.executable,
             "-m",
             "sglang.launch_server",
@@ -435,6 +445,7 @@ def scenario_peer(args, workdir: Path) -> dict:
         linker_config=_linker_config(args, control_port=source_control),
         extra_args=args.extra,
         dp_rank=args.dp_rank,
+        numa_node=args.numa_node,
     )
     # With DP attention the server derives a block of TCP ports from its port
     # (port + 233 onwards), so two servers on adjacent ports collide; keep the
@@ -451,6 +462,7 @@ def scenario_peer(args, workdir: Path) -> dict:
         linker_config=_linker_config(args, control_port=target_control),
         extra_args=args.extra,
         dp_rank=args.dp_rank,
+        numa_node=args.numa_node,
     )
     try:
         source.wait_ready()
@@ -772,6 +784,12 @@ def main() -> int:
         "--pyspy-steady",
         action="store_true",
         help="peer scenario: py-spy the target scheduler during the steady block",
+    )
+    parser.add_argument(
+        "--numa-node",
+        type=int,
+        default=None,
+        help="peer scenario: numactl both servers onto this NUMA node",
     )
     # Unknown flags are forwarded to sglang.launch_server verbatim.
     args, args.extra = parser.parse_known_args()
