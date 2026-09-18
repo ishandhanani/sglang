@@ -526,7 +526,7 @@ def scenario_peer(args, workdir: Path) -> dict:
                             "--threads",
                             "--idle",
                             "--rate",
-                            "200",
+                            "100",
                             "--duration",
                             str(duration),
                             "--format",
@@ -563,7 +563,13 @@ def scenario_peer(args, workdir: Path) -> dict:
             runs["steady_hinted"] = steady
             runs["steady_recompute"] = recompute
             if profiler is not None:
-                profiler.wait(timeout=120)
+                # py-spy writes its output on SIGINT; sampling many threads can
+                # run well past --duration, so stop it explicitly.
+                profiler.send_signal(signal.SIGINT)
+                try:
+                    profiler.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    profiler.kill()
         time.sleep(args.settle_s)
         report["runs"] = runs
         report["source_stats"] = source.stats()
