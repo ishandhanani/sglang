@@ -270,9 +270,11 @@ class UnifiedCacheLinkerWrapper:
         ]
         if not ready:
             return set()
-        mask = torch.tensor(ready, dtype=torch.int, device="cpu")
-        self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
-        return {req.rid for req, flag in zip(reqs, mask.tolist()) if flag}
+        if self.cache._attn_groups_reduce:
+            mask = torch.tensor(ready, dtype=torch.int, device="cpu")
+            self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
+            ready = mask.tolist()
+        return {req.rid for req, flag in zip(reqs, ready) if flag}
 
     # ---- match: probe the remote store and report host_hit_length ----
 
@@ -349,10 +351,12 @@ class UnifiedCacheLinkerWrapper:
         length that only some ranks can restore. On a 0/1 mask MIN is AND, which
         makes the reduction an intersection.
         """
+        valid = [pages for pages in restorable if device_hit_pages < pages <= num_pages]
+        if not self.cache._attn_groups_reduce:
+            return max(valid, default=0)
         mask = torch.zeros(num_pages + 1, dtype=torch.int)
-        for pages in restorable:
-            if device_hit_pages < pages <= num_pages:
-                mask[pages] = 1
+        for pages in valid:
+            mask[pages] = 1
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
         common = mask.nonzero()
         if common.numel() == 0:

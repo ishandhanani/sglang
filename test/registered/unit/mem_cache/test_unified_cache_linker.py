@@ -152,6 +152,8 @@ def _cache_for_wrapper(**kwargs):
         "write_through_threshold": 256,
         "pp_size": 1,
         "pp_group": None,
+        # Behave like several attention ranks so faked reductions are exercised.
+        "_attn_groups_reduce": True,
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
