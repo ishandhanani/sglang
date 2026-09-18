@@ -149,14 +149,23 @@ class Server:
         return _post(f"{self.base}/generate", payload)
 
     def flush(self) -> None:
-        # /flush_cache answers with plain text, not JSON.
+        # /flush_cache answers with plain text, not JSON, and refuses (400)
+        # while a request is still finishing; retry briefly.
         request = urllib.request.Request(
             f"{self.base}/flush_cache",
             data=b"{}",
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=120.0) as response:
-            response.read()
+        deadline = time.monotonic() + 30.0
+        while True:
+            try:
+                with urllib.request.urlopen(request, timeout=120.0) as response:
+                    response.read()
+                return
+            except urllib.error.HTTPError as error:
+                if error.code != 400 or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.5)
 
     def stats(self) -> dict[str, dict[str, str]]:
         """Latest stats line per rank from the log."""
@@ -434,6 +443,48 @@ def scenario_peer(args, workdir: Path) -> dict:
             _hint(f"tcp://127.0.0.1:{args.control_port + 500}", prompt, page),
             False,
         )
+        if args.peer_prompts > 0:
+            # Steady state: distinct prompts served once on the source, then
+            # hinted on the target without flushing in between, so first
+            # contact (metadata exchange) is separated from per-transfer cost.
+            # Recompute baselines use other prompts of the same length so the
+            # target's own tier cannot serve them.
+            steady_rng = random.Random(args.seed + 2)
+            served = [
+                _prompt(steady_rng, args.prompt_tokens, args.vocab)
+                for _ in range(args.peer_prompts)
+            ]
+            fresh = [
+                _prompt(steady_rng, args.prompt_tokens, args.vocab)
+                for _ in range(args.peer_prompts)
+            ]
+            source_texts = [
+                _summary(source.generate(tokens, args.max_new_tokens))["text"]
+                for tokens in served
+            ]
+            time.sleep(args.settle_s)
+            target.flush()
+            time.sleep(0.5)
+            steady = []
+            for tokens, source_text in zip(served, source_texts):
+                started = time.monotonic()
+                result = target.generate(
+                    tokens,
+                    args.max_new_tokens,
+                    kv_hints=_hint(source_endpoint, tokens, page),
+                )
+                entry = _summary(result)
+                entry["wall_s"] = time.monotonic() - started
+                entry["matches_source"] = entry["text"] == source_text
+                steady.append(entry)
+            recompute = []
+            for tokens in fresh:
+                started = time.monotonic()
+                entry = _summary(target.generate(tokens, args.max_new_tokens))
+                entry["wall_s"] = time.monotonic() - started
+                recompute.append(entry)
+            runs["steady_hinted"] = steady
+            runs["steady_recompute"] = recompute
         time.sleep(args.settle_s)
         report["runs"] = runs
         report["source_stats"] = source.stats()
@@ -443,8 +494,15 @@ def scenario_peer(args, workdir: Path) -> dict:
         source.stop()
         target.stop()
     runs = report["runs"]
-    texts = {label: run["text"] for label, run in runs.items()}
+    texts = {label: run["text"] for label, run in runs.items() if isinstance(run, dict)}
+    steady = runs.get("steady_hinted", [])
     report["checks"] = {
+        "steady_all_restored": all((e["cached_tokens"] or 0) > 0 for e in steady),
+        "steady_all_match_source": all(e["matches_source"] for e in steady),
+        "steady_hinted_e2e_s": [e["e2e_latency_s"] for e in steady],
+        "steady_recompute_e2e_s": [
+            e["e2e_latency_s"] for e in runs.get("steady_recompute", [])
+        ],
         "hinted_restored": (runs["hinted"]["cached_tokens"] or 0) > 0,
         "no_hint_recomputed": runs["no_hint"]["cached_tokens"] in (0, None),
         "stale_hint_recomputed": runs["stale_hint"]["cached_tokens"] in (0, None),
@@ -614,6 +672,12 @@ def main() -> int:
         "--natural-prompt",
         action="store_true",
         help="build prompts from a repeated passage instead of random tokens",
+    )
+    parser.add_argument(
+        "--peer-prompts",
+        type=int,
+        default=0,
+        help="peer scenario: distinct prompts hinted back-to-back without flushes",
     )
     # Unknown flags are forwarded to sglang.launch_server verbatim.
     args, args.extra = parser.parse_known_args()

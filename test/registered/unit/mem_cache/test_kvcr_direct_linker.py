@@ -1136,6 +1136,27 @@ def test_owner_thread_stats_tick_during_startup_does_not_fault(harness, caplog):
     assert not [r for r in caplog.records if "owner loop fault" in r.getMessage()]
 
 
+def test_telemetry_sink_folds_kvcr_metrics_into_stats(harness):
+    # With telemetry on, KVCR's counters and stage histograms land in the
+    # snapshot under kvcr_ keys; off, no sink is created at all.
+    h = harness(extra={"enable_telemetry": True})
+    sink = h.linker._telemetry
+    assert sink is not None and sink.is_empty()
+    sink.increase_counter("ops", 2, ("fetch",))
+    sink.increase_counter("ops", 3, ("fetch",))
+    sink.set_gauge("inflight", 4)
+    sink.observe_histogram("duration", 0.25, ("source_write",))
+    sink.observe_histogram("duration", 0.75, ("source_write",))
+    snapshot = h.linker.snapshot_stats()
+    assert snapshot["kvcr_ops[fetch]"] == 5
+    assert snapshot["kvcr_inflight"] == 4
+    assert snapshot["kvcr_duration[source_write]_count"] == 2
+    assert snapshot["kvcr_duration[source_write]_sum"] == 1.0
+    assert snapshot["kvcr_duration[source_write]_max"] == 0.75
+    assert not sink.is_empty()
+    assert harness(extra={"enable_telemetry": False}).linker._telemetry is None
+
+
 if __name__ == "__main__":
     import sys
 

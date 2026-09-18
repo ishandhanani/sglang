@@ -153,6 +153,64 @@ class LayerWiseLoadCounter:
             self.futures.clear()
 
 
+class _LinkerTelemetry:
+    """KVCR ``TelemetryStats`` sink folded into the linker's stats log.
+
+    Counters sum, gauges keep the last value, histograms keep count, sum, and
+    max, all keyed by metric name and label values. KVCR reports from both the
+    owner thread and its progress thread.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counters: dict[str, float] = collections.defaultdict(float)
+        self._gauges: dict[str, float] = {}
+        self._histograms: dict[str, list[float]] = collections.defaultdict(
+            lambda: [0.0, 0.0, 0.0]
+        )
+
+    @staticmethod
+    def _key(name: str, labelvalues: tuple[str, ...]) -> str:
+        return f"kvcr_{name}" + (
+            "[" + ",".join(labelvalues) + "]" if labelvalues else ""
+        )
+
+    def increase_counter(
+        self, name: str, value: int | float = 1, labelvalues: tuple[str, ...] = ()
+    ) -> None:
+        with self._lock:
+            self._counters[self._key(name, labelvalues)] += value
+
+    def set_gauge(
+        self, name: str, value: int | float, labelvalues: tuple[str, ...] = ()
+    ) -> None:
+        with self._lock:
+            self._gauges[self._key(name, labelvalues)] = value
+
+    def observe_histogram(
+        self, name: str, value: int | float, labelvalues: tuple[str, ...] = ()
+    ) -> None:
+        with self._lock:
+            entry = self._histograms[self._key(name, labelvalues)]
+            entry[0] += 1
+            entry[1] += value
+            entry[2] = max(entry[2], value)
+
+    def reduce(self) -> dict[str, int | float]:
+        with self._lock:
+            flat: dict[str, int | float] = dict(self._counters)
+            flat.update(self._gauges)
+            for key, (count, total, peak) in self._histograms.items():
+                flat[f"{key}_count"] = count
+                flat[f"{key}_sum"] = total
+                flat[f"{key}_max"] = peak
+            return flat
+
+    def is_empty(self) -> bool:
+        with self._lock:
+            return not (self._counters or self._gauges or self._histograms)
+
+
 class _NoFrameworkPinning:
     """Decline every peer pin request: this rank never serves live GPU pages.
 
@@ -498,6 +556,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self.agent_name = self._new_agent_name()
         self._key_adapter = KVCRLinkerKeyAdapter()
         self._pinning = _NoFrameworkPinning()
+        self._telemetry = _LinkerTelemetry() if self.config.enable_telemetry else None
         self._control = self._build_control_channel()
         # Restores copy claimed KVCR slots straight into GPU pages from this
         # process, one logical layer at a time, so compute can start on a
@@ -744,6 +803,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             inventory_sink=self._on_inventory_event,
             policy=resolve_policy(self.config.policy),
             on_resilience_event=self._on_resilience_event,
+            stats_factory=(
+                (lambda: self._telemetry) if self._telemetry is not None else None
+            ),
         )
         backend_configs = KVCRBackendConfigs(
             framework_regions=self._framework_regions,
@@ -1725,6 +1787,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         snapshot["kvcr_pending_ops"] = self._adapter.pending_ops
         snapshot["kvcr_inflight_ops_hwm"] = self._adapter.inflight_high_water
         snapshot["dram_bytes"] = self.plan.total_bytes
+        if self._telemetry is not None:
+            snapshot.update(self._telemetry.reduce())
         return snapshot
 
     def log_stats(self) -> None:
