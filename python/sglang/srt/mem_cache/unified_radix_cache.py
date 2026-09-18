@@ -255,6 +255,12 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.tp_group is None
             else torch.distributed.get_world_size(group=self.tp_group)
         )
+        # Whether attention-group consensus needs a collective at all; on a
+        # single rank the per-step linker polls stay on plain integers.
+        self._attn_groups_reduce = self.tp_world_size > 1 or any(
+            group is not None and torch.distributed.get_world_size(group=group) > 1
+            for group in (self.attn_cp_group, self.attn_tp_group)
+        )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
@@ -3455,23 +3461,29 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
-            finish_counts = torch.tensor(
-                [
-                    self.linker.num_completed_loads(),
-                    self.linker.num_completed_offloads(),
-                ],
-                dtype=torch.int,
-                device="cpu",
-            )
-            self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
+            load_count = self.linker.num_completed_loads()
+            offload_count = self.linker.num_completed_offloads()
+            if self._attn_groups_reduce:
+                finish_counts = torch.tensor(
+                    [load_count, offload_count], dtype=torch.int, device="cpu"
+                )
+                self._all_reduce_attn_groups(
+                    finish_counts, torch.distributed.ReduceOp.MIN
+                )
+                load_count, offload_count = map(int, finish_counts.tolist())
             self.linker.drain_loads(load_count)
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:
-                successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
-                self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+                if self._attn_groups_reduce:
+                    successes = torch.tensor(
+                        local_successes, dtype=torch.int, device="cpu"
+                    )
+                    self._all_reduce_attn_groups(
+                        successes, torch.distributed.ReduceOp.MIN
+                    )
+                    local_successes = successes.tolist()
                 self.linker.commit_completed_offloads(
-                    [bool(success) for success in successes.tolist()]
+                    [bool(success) for success in local_successes]
                 )
             self.linker.drain_external_inventory()
             return

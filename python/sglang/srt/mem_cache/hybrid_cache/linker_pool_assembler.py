@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Any
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
@@ -41,6 +42,7 @@ class DevicePoolEntry:
         self.packed = packed
         self._index_mapper = index_mapper
         self._page_offsets = torch.arange(page_size)
+        self._page_offsets_np = np.arange(page_size, dtype=np.int64)
         self._row_span = 1 if rows_are_pages else page_size
 
         if not self.components or any(not component for component in self.components):
@@ -78,26 +80,25 @@ class DevicePoolEntry:
         return self._index_mapper(indices) if self._index_mapper else indices
 
     def _rows(self, indices: torch.Tensor) -> list[int]:
-        slots = indices.detach().to(device="cpu", dtype=torch.int64).flatten()
-        if slots.numel() % self.page_size:
+        # numpy, not torch, for these few thousand integers: every small torch
+        # CPU op pays dispatch and intra-op thread-pool costs that dwarf the
+        # arithmetic on a many-core host.
+        slots = indices.detach().to(device="cpu", dtype=torch.int64).flatten().numpy()
+        if slots.size % self.page_size:
             raise ValueError(
-                f"Pool {self.name} got {slots.numel()} indices, expected a "
+                f"Pool {self.name} got {slots.size} indices, expected a "
                 f"multiple of page_size={self.page_size}."
             )
-        if not slots.numel():
+        if not slots.size:
             return []
 
         pages = slots.reshape(-1, self.page_size)
         starts = pages[:, 0]
-        if torch.any(starts.remainder(self.page_size)) or not torch.equal(
-            pages, starts[:, None] + self._page_offsets
+        if (starts % self.page_size).any() or not np.array_equal(
+            pages, starts[:, None] + self._page_offsets_np
         ):
             raise ValueError(f"Pool {self.name} requires aligned contiguous pages.")
-        rows = (
-            starts.div(self.page_size, rounding_mode="floor")
-            if self._row_span == 1
-            else starts
-        )
+        rows = starts // self.page_size if self._row_span == 1 else starts
         first_row = int(rows.min())
         last_row = int(rows.max()) + self._row_span
         if first_row < 0 or last_row > self._row_count:
