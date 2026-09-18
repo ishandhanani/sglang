@@ -306,6 +306,9 @@ class _OffloadTask:
         "success",
         "done",
         "started_at",
+        "chunks",
+        "next_chunk",
+        "submitted_all",
     )
 
     def __init__(self, transfers: list[PoolTransfer], ready_event, nbytes: int):
@@ -316,6 +319,11 @@ class _OffloadTask:
         self.success = True
         self.done = False
         self.started_at = time.monotonic()
+        # (pool, page hashes, rows) per deposit, built once; submission may
+        # span several owner-loop iterations.
+        self.chunks: Optional[list[tuple[str, list[str], list[int]]]] = None
+        self.next_chunk = 0
+        self.submitted_all = False
 
 
 def _cpu_indices(indices: torch.Tensor) -> torch.Tensor:
@@ -1516,45 +1524,72 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         )
         return True
 
+    def _offload_chunks(
+        self, task: _OffloadTask
+    ) -> list[tuple[str, list[str], list[int]]]:
+        chunk = self.config.fetch_chunk_pages
+        chunks: list[tuple[str, list[str], list[int]]] = []
+        for transfer in task.transfers:
+            pool = str(transfer.name)
+            pages = list(transfer.keys or [])
+            rows = self._rows(pool, transfer.host_indices)
+            if len(rows) != len(pages):
+                raise RuntimeError(
+                    f"KVCR offload pool={pool} rows={len(rows)} pages={len(pages)}"
+                )
+            for start in range(0, len(rows), chunk):
+                chunks.append(
+                    (pool, pages[start : start + chunk], rows[start : start + chunk])
+                )
+        return chunks
+
     def _submit_offload(self, task: _OffloadTask) -> None:
+        """Submit an offload one deposit at a time, yielding to queued commands.
+
+        Preparations and restores posted while an offload is being submitted
+        are on the TTFT path, so when a command is waiting the remaining
+        deposits are deferred to the next owner-loop iteration, after it runs.
+        """
         kvcr = self._adapter.kvcr
         try:
-            chunk = self.config.fetch_chunk_pages
             build_started = time.perf_counter()
-            for transfer in task.transfers:
-                pool = str(transfer.name)
-                pages = list(transfer.keys or [])
-                rows = self._rows(pool, transfer.host_indices)
-                if len(rows) != len(pages):
-                    raise RuntimeError(
-                        f"KVCR offload pool={pool} rows={len(rows)} pages={len(pages)}"
-                    )
-                for start in range(0, len(rows), chunk):
-                    chunk_pages = pages[start : start + chunk]
-                    blocks = {
-                        self._key(page, pool): self._descriptors(pool, row)
-                        for page, row in zip(chunk_pages, rows[start : start + chunk])
-                    }
-                    op = kvcr.deposit(blocks)
-                    if pool == str(PoolName.KV):
-                        # Filling pages are fetchable: a fetch waits for the
-                        # fill, so they count as candidates from submission on.
-                        with self._lock:
-                            self._resident_pages.update(chunk_pages)
-                    task.outstanding += 1
-                    self._adapter.track(
-                        op,
-                        self._offload_completion(task, list(blocks), chunk_pages, pool),
-                    )
+            if task.chunks is None:
+                task.chunks = self._offload_chunks(task)
+            while task.next_chunk < len(task.chunks):
+                pool, chunk_pages, chunk_rows = task.chunks[task.next_chunk]
+                blocks = {
+                    self._key(page, pool): self._descriptors(pool, row)
+                    for page, row in zip(chunk_pages, chunk_rows)
+                }
+                op = kvcr.deposit(blocks)
+                if pool == str(PoolName.KV):
+                    # Filling pages are fetchable: a fetch waits for the fill,
+                    # so they count as candidates from submission on.
+                    with self._lock:
+                        self._resident_pages.update(chunk_pages)
+                task.outstanding += 1
+                task.next_chunk += 1
+                self._adapter.track(
+                    op,
+                    self._offload_completion(task, list(blocks), chunk_pages, pool),
+                )
+                if (
+                    task.next_chunk < len(task.chunks)
+                    and self._adapter.has_pending_commands()
+                ):
+                    self._deferred.append((None, lambda: self._submit_offload(task)))
+                    break
+            else:
+                task.submitted_all = True
             with self._lock:
                 self.stats["descriptor_build_s_sum"] += (
                     time.perf_counter() - build_started
                 )
-            if task.outstanding == 0:
-                self._finish_offload(task)
         except Exception:  # noqa: BLE001 - reported as a failed offload
             logger.exception("KVCR offload submission failed")
             task.success = False
+            task.submitted_all = True
+        if task.submitted_all and task.outstanding == 0:
             self._finish_offload(task)
 
     def _offload_completion(
@@ -1569,7 +1604,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                         page for page, landed in zip(pages, results) if not landed
                     )
             task.outstanding -= 1
-            if task.outstanding == 0:
+            if task.outstanding == 0 and task.submitted_all:
                 self._finish_offload(task)
 
         return completion

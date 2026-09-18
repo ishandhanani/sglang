@@ -694,6 +694,34 @@ def test_out_of_order_offload_completions_keep_fifo_results(harness):
     assert h.wait_offloads(2) == [True, True]
 
 
+def test_offload_submission_yields_between_chunks_and_still_completes(harness):
+    h = harness(extra={"fetch_chunk_pages": 1})
+    hashes = _hashes("y", 4)
+    h.fill(0, 4, seed=31)
+    expected = h.snapshot(0, 4)
+    # Pretend a command is always waiting: every deposit after the first is
+    # deferred to a later owner-loop iteration, and the task must still finish
+    # exactly once with every page resident.
+    with patch.object(h.linker._adapter, "has_pending_commands", return_value=True):
+        h.offload(hashes, first_page=0)
+        assert h.wait_offloads(1) == [True]
+    assert h.linker.num_completed_offloads() == 0
+    handle = h.prepare("ry", hashes)
+    h.wait_ready(handle)
+    assert h.linker.lookup("ry", h.lookup_transfers(hashes)) == [1, 2, 3, 4]
+    index = h.load("ry", hashes, first_page=8)
+    h.linker.layer_done_counter.set_consumer(index)
+    assert h.wait_loads(1) == [["ry"]]
+    h.linker.layer_done_counter.wait_until(LAYERS - 1)
+    restored = h.snapshot(8, 4)
+    for name in expected:
+        for got, want in zip(restored[name], expected[name]):
+            assert torch.equal(got, want), name
+    stats = h.linker.snapshot_stats()
+    assert stats["offload_tasks"] == 1
+    assert stats["offload_inflight_bytes"] == 0
+
+
 def test_release_and_finish_drain_claims(harness):
     h = harness()
     hashes = _hashes("g", 3)

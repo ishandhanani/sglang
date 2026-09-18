@@ -89,6 +89,10 @@ class KVCRAdapter:
         self.raise_if_failed()
         self._commands.put(command)
 
+    def has_pending_commands(self) -> bool:
+        """Whether a posted command is waiting; long owner-thread work yields to it."""
+        return not self._commands.empty()
+
     # ---- owner-thread helpers (only call from commands/tickers) ----
 
     @property
