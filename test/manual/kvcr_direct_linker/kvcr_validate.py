@@ -383,10 +383,13 @@ def scenario_peer(args, workdir: Path) -> dict:
         extra_args=args.extra,
         dp_rank=args.dp_rank,
     )
+    # With DP attention the server derives a block of TCP ports from its port
+    # (port + 233 onwards), so two servers on adjacent ports collide; keep the
+    # target well clear of the source.
     target = Server(
         name="peer_target",
         model=args.model,
-        port=args.port + 1,
+        port=args.port + 100,
         gpus=target_gpus,
         tp=args.tp,
         workdir=workdir,
