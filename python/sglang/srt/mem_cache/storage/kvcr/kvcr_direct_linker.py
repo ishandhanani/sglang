@@ -24,6 +24,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future
+from operator import attrgetter
 from typing import Any, Optional
 
 import msgspec
@@ -70,6 +71,9 @@ from sglang.srt.utils.common import is_hip
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+_span_addr = attrgetter("addr")
+_span_size = attrgetter("size")
 
 _SUPPORTED_NIXL_BACKENDS = frozenset({"UCX"})
 # How long reset/close wait for outstanding KVCR operations before treating
@@ -359,19 +363,26 @@ def _default_copy_engine_factory(regions):
 
 
 class _RestorePlan(msgspec.Struct, frozen=True):
-    """Per-pool span geometry for direct restores, in layout span order.
+    """Per-pool span geometry for direct restores.
 
-    ``layer_columns`` maps a logical layer to the span indices that land it.
-    A span shared by several logical layers (packed draft mappings) sits under
-    the smallest one, so no layer completes before every span it reads landed;
-    spans no layer maps to are landed with the last layer.
+    ``sizes`` is in layout span order. ``order`` lists the layout's span
+    indices layer-major (the spans landing logical layer 0 first, then layer
+    1, and so on) and ``ordered_*`` are the geometry permuted the same way, so
+    a page batch laid out span-major over pages has every layer as one
+    contiguous slice; ``layer_slices`` gives each layer's [start, end) span
+    range in that order. A span shared by several logical layers (packed draft
+    mappings) sits under the smallest one, so no layer completes before every
+    span it reads landed; spans no layer maps to are landed with the last
+    layer.
     """
 
     device_id: int
-    bases: np.ndarray
-    strides: np.ndarray
     sizes: np.ndarray
-    layer_columns: dict[int, np.ndarray]
+    order: np.ndarray
+    ordered_bases: np.ndarray
+    ordered_strides: np.ndarray
+    ordered_sizes: np.ndarray
+    layer_slices: tuple[tuple[int, int, int], ...]
 
 
 def _build_restore_plans(
@@ -395,17 +406,27 @@ def _build_restore_plans(
                 f"KVCR linker pool {entry.name} layout has {len(layout.spans)} spans "
                 f"but its buffers describe {len(span_layers)}."
             )
-        columns: dict[int, np.ndarray] = {}
+        order_parts: list[np.ndarray] = []
+        layer_slices: list[tuple[int, int, int]] = []
         for layer in sorted(set(span_layers)):
-            columns[layer] = np.fromiter(
+            columns = np.fromiter(
                 (i for i, l in enumerate(span_layers) if l == layer), dtype=np.intp
             )
+            start = sum(len(part) for part in order_parts)
+            layer_slices.append((layer, start, start + len(columns)))
+            order_parts.append(columns)
+        order = np.concatenate(order_parts)
+        bases = np.fromiter((b for b, _, _ in layout.spans), dtype=np.uint64)
+        strides = np.fromiter((s for _, s, _ in layout.spans), dtype=np.uint64)
+        sizes = np.fromiter((z for _, _, z in layout.spans), dtype=np.uint64)
         plans[str(entry.name)] = _RestorePlan(
             device_id=layout.device_id,
-            bases=np.fromiter((b for b, _, _ in layout.spans), dtype=np.uint64),
-            strides=np.fromiter((s for _, s, _ in layout.spans), dtype=np.uint64),
-            sizes=np.fromiter((z for _, _, z in layout.spans), dtype=np.uint64),
-            layer_columns=columns,
+            sizes=sizes,
+            order=order,
+            ordered_bases=bases[order],
+            ordered_strides=strides[order],
+            ordered_sizes=sizes[order],
+            layer_slices=tuple(layer_slices),
         )
     return plans
 
@@ -792,6 +813,21 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def _key(self, page_hash: str, pool: str):
         return encode_object_key(page_hash, self.digest, pool)
 
+    def _claimed_spans(self, pool: str, descriptors) -> Optional[np.ndarray]:
+        """Slot addresses of a claimed page in layout span order.
+
+        None when the claim does not match the pool layout; such a page falls
+        back to KVCR deliver rather than being copied from the wrong spans.
+        """
+        plan = self._restore_plans[pool]
+        count = len(plan.sizes)
+        if len(descriptors) != count:
+            return None
+        sizes = np.fromiter(map(_span_size, descriptors), dtype=np.uint64, count=count)
+        if not np.array_equal(sizes, plan.sizes):
+            return None
+        return np.fromiter(map(_span_addr, descriptors), dtype=np.uint64, count=count)
+
     def _descriptors(self, pool: str, row: int) -> list:
         from kvcr.types import MemDescriptor
 
@@ -1001,7 +1037,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                         continue
                     prep.claims[(pool, page)] = entry.release_handle
                     if entry.descriptors:
-                        prep.spans[(pool, page)] = entry.descriptors
+                        spans = self._claimed_spans(pool, entry.descriptors)
+                        if spans is not None:
+                            prep.spans[(pool, page)] = spans
                     prep.pools[pool].present[page] = True
                     if pool == str(PoolName.KV):
                         self._resident_pages.add(prep.page_hashes[page])
@@ -1390,30 +1428,20 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     raise RuntimeError(
                         f"KVCR load pool={pool.pool} rows={len(rows)} pages={pages}"
                     )
-                span_count = len(plan.sizes)
-                dst = plan.bases[None, :] + rows[:, None] * plan.strides[None, :]
-                src = np.fromiter(
-                    (span.addr for spans in pool.spans for span in spans),
-                    dtype=np.uint64,
-                    count=pages * span_count,
-                ).reshape(pages, span_count)
-                sizes = np.fromiter(
-                    (span.size for spans in pool.spans for span in spans),
-                    dtype=np.uint64,
-                    count=pages * span_count,
-                ).reshape(pages, span_count)
-                if not np.array_equal(sizes, np.broadcast_to(plan.sizes, sizes.shape)):
-                    raise RuntimeError(
-                        f"KVCR load pool={pool.pool}: claimed spans do not match "
-                        "the pool layout"
-                    )
-                for layer, columns in plan.layer_columns.items():
+                # Span-major over pages in layer order, so each layer's
+                # operands are one contiguous slice and no per-layer gather
+                # runs in Python. Claimed spans were checked against the
+                # layout when the claim arrived.
+                dst = (
+                    plan.ordered_bases[None, :]
+                    + rows[:, None] * plan.ordered_strides[None, :]
+                ).T.ravel()
+                src = np.stack(pool.spans)[:, plan.order].T.ravel()
+                sizes = np.repeat(plan.ordered_sizes, pages)
+                for layer, start, end in plan.layer_slices:
+                    low, high = start * pages, end * pages
                     per_layer.setdefault(layer, []).append(
-                        (
-                            dst[:, columns].ravel(),
-                            src[:, columns].ravel(),
-                            np.tile(plan.sizes[columns], pages),
-                        )
+                        (dst[low:high], src[low:high], sizes[low:high])
                     )
             if len(device_ids) != 1:
                 raise RuntimeError(
@@ -1422,9 +1450,12 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             device_id = device_ids.pop()
             for layer in sorted(per_layer):
                 parts = per_layer[layer]
-                dst = np.concatenate([part[0] for part in parts])
-                src = np.concatenate([part[1] for part in parts])
-                sizes = np.concatenate([part[2] for part in parts])
+                if len(parts) == 1:
+                    dst, src, sizes = parts[0]
+                else:
+                    dst = np.concatenate([part[0] for part in parts])
+                    src = np.concatenate([part[1] for part in parts])
+                    sizes = np.concatenate([part[2] for part in parts])
                 request = engine.request(device_id, dst, sizes, src, sizes)
                 if isinstance(request, str):
                     raise RuntimeError(f"KVCR load layer={layer}: {request}")
