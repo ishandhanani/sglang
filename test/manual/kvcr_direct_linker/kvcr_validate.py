@@ -267,6 +267,10 @@ def scenario_roundtrip(args, workdir: Path) -> dict:
         )
         try:
             server.wait_ready()
+            # A server's very first request can differ numerically (kernel
+            # JIT and warmup paths); keep it out of the compared runs.
+            server.generate(_prompt(random.Random(args.seed + 1), 256, args.vocab), 1)
+            time.sleep(args.settle_s)
             first = server.generate(prompt, args.max_new_tokens)
             time.sleep(args.settle_s)
             for filler in fillers:
@@ -292,6 +296,11 @@ def scenario_roundtrip(args, workdir: Path) -> dict:
         == control["replay"]["text"]
         == linker["first"]["text"]
         == linker["replay"]["text"],
+        # The comparison that judges the restore: restored bytes must produce
+        # what a recompute of the same prompt produces, on both servers.
+        "linker_replay_matches_recompute": linker["replay"]["text"]
+        == linker["first"]["text"]
+        == control["replay"]["text"],
         "no_hicache_host_pool": not any(
             "host" in line.lower() and "alloc" in line.lower()
             for line in linker["host_pool_lines"]

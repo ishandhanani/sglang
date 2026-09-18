@@ -527,13 +527,14 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._offload_results: collections.deque[bool] = collections.deque()
         self._deferred: list[tuple[Any, Callable[[], None]]] = []
         self._removed_pages: list[str] = []
-        # KV page hashes this rank knows to be in its KVCR DRAM: added when a
-        # deposit or fetch confirms them, dropped on KVCR removal events. A
-        # request whose first tail page is absent cannot restore anything under
-        # the all-pages policy, so it is marked a miss on the scheduler thread
-        # without a round trip through the owner thread. Staleness only ever
-        # costs a hit, never correctness: presence is still confirmed by fetch.
-        self._resident_pages: set[str] = set()
+        # Per physical pool, the page hashes this rank knows to be in its KVCR
+        # DRAM: added when a deposit or fetch confirms them, dropped on KVCR
+        # removal events. A request whose first tail page is absent from an
+        # all-pages pool cannot restore anything, so it is marked a miss on the
+        # scheduler thread without a round trip through the owner thread.
+        # Staleness only ever costs a hit, never correctness: presence is still
+        # confirmed by fetch.
+        self._resident_pages: dict[str, set[str]] = collections.defaultdict(set)
         # Direct restores whose copies are still landing (owner thread only).
         self._direct_batches: list[_LoadBatch] = []
         self._inflight_prepare_bytes = 0
@@ -907,16 +908,18 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             if declined is not None:
                 self._mark_miss_locked(prep, declined)
                 return
-            kv_plan = pools.get(str(PoolName.KV))
+            anchor = next(
+                (plan for plan in pools.values() if plan.policy == "all_pages"), None
+            )
             if (
                 hint is None
-                and kv_plan is not None
-                and kv_plan.policy == "all_pages"
-                and page_hashes[0] not in self._resident_pages
+                and anchor is not None
+                and page_hashes[0] not in self._resident_pages[anchor.pool]
             ):
                 # Nothing local can satisfy the prefix and no peer was named:
                 # a certain miss, decided here so the request is admitted in
-                # this scheduling pass.
+                # this scheduling pass. Any all-pages pool works as the anchor
+                # because every one of them must hold page 0 for a restore.
                 self._mark_miss_locked(prep, "no_local_candidates")
                 return
         self._adapter.post(lambda adapter: self._start_preparation(prep))
@@ -1041,8 +1044,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                         if spans is not None:
                             prep.spans[(pool, page)] = spans
                     prep.pools[pool].present[page] = True
-                    if pool == str(PoolName.KV):
-                        self._resident_pages.add(prep.page_hashes[page])
+                    self._resident_pages[pool].add(prep.page_hashes[page])
                     confirmed += 1
                 if late:
                     self._abandoned_bytes = max(
@@ -1317,8 +1319,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._release_handles(leftover)
             self._discard_hint(prep)
             self._pending_loads[rid] = pools
-            self.stats["admitted_pages"] += sum(
-                len(pool.page_hashes) for pool in pools if pool.pool == str(PoolName.KV)
+            # The widest pool is the all-pages prefix; trailing-window pools
+            # cover a subset of it.
+            self.stats["admitted_pages"] += max(
+                (len(pool.page_hashes) for pool in pools), default=0
             )
         return True
 
@@ -1506,10 +1510,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         if batch.success and error is None:
             self.layer_done_counter.complete_all(batch.counter_index)
             with self._lock:
-                self.stats["restored_pages"] += sum(
-                    len(pool.page_hashes)
-                    for pool in batch.pools
-                    if pool.pool == str(PoolName.KV)
+                self.stats["restored_pages"] += max(
+                    (len(pool.page_hashes) for pool in batch.pools), default=0
                 )
                 self.stats["gpu_restore_bytes"] += batch.bytes
                 self.stats["gpu_restore_s_sum"] += elapsed
@@ -1603,11 +1605,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     for page, row in zip(chunk_pages, chunk_rows)
                 }
                 op = kvcr.deposit(blocks)
-                if pool == str(PoolName.KV):
-                    # Filling pages are fetchable: a fetch waits for the fill,
-                    # so they count as candidates from submission on.
-                    with self._lock:
-                        self._resident_pages.update(chunk_pages)
+                # Filling pages are fetchable: a fetch waits for the fill, so
+                # they count as candidates from submission on.
+                with self._lock:
+                    self._resident_pages[pool].update(chunk_pages)
                 task.outstanding += 1
                 task.next_chunk += 1
                 self._adapter.track(
@@ -1639,9 +1640,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         def completion(entries: Mapping[Any, Any]) -> None:
             results = [(e := entries.get(k)) is not None and e.success for k in keys]
             task.success = task.success and all(results)
-            if pool == str(PoolName.KV) and not all(results):
+            if not all(results):
                 with self._lock:
-                    self._resident_pages.difference_update(
+                    self._resident_pages[pool].difference_update(
                         page for page, landed in zip(pages, results) if not landed
                     )
             task.outstanding -= 1
@@ -1681,7 +1682,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         pages = unique_page_hashes_from_keys(event.keys)
         with self._lock:
             self._removed_pages.extend(pages)
-            self._resident_pages.difference_update(pages)
+            # Keys name their pool, but a page evicted from one pool can no
+            # longer be restored anyway, so drop it everywhere.
+            for resident in self._resident_pages.values():
+                resident.difference_update(pages)
             self.stats["inventory_removed_pages"] += len(pages)
 
     def take_removed_page_hashes(self) -> list[int]:
