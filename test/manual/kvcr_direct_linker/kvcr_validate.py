@@ -134,6 +134,7 @@ class Server:
         max_new_tokens: int,
         kv_hints=None,
         extra_fields: dict | None = None,
+        stream: bool = False,
     ) -> dict:
         payload = {
             "input_ids": token_ids,
@@ -146,7 +147,47 @@ class Server:
             payload["routed_dp_rank"] = self.dp_rank
         if extra_fields:
             payload.update(extra_fields)
-        return _post(f"{self.base}/generate", payload)
+        if not stream:
+            return _post(f"{self.base}/generate", payload)
+        # Streaming separates time to first token (prepare + restore + prefill)
+        # from the decode tail; the final chunk carries the full text and meta.
+        payload["stream"] = True
+        request = urllib.request.Request(
+            f"{self.base}/generate",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        started = time.monotonic()
+        first = None
+        last = None
+        with urllib.request.urlopen(request, timeout=900.0) as response:
+            for raw in response:
+                line = raw.decode().strip()
+                if not line.startswith("data:"):
+                    continue
+                body = line[len("data:") :].strip()
+                if body == "[DONE]":
+                    break
+                if first is None:
+                    first = time.monotonic()
+                last = json.loads(body)
+        if last is None:
+            raise RuntimeError("streamed generate returned no chunks")
+        last["ttft_s"] = (first or time.monotonic()) - started
+        return last
+
+    def scheduler_pid(self) -> int | None:
+        """PID of this server's scheduler subprocess, if it is running."""
+        try:
+            out = subprocess.run(
+                ["pgrep", "-f", "sglang::scheduler", "-P", str(self.process.pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.split()
+        except OSError:
+            return None
+        return int(out[0]) if out else None
 
     def flush(self) -> None:
         # /flush_cache answers with plain text, not JSON, and refuses (400)
@@ -270,12 +311,15 @@ def _effective_page_size(server: Server, requested: int) -> int:
 
 def _summary(result: dict) -> dict:
     meta = result["meta_info"]
-    return {
+    summary = {
         "text": result["text"],
         "cached_tokens": meta.get("cached_tokens"),
         "prompt_tokens": meta.get("prompt_tokens"),
         "e2e_latency_s": meta.get("e2e_latency"),
     }
+    if "ttft_s" in result:
+        summary["ttft_s"] = result["ttft_s"]
+    return summary
 
 
 def _linker_config(args, *, control_port: int | None) -> dict:
@@ -465,6 +509,36 @@ def scenario_peer(args, workdir: Path) -> dict:
             time.sleep(args.settle_s)
             target.flush()
             time.sleep(0.5)
+            profiler = None
+            if args.pyspy_steady:
+                # Sample every thread of the target scheduler while the steady
+                # block runs; the raw collapsed stacks attribute per thread.
+                pid = target.scheduler_pid()
+                profile_path = workdir / "target_steady.pyspy"
+                duration = max(10, int(args.peer_prompts * 2 * 1.5) + 5)
+                if pid is not None:
+                    profiler = subprocess.Popen(
+                        [
+                            str(Path(sys.executable).parent / "py-spy"),
+                            "record",
+                            "--pid",
+                            str(pid),
+                            "--threads",
+                            "--idle",
+                            "--rate",
+                            "200",
+                            "--duration",
+                            str(duration),
+                            "--format",
+                            "raw",
+                            "-o",
+                            str(profile_path),
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    report["target_steady_profile"] = str(profile_path)
+                    time.sleep(1.0)
             steady = []
             for tokens, source_text in zip(served, source_texts):
                 started = time.monotonic()
@@ -472,6 +546,7 @@ def scenario_peer(args, workdir: Path) -> dict:
                     tokens,
                     args.max_new_tokens,
                     kv_hints=_hint(source_endpoint, tokens, page),
+                    stream=True,
                 )
                 entry = _summary(result)
                 entry["wall_s"] = time.monotonic() - started
@@ -480,11 +555,15 @@ def scenario_peer(args, workdir: Path) -> dict:
             recompute = []
             for tokens in fresh:
                 started = time.monotonic()
-                entry = _summary(target.generate(tokens, args.max_new_tokens))
+                entry = _summary(
+                    target.generate(tokens, args.max_new_tokens, stream=True)
+                )
                 entry["wall_s"] = time.monotonic() - started
                 recompute.append(entry)
             runs["steady_hinted"] = steady
             runs["steady_recompute"] = recompute
+            if profiler is not None:
+                profiler.wait(timeout=120)
         time.sleep(args.settle_s)
         report["runs"] = runs
         report["source_stats"] = source.stats()
@@ -500,8 +579,12 @@ def scenario_peer(args, workdir: Path) -> dict:
         "steady_all_restored": all((e["cached_tokens"] or 0) > 0 for e in steady),
         "steady_all_match_source": all(e["matches_source"] for e in steady),
         "steady_hinted_e2e_s": [e["e2e_latency_s"] for e in steady],
+        "steady_hinted_ttft_s": [e.get("ttft_s") for e in steady],
         "steady_recompute_e2e_s": [
             e["e2e_latency_s"] for e in runs.get("steady_recompute", [])
+        ],
+        "steady_recompute_ttft_s": [
+            e.get("ttft_s") for e in runs.get("steady_recompute", [])
         ],
         "hinted_restored": (runs["hinted"]["cached_tokens"] or 0) > 0,
         "no_hint_recomputed": runs["no_hint"]["cached_tokens"] in (0, None),
@@ -678,6 +761,11 @@ def main() -> int:
         type=int,
         default=0,
         help="peer scenario: distinct prompts hinted back-to-back without flushes",
+    )
+    parser.add_argument(
+        "--pyspy-steady",
+        action="store_true",
+        help="peer scenario: py-spy the target scheduler during the steady block",
     )
     # Unknown flags are forwarded to sglang.launch_server verbatim.
     args, args.extra = parser.parse_known_args()
