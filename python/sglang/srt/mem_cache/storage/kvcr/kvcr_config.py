@@ -78,6 +78,10 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     # Owner-thread idle poll interval; shorter finishes small transfers sooner.
     poll_interval_ms: float = 0.5
     stats_log_interval_s: float = 30.0
+    # Interpreter switch interval to apply in the scheduler process. The owner
+    # thread and the scheduler share one GIL; a shorter interval caps how long
+    # either waits for the other. None leaves the interpreter default (5 ms).
+    gil_switch_interval_ms: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.local_dram_bytes_per_worker <= 0:
@@ -108,6 +112,8 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
                 raise ValueError(f"KVCR {name} must be positive.")
         if self.poll_interval_ms <= 0:
             raise ValueError("KVCR poll_interval_ms must be positive.")
+        if self.gil_switch_interval_ms is not None and self.gil_switch_interval_ms <= 0:
+            raise ValueError("KVCR gil_switch_interval_ms must be positive.")
         self._validate_remote_hint_endpoint()
 
     def _validate_remote_hint_endpoint(self) -> None:

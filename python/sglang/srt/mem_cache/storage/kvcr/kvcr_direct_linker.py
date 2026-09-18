@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import sys
 import threading
 import time
 import uuid
@@ -431,6 +432,15 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             get_memory().hicache_storage_backend_extra_config
         )
         self.config = KVCRLinkerConfig.from_extra_config(extra_config)
+        if self.config.gil_switch_interval_ms is not None:
+            # Process-wide: the owner thread and the scheduler share this
+            # interpreter, and the default 5 ms slice is long against a
+            # single request's launch path.
+            sys.setswitchinterval(self.config.gil_switch_interval_ms / 1000.0)
+            logger.info(
+                "KVCR linker set the interpreter switch interval to %.3f ms",
+                self.config.gil_switch_interval_ms,
+            )
         self.page_size = params.page_size
         self._params = params
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
