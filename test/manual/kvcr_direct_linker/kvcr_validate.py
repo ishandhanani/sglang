@@ -210,6 +210,26 @@ def _hint(source_control: str, token_ids: list[int], page_size: int) -> dict:
     }
 
 
+def _effective_page_size(server: Server, requested: int) -> int:
+    """The page size the server runs with; some models force their own.
+
+    A hint hashed over the wrong page size never matches the source's keys and
+    shows up as `miss_no_candidates`, so hints must follow the server.
+    """
+    for line in server.log_matches(r"'page_size': \d+"):
+        match = re.search(r"'page_size': (\d+)", line)
+        if match:
+            actual = int(match.group(1))
+            if actual != requested:
+                print(
+                    f"{server.name}: server runs page_size={actual}, "
+                    f"not the requested {requested}; hints use {actual}",
+                    flush=True,
+                )
+            return actual
+    return requested
+
+
 def _summary(result: dict) -> dict:
     meta = result["meta_info"]
     return {
@@ -359,6 +379,7 @@ def scenario_peer(args, workdir: Path) -> dict:
         control = source.generate(prompt, args.max_new_tokens)
         time.sleep(args.settle_s)
         source_endpoint = f"tcp://127.0.0.1:{source_control}"
+        page = _effective_page_size(source, args.page_size)
         runs = {"control_source": _summary(control)}
 
         def cold_target_run(label: str, kv_hints, expect_hit: bool) -> None:
@@ -370,19 +391,15 @@ def scenario_peer(args, workdir: Path) -> dict:
             runs[label]["wall_s"] = time.monotonic() - started
             runs[label]["expect_hit"] = expect_hit
 
-        cold_target_run("hinted", _hint(source_endpoint, prompt, args.page_size), True)
+        cold_target_run("hinted", _hint(source_endpoint, prompt, page), True)
         # Warm target: a second hinted replay must be served from the local
         # tier, not presented as peer reuse.
-        cold_target_run(
-            "hinted_again", _hint(source_endpoint, prompt, args.page_size), True
-        )
+        cold_target_run("hinted_again", _hint(source_endpoint, prompt, page), True)
         cold_target_run("no_hint", None, False)
-        cold_target_run(
-            "stale_hint", _hint(source_endpoint, stale, args.page_size), False
-        )
+        cold_target_run("stale_hint", _hint(source_endpoint, stale, page), False)
         cold_target_run(
             "dead_peer",
-            _hint(f"tcp://127.0.0.1:{args.control_port + 500}", prompt, args.page_size),
+            _hint(f"tcp://127.0.0.1:{args.control_port + 500}", prompt, page),
             False,
         )
         time.sleep(args.settle_s)
