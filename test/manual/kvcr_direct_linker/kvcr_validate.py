@@ -186,8 +186,37 @@ class Server:
         self.log.close()
 
 
+# Natural-text token stream for prompts (set by --natural-prompt). Random-token
+# prompts leave FP8 MoE models with near-uniform logits, so greedy outputs can
+# differ between two recomputes of the same input and equality checks become
+# meaningless; a repeated passage gives every run a large argmax margin.
+_NATURAL: list[int] | None = None
+_PASSAGE = (
+    "The first electronic computers filled entire rooms and were programmed by "
+    "rewiring their circuits. Stored-program machines replaced the wiring with "
+    "instructions kept in memory, and high-level languages let people describe "
+    "a computation without naming a single register. Operating systems then "
+    "shared one machine among many users, networks connected those machines, "
+    "and the same ideas now run on chips small enough to lose in a pocket. "
+)
+
+
+def _load_natural_tokens(model: str, needed: int) -> list[int]:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    ids = tokenizer.encode(_PASSAGE, add_special_tokens=False)
+    return (ids * (needed // len(ids) + 2))[:needed]
+
+
 def _prompt(rng: random.Random, length: int, vocab: int) -> list[int]:
-    return [rng.randrange(1000, vocab) for _ in range(length)]
+    if _NATURAL is None:
+        return [rng.randrange(1000, vocab) for _ in range(length)]
+    # A random head keeps prompts from sharing prefixes (fillers must evict the
+    # prompt, not extend it); the tail is natural text from a random offset.
+    head = [rng.randrange(1000, vocab) for _ in range(8)]
+    start = rng.randrange(0, max(1, len(_NATURAL) - length))
+    return head + _NATURAL[start : start + length - len(head)]
 
 
 def _hint(source_control: str, token_ids: list[int], page_size: int) -> dict:
@@ -578,10 +607,20 @@ def main() -> int:
     )
     parser.add_argument("--workdir", required=True)
     parser.add_argument("--report", required=True)
+    parser.add_argument(
+        "--natural-prompt",
+        action="store_true",
+        help="build prompts from a repeated passage instead of random tokens",
+    )
     # Unknown flags are forwarded to sglang.launch_server verbatim.
     args, args.extra = parser.parse_known_args()
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
+    if args.natural_prompt:
+        global _NATURAL
+        _NATURAL = _load_natural_tokens(
+            args.model, args.prompt_tokens + args.filler_tokens + 4096
+        )
     report = _SCENARIOS[args.scenario](args, workdir)
     Path(args.report).write_text(json.dumps(report, indent=2))
     print(json.dumps(report["checks"], indent=2))
