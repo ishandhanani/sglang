@@ -348,6 +348,8 @@ class _LoadBatch:
         "success",
         "bytes",
         "started_at",
+        "requested_at",
+        "submit_at",
         "handles",
         "next_handle",
     )
@@ -363,6 +365,11 @@ class _LoadBatch:
         self.success = True
         self.bytes = 0
         self.started_at = time.monotonic()
+        # Earliest load() call folded into this batch, and when the owner
+        # thread began building copies; the gap is the ready-event wait plus
+        # owner-thread queueing.
+        self.requested_at = self.started_at
+        self.submit_at = 0.0
         # Direct restore: (logical layers, copy handle) in submission order.
         self.handles: list[tuple[list[int], Any]] = []
         self.next_handle = 0
@@ -589,6 +596,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._preparations: dict[CacheRequestHandle, _Preparation] = {}
         self._by_rid: dict[str, _Preparation] = {}
         self._pending_loads: dict[str, list[_LoadPool]] = {}
+        # rid -> when load() accepted it; peer-hinted rids log their restore.
+        self._load_requested_at: dict[str, float] = {}
+        self._hinted_rids: set[str] = set()
         self._completed_loads: collections.deque[list[str]] = collections.deque()
         self._offload_tasks: collections.deque[_OffloadTask] = collections.deque()
         self._offload_results: collections.deque[bool] = collections.deque()
@@ -974,6 +984,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self.stats["queried_pages"] += len(page_hashes)
             if hint is not None:
                 self.stats["hinted_requests"] += 1
+                self._hinted_rids.add(handle.rid)
             declined = self._decline_reason_locked()
             if declined is not None:
                 self._mark_miss_locked(prep, declined)
@@ -1345,6 +1356,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
 
     def release_request(self, rid: str) -> None:
         with self._lock:
+            self._hinted_rids.discard(rid)
+            self._load_requested_at.pop(rid, None)
             prep = self._by_rid.pop(rid, None)
             if prep is None:
                 return
@@ -1405,6 +1418,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._release_handles(leftover)
             self._discard_hint(prep)
             self._pending_loads[rid] = pools
+            self._load_requested_at[rid] = time.monotonic()
             # The widest pool is the all-pages prefix; trailing-window pools
             # cover a subset of it.
             self.stats["admitted_pages"] += max(
@@ -1438,6 +1452,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         batch.bytes = sum(
             len(pool.page_hashes) * self.layouts[pool.pool].object_bytes
             for pool in pools
+        )
+        batch.requested_at = min(
+            (self._load_requested_at.pop(rid, batch.started_at) for rid in pending),
+            default=batch.started_at,
         )
         with self._lock:
             self.stats["load_batches"] += 1
@@ -1506,6 +1524,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         """
         engine = self._copy_engine
         started = time.perf_counter()
+        batch.submit_at = time.monotonic()
         try:
             per_layer: dict[int, list[tuple[np.ndarray, ...]]] = {}
             device_ids: set[int] = set()
@@ -1591,16 +1610,32 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def _finish_load(
         self, batch: _LoadBatch, error: Optional[BaseException] = None
     ) -> None:
-        elapsed = time.monotonic() - batch.started_at
+        now = time.monotonic()
+        elapsed = now - batch.started_at
         claims = [claim for pool in batch.pools for claim in pool.claims]
         if batch.success and error is None:
             self.layer_done_counter.complete_all(batch.counter_index)
+            submit_at = batch.submit_at or batch.started_at
             with self._lock:
                 self.stats["restored_pages"] += max(
                     (len(pool.page_hashes) for pool in batch.pools), default=0
                 )
                 self.stats["gpu_restore_bytes"] += batch.bytes
                 self.stats["gpu_restore_s_sum"] += elapsed
+                self.stats["restore_wait_s_sum"] += submit_at - batch.requested_at
+                self.stats["restore_copy_s_sum"] += now - submit_at
+                hinted = [rid for rid in batch.rids if rid in self._hinted_rids]
+                self._hinted_rids.difference_update(batch.rids)
+            if hinted:
+                logger.info(
+                    "KVCR linker restore done: rids=%s bytes=%d wait=%.3fs "
+                    "copy=%.3fs total=%.3fs",
+                    ",".join(hinted),
+                    batch.bytes,
+                    submit_at - batch.requested_at,
+                    now - submit_at,
+                    now - batch.requested_at,
+                )
         else:
             # After admission a failed transfer is not a miss: the tree already
             # exposes the destination slots. Fail the counter so the worker stops
