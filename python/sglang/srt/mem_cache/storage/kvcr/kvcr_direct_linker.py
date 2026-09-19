@@ -1588,6 +1588,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             pool_rows = self._rows_for_pools(
                 [(pool.pool, pool.indices) for pool in batch.pools]
             )
+            rows_done = time.perf_counter()
             for pool, rows_list in zip(batch.pools, pool_rows):
                 plan = self._restore_plans[pool.pool]
                 device_ids.add(plan.device_id)
@@ -1617,6 +1618,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     f"KVCR load spans several devices: {sorted(device_ids)}"
                 )
             device_id = device_ids.pop()
+            assemble_done = time.perf_counter()
             # Consecutive layers whose operands are small are merged into one
             # batch: each submission costs a launch and an event regardless of
             # size, and a merged batch still completes in layer order.
@@ -1646,9 +1648,15 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 group_layers = []
                 group_parts = []
                 group_bytes = 0
+            finished = time.perf_counter()
             with self._lock:
                 self.stats["restore_direct_batches"] += 1
-                self.stats["restore_build_s_sum"] += time.perf_counter() - started
+                self.stats["restore_build_s_sum"] += finished - started
+                # Build phases: device index snapshot, numpy operand assembly,
+                # copy submission (requests, streams, events).
+                self.stats["restore_rows_s_sum"] += rows_done - started
+                self.stats["restore_assemble_s_sum"] += assemble_done - rows_done
+                self.stats["restore_submit_s_sum"] += finished - assemble_done
             self._direct_batches.append(batch)
             self._poll_direct_batches()
         except Exception as error:  # noqa: BLE001 - propagated through the counter
