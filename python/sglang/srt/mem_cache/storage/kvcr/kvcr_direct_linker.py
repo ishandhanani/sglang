@@ -1088,18 +1088,32 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self.stats["prepare_inflight_bytes_hwm"] = max(
                 self.stats["prepare_inflight_bytes_hwm"], self._inflight_prepare_bytes
             )
+        # One KVCR operation per page chunk covers every pool's key for those
+        # pages: one control message, one peer write, and one notification
+        # per chunk instead of one per pool (DeepSeek V4 has six pools).
         chunk = self.config.fetch_chunk_pages
-        for pool, plan in prep.pools.items():
-            wanted = [i for i in range(limit) if candidates[pool][i]]
-            layout = self.layouts[pool].expected_layout
-            for start in range(0, len(wanted), chunk):
-                pages = wanted[start : start + chunk]
-                keys = [self._key(prep.page_hashes[i], pool) for i in pages]
-                op = kvcr.fetch(
-                    keys, request_id=prep.request_id, expected_layout=layout
-                )
-                prep.outstanding_ops += 1
-                self._adapter.track(op, self._fetch_completion(prep, pool, pages, keys))
+        pool_layouts = {pool: self.layouts[pool].expected_layout for pool in prep.pools}
+        for start in range(0, limit, chunk):
+            entries: list[tuple[str, int, Any]] = []
+            layouts: dict[Any, list[str]] = {}
+            for pool in prep.pools:
+                present = candidates[pool]
+                for page in range(start, min(start + chunk, limit)):
+                    if present[page]:
+                        key = self._key(prep.page_hashes[page], pool)
+                        entries.append((pool, page, key))
+                        layouts[key] = pool_layouts[pool]
+            if not entries:
+                continue
+            first_layout = entries[0][2]
+            op = kvcr.fetch(
+                [key for _, _, key in entries],
+                request_id=prep.request_id,
+                expected_layout=layouts[first_layout],
+                expected_layouts=layouts,
+            )
+            prep.outstanding_ops += 1
+            self._adapter.track(op, self._fetch_completion(prep, entries))
         prep.fetch_issued_at = time.monotonic()
         if prep.outstanding_ops == 0:
             with self._lock:
@@ -1107,13 +1121,18 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._discard_hint(prep)
 
     def _fetch_completion(
-        self, prep: _Preparation, pool: str, pages: list[int], keys: list
+        self, prep: _Preparation, fetched: list[tuple[str, int, Any]]
     ):
+        """Completion for one fetch operation over ``(pool, page, key)`` entries."""
+
         def completion(entries: Mapping[Any, Any]) -> None:
-            confirmed = 0
+            confirmed_bytes = 0
+            requested_bytes = 0
             late = prep.state != _State.FETCHING
             with self._lock:
-                for page, key in zip(pages, keys):
+                for pool, page, key in fetched:
+                    object_bytes = self.layouts[pool].object_bytes
+                    requested_bytes += object_bytes
                     entry = entries.get(key)
                     if entry is None or not entry.success:
                         continue
@@ -1129,16 +1148,14 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                             prep.spans[(pool, page)] = spans
                     prep.pools[pool].present[page] = True
                     self._resident_pages[pool].add(prep.page_hashes[page])
-                    confirmed += 1
+                    confirmed_bytes += object_bytes
                 if late:
                     self._abandoned_bytes = max(
-                        0,
-                        self._abandoned_bytes
-                        - len(pages) * self.layouts[pool].object_bytes,
+                        0, self._abandoned_bytes - requested_bytes
                     )
                     self.stats["late_completions"] += 1
                     return
-                prep.bytes_confirmed += confirmed * self.layouts[pool].object_bytes
+                prep.bytes_confirmed += confirmed_bytes
                 prep.outstanding_ops -= 1
                 if prep.outstanding_ops == 0:
                     prep.fetched_at = time.monotonic()
