@@ -277,6 +277,7 @@ class _Preparation:
         "ready_observed",
         "spans",
         "owner_started_at",
+        "query_done_at",
         "fetch_issued_at",
         "fetched_at",
     )
@@ -315,6 +316,7 @@ class _Preparation:
         # Timeline for the per-request log: owner pickup, last fetch issued,
         # last fetch completed.
         self.owner_started_at = 0.0
+        self.query_done_at = 0.0
         self.fetch_issued_at = 0.0
         self.fetched_at = 0.0
 
@@ -1106,6 +1108,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             pool: (plan.policy, plan.window) for pool, plan in prep.pools.items()
         }
         boundaries = restorable_boundaries(candidates, policies, num_pages)
+        prep.query_done_at = time.monotonic()
         limit = boundaries[-1] if boundaries else 0
         # Bound the bytes one request may pull into DRAM.
         max_pages = self.config.max_prepare_bytes_per_request // max(
@@ -1364,6 +1367,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     marks = (
                         prep.started_at,
                         prep.owner_started_at or now,
+                        prep.query_done_at or prep.owner_started_at or now,
                         prep.fetch_issued_at or now,
                         prep.fetched_at or now,
                         now,
@@ -1371,7 +1375,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     logger.info(
                         "KVCR linker preparation observed ready: rid=%s state=%s "
                         "pages=%d restorable=%d waited=%.3fs reason=%s "
-                        "queue=%.3fs issue=%.3fs fetch=%.3fs observe=%.3fs",
+                        "queue=%.3fs query=%.3fs issue=%.3fs fetch=%.3fs observe=%.3fs",
                         prep.handle.rid,
                         prep.state,
                         len(prep.page_hashes),
