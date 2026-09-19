@@ -153,6 +153,12 @@ class LayerWiseLoadCounter:
             self.futures.clear()
 
 
+# Pause between offload deposits on the owner thread; each deposit holds the
+# GIL for a few milliseconds of per-key work, and the scheduler thread
+# launching a forward needs uncontended slices in between.
+_OFFLOAD_DEPOSIT_PAUSE_S = 0.001
+
+
 class _LinkerTelemetry:
     """KVCR ``TelemetryStats`` sink folded into the linker's stats log.
 
@@ -1842,10 +1848,12 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                             (None, lambda: self._submit_offload(task))
                         )
                         break
-                    # Offloads are off the TTFT path; hand the GIL to the
-                    # scheduler between deposits instead of holding it for
-                    # the whole task while a prefill is being launched.
-                    time.sleep(0)
+                    # Offloads are off the TTFT path; give the scheduler a
+                    # guaranteed window between deposits instead of holding
+                    # the GIL for the whole task while a forward is being
+                    # launched. A zero-length yield only offers the GIL; a
+                    # millisecond lets the launch loop actually progress.
+                    time.sleep(_OFFLOAD_DEPOSIT_PAUSE_S)
             else:
                 task.submitted_all = True
             with self._lock:

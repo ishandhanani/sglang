@@ -81,7 +81,7 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     # Pages per offload deposit; each deposit covers every pool's pages for
     # its range. Smaller chunks keep each owner-thread call short so the GIL
     # returns to the scheduler between deposits while a prefill is launched.
-    offload_chunk_pages: int = 8
+    offload_chunk_pages: int = 4
     # Offloads beyond this many in-flight bytes are declined; the tree retries.
     max_inflight_offload_bytes: int = 8 << 30
     # Late (abandoned) work above this stops new preparation until it drains.
