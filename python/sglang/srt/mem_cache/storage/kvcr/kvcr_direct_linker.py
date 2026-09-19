@@ -921,23 +921,59 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._snapshot_indices(indices)
         )
 
-    def _snapshot_indices(self, indices: torch.Tensor) -> torch.Tensor:
+    def _rows_for_pools(self, pools: list[tuple[str, torch.Tensor]]) -> list[list[int]]:
+        """Rows for several pools' device indices with one copy and one sync.
+
+        A DeepSeek V4 page touches six pools; snapshotting them one at a time
+        costs six device round trips per restore or offload.
+        """
+        device = [
+            (index, indices)
+            for index, (_, indices) in enumerate(pools)
+            if indices.device.type == "cuda"
+        ]
+        rows: list[Optional[list[int]]] = [None] * len(pools)
+        if len(device) > 1:
+            flat = self._snapshot_indices(
+                [indices.detach().flatten() for _, indices in device]
+            )
+            offset = 0
+            for index, indices in device:
+                count = indices.numel()
+                rows[index] = self.pools[PoolName(pools[index][0])].prepare_locations(
+                    flat[offset : offset + count]
+                )
+                offset += count
+        for index, (pool, indices) in enumerate(pools):
+            if rows[index] is None:
+                rows[index] = self._rows(pool, indices)
+        return rows  # type: ignore[return-value]
+
+    def _snapshot_indices(
+        self, indices: torch.Tensor | list[torch.Tensor]
+    ) -> torch.Tensor:
         """CPU copy of device indices, taken on the owner thread's own stream.
 
         A copy on this thread's default stream would wait for every queued
         compute kernel. The producer event already guarantees the indices are
-        final, so a private stream only waits for its own copy.
+        final, so a private stream only waits for its own copy. Several
+        tensors are concatenated on that stream and copied with one sync.
         """
-        if indices.device.type != "cuda":
-            return _cpu_indices(indices)
+        if isinstance(indices, torch.Tensor):
+            if indices.device.type != "cuda":
+                return _cpu_indices(indices)
+            sources = [indices.detach().flatten()]
+        else:
+            sources = indices
+        device = sources[0].device
         if self._index_stream is None:
-            self._index_stream = device_module.Stream(device=indices.device)
-        source = indices.detach().flatten()
-        pinned = torch.empty(
-            source.numel(), dtype=torch.int64, device="cpu", pin_memory=True
-        )
+            self._index_stream = device_module.Stream(device=device)
+        total = sum(source.numel() for source in sources)
+        pinned = torch.empty(total, dtype=torch.int64, device="cpu", pin_memory=True)
         with device_module.stream(self._index_stream):
-            source.record_stream(self._index_stream)
+            for source in sources:
+                source.record_stream(self._index_stream)
+            source = sources[0] if len(sources) == 1 else torch.cat(sources)
             pinned.copy_(source, non_blocking=True)
         self._index_stream.synchronize()
         return pinned
@@ -1549,10 +1585,13 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         try:
             per_layer: dict[int, list[tuple[np.ndarray, ...]]] = {}
             device_ids: set[int] = set()
-            for pool in batch.pools:
+            pool_rows = self._rows_for_pools(
+                [(pool.pool, pool.indices) for pool in batch.pools]
+            )
+            for pool, rows_list in zip(batch.pools, pool_rows):
                 plan = self._restore_plans[pool.pool]
                 device_ids.add(plan.device_id)
-                rows = np.asarray(self._rows(pool.pool, pool.indices), dtype=np.uint64)
+                rows = np.asarray(rows_list, dtype=np.uint64)
                 pages = len(pool.page_hashes)
                 if len(rows) != pages:
                     raise RuntimeError(
@@ -1738,10 +1777,12 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         """
         chunk = self.config.offload_chunk_pages
         chunks: list[list[tuple[str, list[str], list[int]]]] = []
-        for transfer in task.transfers:
+        pool_rows = self._rows_for_pools(
+            [(str(t.name), t.host_indices) for t in task.transfers]
+        )
+        for transfer, rows in zip(task.transfers, pool_rows):
             pool = str(transfer.name)
             pages = list(transfer.keys or [])
-            rows = self._rows(pool, transfer.host_indices)
             if len(rows) != len(pages):
                 raise RuntimeError(
                     f"KVCR offload pool={pool} rows={len(rows)} pages={len(pages)}"
