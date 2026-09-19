@@ -397,9 +397,10 @@ class _OffloadTask:
         self.success = True
         self.done = False
         self.started_at = time.monotonic()
-        # (pool, page hashes, rows) per deposit, built once; submission may
+        # One deposit per chunk: (pool, page hashes, rows) segments covering
+        # every pool's pages for that chunk index. Built once; submission may
         # span several owner-loop iterations.
-        self.chunks: Optional[list[tuple[str, list[str], list[int]]]] = None
+        self.chunks: Optional[list[list[tuple[str, list[str], list[int]]]]] = None
         self.next_chunk = 0
         self.submitted_all = False
 
@@ -1727,9 +1728,16 @@ class KVCRDirectLinker(UnifiedCacheLinker):
 
     def _offload_chunks(
         self, task: _OffloadTask
-    ) -> list[tuple[str, list[str], list[int]]]:
-        chunk = self.config.fetch_chunk_pages
-        chunks: list[tuple[str, list[str], list[int]]] = []
+    ) -> list[list[tuple[str, list[str], list[int]]]]:
+        """Group every pool's pages into deposits of ``offload_chunk_pages``.
+
+        Chunk ``i`` carries pages ``i*n .. (i+1)*n`` of each pool that has
+        them, so one KVCR operation (one copy batch, one completion) covers a
+        page range across all physical pools, and each owner-thread call stays
+        short enough to hand the GIL back to the scheduler between chunks.
+        """
+        chunk = self.config.offload_chunk_pages
+        chunks: list[list[tuple[str, list[str], list[int]]]] = []
         for transfer in task.transfers:
             pool = str(transfer.name)
             pages = list(transfer.keys or [])
@@ -1738,8 +1746,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 raise RuntimeError(
                     f"KVCR offload pool={pool} rows={len(rows)} pages={len(pages)}"
                 )
-            for start in range(0, len(rows), chunk):
-                chunks.append(
+            for index, start in enumerate(range(0, len(rows), chunk)):
+                if index == len(chunks):
+                    chunks.append([])
+                chunks[index].append(
                     (pool, pages[start : start + chunk], rows[start : start + chunk])
                 )
         return chunks
@@ -1757,28 +1767,32 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             if task.chunks is None:
                 task.chunks = self._offload_chunks(task)
             while task.next_chunk < len(task.chunks):
-                pool, chunk_pages, chunk_rows = task.chunks[task.next_chunk]
-                blocks = {
-                    self._key(page, pool): self._descriptors(pool, row)
-                    for page, row in zip(chunk_pages, chunk_rows)
-                }
+                deposited: list[tuple[str, str, Any]] = []
+                blocks = {}
+                for pool, chunk_pages, chunk_rows in task.chunks[task.next_chunk]:
+                    for page, row in zip(chunk_pages, chunk_rows):
+                        key = self._key(page, pool)
+                        blocks[key] = self._descriptors(pool, row)
+                        deposited.append((pool, page, key))
                 op = kvcr.deposit(blocks)
                 # Filling pages are fetchable: a fetch waits for the fill, so
                 # they count as candidates from submission on.
                 with self._lock:
-                    self._resident_pages[pool].update(chunk_pages)
+                    for pool, chunk_pages, _ in task.chunks[task.next_chunk]:
+                        self._resident_pages[pool].update(chunk_pages)
                 task.outstanding += 1
                 task.next_chunk += 1
-                self._adapter.track(
-                    op,
-                    self._offload_completion(task, list(blocks), chunk_pages, pool),
-                )
-                if (
-                    task.next_chunk < len(task.chunks)
-                    and self._adapter.has_pending_commands()
-                ):
-                    self._deferred.append((None, lambda: self._submit_offload(task)))
-                    break
+                self._adapter.track(op, self._offload_completion(task, deposited))
+                if task.next_chunk < len(task.chunks):
+                    if self._adapter.has_pending_commands():
+                        self._deferred.append(
+                            (None, lambda: self._submit_offload(task))
+                        )
+                        break
+                    # Offloads are off the TTFT path; hand the GIL to the
+                    # scheduler between deposits instead of holding it for
+                    # the whole task while a prefill is being launched.
+                    time.sleep(0)
             else:
                 task.submitted_all = True
             with self._lock:
@@ -1793,16 +1807,19 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._finish_offload(task)
 
     def _offload_completion(
-        self, task: _OffloadTask, keys: list, pages: list[str], pool: str
+        self, task: _OffloadTask, deposited: list[tuple[str, str, Any]]
     ):
         def completion(entries: Mapping[Any, Any]) -> None:
-            results = [(e := entries.get(k)) is not None and e.success for k in keys]
-            task.success = task.success and all(results)
-            if not all(results):
+            failed = [
+                (pool, page)
+                for pool, page, key in deposited
+                if (e := entries.get(key)) is None or not e.success
+            ]
+            if failed:
+                task.success = False
                 with self._lock:
-                    self._resident_pages[pool].difference_update(
-                        page for page, landed in zip(pages, results) if not landed
-                    )
+                    for pool, page in failed:
+                        self._resident_pages[pool].discard(page)
             task.outstanding -= 1
             if task.outstanding == 0 and task.submitted_all:
                 self._finish_offload(task)

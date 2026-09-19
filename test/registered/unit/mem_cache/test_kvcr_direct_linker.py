@@ -167,6 +167,7 @@ def _publish_args(extra: dict) -> None:
         "abandon_timeout_ms": 1000,
         "poll_interval_ms": 0.2,
         "fetch_chunk_pages": 2,
+        "offload_chunk_pages": 2,
         # Fake pages are a few bytes; keep one copy batch per layer so the
         # layer-ordering tests see every layer land separately.
         "direct_restore_min_batch_bytes": 0,
@@ -728,7 +729,7 @@ def test_out_of_order_offload_completions_keep_fifo_results(harness):
 
 
 def test_offload_submission_yields_between_chunks_and_still_completes(harness):
-    h = harness(extra={"fetch_chunk_pages": 1})
+    h = harness(extra={"fetch_chunk_pages": 1, "offload_chunk_pages": 1})
     hashes = _hashes("y", 4)
     h.fill(0, 4, seed=31)
     expected = h.snapshot(0, 4)
@@ -1194,3 +1195,26 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+def test_multi_pool_offload_and_fetch_share_one_operation_per_chunk(harness):
+    # Two pools, four pages, chunks of two: the offload issues one deposit per
+    # chunk (the SWA tail rides with the KV pages of its chunk) and the
+    # preparation issues one fetch per chunk carrying both pools' keys.
+    h = harness(with_swa=True)
+    hashes = _hashes("mp", 4)
+    h.fill(0, 4, seed=25)
+    h.offload(hashes, first_page=0, swa_tail=2)
+    assert h.wait_offloads(1) == [True]
+    assert len(h.agent.xfers) == 2
+    kvcr_obj = h.linker._adapter.kvcr
+    with patch.object(kvcr_obj, "fetch", wraps=kvcr_obj.fetch) as spy:
+        handle = h.prepare("mp", hashes, swa_window=2)
+        h.wait_ready(handle)
+    assert spy.call_count == 2
+    layouts = [call.kwargs["expected_layouts"] for call in spy.call_args_list]
+    assert all(layouts)
+    assert len(layouts[1]) == 4, "second chunk carries kv and swa keys"
+    # Only the boundary whose trailing SWA window is present is restorable.
+    assert h.linker.lookup("mp", h.lookup_transfers(hashes, swa_window=2)) == [4]
+    h.close()

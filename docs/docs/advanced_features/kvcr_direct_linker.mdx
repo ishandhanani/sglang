@@ -74,7 +74,8 @@ one-second idle poll stalls DP-attention ranks, so do not combine the two.
 | `max_abandoned_bytes` | `4 GiB` | Late (abandoned) work above this pauses new preparation until it drains. |
 | `operation_timeout_ms`, `abandon_timeout_ms` | `20000`, `60000` | KVCR core deadlines. |
 | `policy` | `lru` | Local tier placement policy (`lru` or `fifo`). |
-| `fetch_chunk_pages` | `32` | Pages per KVCR operation. |
+| `fetch_chunk_pages` | `32` | Pages per KVCR fetch operation; one operation carries every pool's key for its page range. |
+| `offload_chunk_pages` | `8` | Pages per KVCR deposit; each deposit covers every pool's pages for its range, and the owner thread yields the GIL between deposits so a concurrent prefill launch is not stalled. |
 | `device_copy` | `true` | Offload GPU pages into KVCR DRAM with the CUDA runtime inside KVCR. `false` forces NIXL loopback (diagnostics only; an order of magnitude slower). |
 | `direct_restore` | `true` | Restore claimed KVCR slots into GPU pages from this process, layer by layer. `false` routes restores through KVCR `deliver` and completes every layer at the end. |
 | `poll_interval_ms`, `idle_poll_interval_ms` | `0.5`, `10` | Owner-thread wake cadence while KVCR operations are in flight, and with nothing in flight (deadline and statistics ticks only; posted work wakes it immediately). Each wake costs the scheduler a GIL hand-off, which matters most with one owner per DP-attention rank. |

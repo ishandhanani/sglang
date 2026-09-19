@@ -78,6 +78,10 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     max_inflight_prepare_bytes: int = 8 << 30
     max_prepare_bytes_per_request: int = 2 << 30
     fetch_chunk_pages: int = 32
+    # Pages per offload deposit; each deposit covers every pool's pages for
+    # its range. Smaller chunks keep each owner-thread call short so the GIL
+    # returns to the scheduler between deposits while a prefill is launched.
+    offload_chunk_pages: int = 8
     # Offloads beyond this many in-flight bytes are declined; the tree retries.
     max_inflight_offload_bytes: int = 8 << 30
     # Late (abandoned) work above this stops new preparation until it drains.
@@ -115,6 +119,8 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError("KVCR preparation_deadline_ms must be positive.")
         if self.fetch_chunk_pages <= 0:
             raise ValueError("KVCR fetch_chunk_pages must be positive.")
+        if self.offload_chunk_pages <= 0:
+            raise ValueError("KVCR offload_chunk_pages must be positive.")
         for name in (
             "max_inflight_prepare_requests",
             "max_inflight_prepare_bytes",
