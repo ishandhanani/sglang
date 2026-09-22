@@ -76,6 +76,7 @@ class Server:
         extra_args: list[str],
         dp_rank: int | None = None,
         numa_node: int | None = None,
+        linker_backend: str = "kvcr",
     ) -> None:
         self.name = name
         self.port = port
@@ -115,7 +116,7 @@ class Server:
             command += [
                 "--enable-unified-cache-external-linker",
                 "--unified-cache-external-linker-backend",
-                "kvcr",
+                linker_backend,
                 "--hicache-storage-backend-extra-config",
                 json.dumps(linker_config),
             ]
@@ -188,18 +189,41 @@ class Server:
         last["ttft_s"] = (first or time.monotonic()) - started
         return last
 
-    def scheduler_pid(self) -> int | None:
-        """PID of this server's scheduler subprocess, if it is running."""
+    def scheduler_pids(self) -> list[int]:
+        """PIDs of this server's scheduler processes, one per rank.
+
+        With DP attention the schedulers are grandchildren (a controller
+        process sits in between), so ancestry is walked through /proc.
+        """
         try:
             out = subprocess.run(
-                ["pgrep", "-f", "sglang::scheduler", "-P", str(self.process.pid)],
+                ["pgrep", "-f", "sglang::scheduler"],
                 capture_output=True,
                 text=True,
                 check=False,
             ).stdout.split()
         except OSError:
-            return None
-        return int(out[0]) if out else None
+            return []
+
+        def descends(pid: int) -> bool:
+            for _ in range(8):
+                try:
+                    with open(f"/proc/{pid}/status") as status:
+                        parent = next(
+                            int(line.split()[1])
+                            for line in status
+                            if line.startswith("PPid:")
+                        )
+                except (OSError, StopIteration, ValueError):
+                    return False
+                if parent == self.process.pid:
+                    return True
+                if parent <= 1:
+                    return False
+                pid = parent
+            return False
+
+        return sorted(int(pid) for pid in out if descends(int(pid)))
 
     def flush(self) -> None:
         # /flush_cache answers with plain text, not JSON, and refuses (400)
@@ -353,13 +377,8 @@ def _linker_config(args, *, control_port: int | None) -> dict:
     return config
 
 
-def _store_args(args) -> list[str]:
-    """HiCache flags that put a storage backend in the linker's place.
-
-    The same prompts and measurements then compare the linker against SGLang's
-    own host tier plus an external store (Mooncake): no hints are sent, the
-    cold target finds the source's pages through the store's prefetch.
-    """
+def _store_config(args) -> dict:
+    """Mooncake client configuration shared by both store modes."""
     config = {
         "master_server_address": args.store_master,
         "metadata_server": "P2PHANDSHAKE",
@@ -371,6 +390,22 @@ def _store_args(args) -> list[str]:
     }
     if args.store_config_json:
         config.update(json.loads(args.store_config_json))
+    return config
+
+
+def _store_args(args) -> list[str]:
+    """HiCache flags that put a storage backend in the linker's place.
+
+    The same prompts and measurements then compare the linker against SGLang's
+    own host tier plus an external store (Mooncake): no hints are sent, the
+    cold target finds the source's pages through the store's prefetch. The
+    ``mooncake-linker`` mode instead runs Mooncake as a direct external linker
+    (GPU pools registered with the store, no host tier), so it needs no
+    HiCache flags at all.
+    """
+    if args.store_backend == "mooncake-linker":
+        return []
+    config = _store_config(args)
     return [
         "--enable-hierarchical-cache",
         "--hicache-ratio",
@@ -476,8 +511,11 @@ def scenario_peer(args, workdir: Path) -> dict:
     # controls, and the cold target relies on the store's prefetch.
     store_mode = args.store_backend is not None
     extra_args = [*args.extra, *_store_args(args)] if store_mode else args.extra
+    linker_backend = "mooncake" if args.store_backend == "mooncake-linker" else "kvcr"
 
     def linker_for(control_port: int) -> dict | None:
+        if args.store_backend == "mooncake-linker":
+            return _store_config(args)
         if store_mode:
             return None
         return _linker_config(args, control_port=control_port)
@@ -501,6 +539,7 @@ def scenario_peer(args, workdir: Path) -> dict:
         extra_args=extra_args,
         dp_rank=args.dp_rank,
         numa_node=args.numa_node,
+        linker_backend=linker_backend,
     )
     # With DP attention the server derives a block of TCP ports from its port
     # (port + 233 onwards), so two servers on adjacent ports collide; keep the
@@ -518,6 +557,7 @@ def scenario_peer(args, workdir: Path) -> dict:
         extra_args=extra_args,
         dp_rank=args.dp_rank,
         numa_node=args.numa_node,
+        linker_backend=linker_backend,
     )
     try:
         source.wait_ready()
@@ -582,35 +622,41 @@ def scenario_peer(args, workdir: Path) -> dict:
             time.sleep(args.settle_s)
             target.flush()
             time.sleep(0.5)
-            profiler = None
+            profilers = []
             if args.pyspy_steady:
-                # Sample every thread of the target scheduler while the steady
-                # block runs; the raw collapsed stacks attribute per thread.
-                pid = target.scheduler_pid()
-                profile_path = workdir / "target_steady.pyspy"
+                # Sample every thread of every target scheduler rank while the
+                # steady block runs; the raw collapsed stacks attribute per
+                # thread, and with DP attention the idle ranks matter too.
                 duration = max(10, int(args.peer_prompts * 2 * 1.5) + 5)
-                if pid is not None:
-                    profiler = subprocess.Popen(
-                        [
-                            str(Path(sys.executable).parent / "py-spy"),
-                            "record",
-                            "--pid",
-                            str(pid),
-                            "--threads",
-                            "--idle",
-                            "--rate",
-                            "100",
-                            "--duration",
-                            str(duration),
-                            "--format",
-                            "raw",
-                            "-o",
-                            str(profile_path),
-                        ],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
+                for index, pid in enumerate(target.scheduler_pids()):
+                    profile_path = workdir / f"target_steady_rank{index}.pyspy"
+                    profilers.append(
+                        subprocess.Popen(
+                            [
+                                str(Path(sys.executable).parent / "py-spy"),
+                                "record",
+                                "--pid",
+                                str(pid),
+                                "--threads",
+                                "--idle",
+                                "--rate",
+                                str(args.pyspy_rate),
+                                *(["--nonblocking"] if args.pyspy_nonblocking else []),
+                                "--duration",
+                                str(duration),
+                                "--format",
+                                "raw",
+                                "-o",
+                                str(profile_path),
+                            ],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
                     )
-                    report["target_steady_profile"] = str(profile_path)
+                    report.setdefault("target_steady_profiles", []).append(
+                        str(profile_path)
+                    )
+                if profilers:
                     time.sleep(1.0)
             steady = []
             for tokens, source_text in zip(served, source_texts):
@@ -657,10 +703,11 @@ def scenario_peer(args, workdir: Path) -> dict:
             runs["steady_device_hit"] = device_hit
             runs["steady_short"] = short
             runs["steady_recompute"] = recompute
-            if profiler is not None:
+            for profiler in profilers:
                 # py-spy writes its output on SIGINT; sampling many threads can
                 # run well past --duration, so stop it explicitly.
                 profiler.send_signal(signal.SIGINT)
+            for profiler in profilers:
                 try:
                     profiler.wait(timeout=60)
                 except subprocess.TimeoutExpired:
@@ -672,7 +719,7 @@ def scenario_peer(args, workdir: Path) -> dict:
         if store_mode:
             # The store backend has no stats line; keep its setup, prefetch
             # and backup log lines for attribution instead.
-            pattern = r"[Pp]refetch|[Bb]ackup|Mooncake|storage"
+            pattern = r"[Pp]refetch|[Bb]ackup|Mooncake|storage|linker"
             report["source_store_lines"] = source.log_matches(pattern)[-200:]
             report["target_store_lines"] = target.log_matches(pattern)[-400:]
         report["commands"] = {"source": source.command, "target": target.command}
@@ -888,6 +935,17 @@ def main() -> int:
         help="peer scenario: py-spy the target scheduler during the steady block",
     )
     parser.add_argument(
+        "--pyspy-rate",
+        type=int,
+        default=100,
+        help="peer scenario: py-spy samples per second for --pyspy-steady",
+    )
+    parser.add_argument(
+        "--pyspy-nonblocking",
+        action="store_true",
+        help="peer scenario: sample without pausing the scheduler (less exact)",
+    )
+    parser.add_argument(
         "--numa-node",
         type=int,
         default=None,
@@ -895,10 +953,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--store-backend",
-        choices=["mooncake"],
+        choices=["mooncake", "mooncake-linker"],
         default=None,
-        help="peer scenario: run HiCache over this storage backend instead "
-        "of the linker (no hints; the store's prefetch serves the cold target)",
+        help="peer scenario: replace the KVCR linker with HiCache over this "
+        "storage backend (mooncake) or with the store's own direct linker "
+        "(mooncake-linker); no hints, the store serves the cold target",
     )
     parser.add_argument("--store-master", default="127.0.0.1:50051")
     parser.add_argument("--store-protocol", choices=["tcp", "rdma"], default="tcp")
