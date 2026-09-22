@@ -699,10 +699,22 @@ def scenario_peer(args, workdir: Path) -> dict:
                 )
                 entry["wall_s"] = time.monotonic() - started
                 recompute.append(entry)
+            # Device hits of prompts the target computed itself, to separate
+            # the cost of a device hit from the history of its pages
+            # (restored from the peer above, recomputed here).
+            device_hit_fresh = []
+            for tokens in fresh:
+                started = time.monotonic()
+                entry = _summary(
+                    target.generate(tokens, args.max_new_tokens, stream=True)
+                )
+                entry["wall_s"] = time.monotonic() - started
+                device_hit_fresh.append(entry)
             runs["steady_hinted"] = steady
             runs["steady_device_hit"] = device_hit
             runs["steady_short"] = short
             runs["steady_recompute"] = recompute
+            runs["steady_device_hit_fresh"] = device_hit_fresh
             for profiler in profilers:
                 # py-spy writes its output on SIGINT; sampling many threads can
                 # run well past --duration, so stop it explicitly.
@@ -744,6 +756,9 @@ def scenario_peer(args, workdir: Path) -> dict:
             e.get("ttft_s") for e in runs.get("steady_device_hit", [])
         ],
         "steady_short_ttft_s": [e.get("ttft_s") for e in runs.get("steady_short", [])],
+        "steady_device_hit_fresh_ttft_s": [
+            e.get("ttft_s") for e in runs.get("steady_device_hit_fresh", [])
+        ],
         "hinted_restored": (runs["hinted"]["cached_tokens"] or 0) > 0,
         "outputs_identical": len(set(texts.values())) == 1,
     }
