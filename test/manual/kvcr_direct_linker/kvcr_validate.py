@@ -13,7 +13,9 @@ Scenarios:
              (cached_tokens > 0) and reproduces the control output.
   peer       Two workers with separate KVCR tiers. The source serves A and
              offloads it; the cold target replays A with an explicit kv.fetch
-             hint, then controls: no hint, stale hint, dead peer.
+             hint, then controls: no hint, stale hint, dead peer. With
+             --store-backend the same sequence runs over HiCache plus an
+             external store (no hints), for a like-for-like comparison.
 
 Example:
   python kvcr_validate.py roundtrip --model Qwen/Qwen3-0.6B --gpus 0 \
@@ -351,6 +353,43 @@ def _linker_config(args, *, control_port: int | None) -> dict:
     return config
 
 
+def _store_args(args) -> list[str]:
+    """HiCache flags that put a storage backend in the linker's place.
+
+    The same prompts and measurements then compare the linker against SGLang's
+    own host tier plus an external store (Mooncake): no hints are sent, the
+    cold target finds the source's pages through the store's prefetch.
+    """
+    config = {
+        "master_server_address": args.store_master,
+        "metadata_server": "P2PHANDSHAKE",
+        "protocol": args.store_protocol,
+        "device_name": args.store_device,
+        # The backend divides this among the server's TP ranks.
+        "global_segment_size": args.store_segment_gib << 30,
+        "local_hostname": "localhost",
+    }
+    if args.store_config_json:
+        config.update(json.loads(args.store_config_json))
+    return [
+        "--enable-hierarchical-cache",
+        "--hicache-ratio",
+        str(args.hicache_ratio),
+        "--hicache-mem-layout",
+        "page_first_direct",
+        "--hicache-io-backend",
+        "direct",
+        "--hicache-write-policy",
+        "write_through",
+        "--hicache-storage-backend",
+        args.store_backend,
+        "--hicache-storage-prefetch-policy",
+        args.store_prefetch_policy,
+        "--hicache-storage-backend-extra-config",
+        json.dumps(config),
+    ]
+
+
 def scenario_roundtrip(args, workdir: Path) -> dict:
     """Local offload, forced GPU eviction, restore; control run without linker."""
     rng = random.Random(args.seed)
@@ -432,7 +471,23 @@ def scenario_peer(args, workdir: Path) -> dict:
     target_gpus = ",".join(gpus[per_worker : 2 * per_worker])
     source_control = args.control_port
     target_control = args.control_port + 100
-    report: dict = {"scenario": "peer", "tp": args.tp, "runs": {}}
+    # With --store-backend the servers run SGLang's hierarchical cache over an
+    # external store instead of the linker: no hints, no hint-specific
+    # controls, and the cold target relies on the store's prefetch.
+    store_mode = args.store_backend is not None
+    extra_args = [*args.extra, *_store_args(args)] if store_mode else args.extra
+
+    def linker_for(control_port: int) -> dict | None:
+        if store_mode:
+            return None
+        return _linker_config(args, control_port=control_port)
+
+    report: dict = {
+        "scenario": "peer",
+        "tp": args.tp,
+        "mode": args.store_backend or "kvcr",
+        "runs": {},
+    }
     source = Server(
         name="peer_source",
         model=args.model,
@@ -442,8 +497,8 @@ def scenario_peer(args, workdir: Path) -> dict:
         workdir=workdir,
         page_size=args.page_size,
         max_total_tokens=args.max_total_tokens,
-        linker_config=_linker_config(args, control_port=source_control),
-        extra_args=args.extra,
+        linker_config=linker_for(source_control),
+        extra_args=extra_args,
         dp_rank=args.dp_rank,
         numa_node=args.numa_node,
     )
@@ -459,8 +514,8 @@ def scenario_peer(args, workdir: Path) -> dict:
         workdir=workdir,
         page_size=args.page_size,
         max_total_tokens=args.max_total_tokens,
-        linker_config=_linker_config(args, control_port=target_control),
-        extra_args=args.extra,
+        linker_config=linker_for(target_control),
+        extra_args=extra_args,
         dp_rank=args.dp_rank,
         numa_node=args.numa_node,
     )
@@ -479,6 +534,11 @@ def scenario_peer(args, workdir: Path) -> dict:
         page = _effective_page_size(source, args.page_size)
         runs = {"control_source": _summary(control)}
 
+        def hint_for(tokens: list[int]):
+            # A store backend finds the source's pages by key; only the
+            # linker needs to be told where they are.
+            return None if store_mode else _hint(source_endpoint, tokens, page)
+
         def cold_target_run(label: str, kv_hints, expect_hit: bool) -> None:
             target.flush()
             time.sleep(0.5)
@@ -488,17 +548,18 @@ def scenario_peer(args, workdir: Path) -> dict:
             runs[label]["wall_s"] = time.monotonic() - started
             runs[label]["expect_hit"] = expect_hit
 
-        cold_target_run("hinted", _hint(source_endpoint, prompt, page), True)
+        cold_target_run("hinted", hint_for(prompt), True)
         # Warm target: a second hinted replay must be served from the local
         # tier, not presented as peer reuse.
-        cold_target_run("hinted_again", _hint(source_endpoint, prompt, page), True)
-        cold_target_run("no_hint", None, False)
-        cold_target_run("stale_hint", _hint(source_endpoint, stale, page), False)
-        cold_target_run(
-            "dead_peer",
-            _hint(f"tcp://127.0.0.1:{args.control_port + 500}", prompt, page),
-            False,
-        )
+        cold_target_run("hinted_again", hint_for(prompt), True)
+        if not store_mode:
+            cold_target_run("no_hint", None, False)
+            cold_target_run("stale_hint", _hint(source_endpoint, stale, page), False)
+            cold_target_run(
+                "dead_peer",
+                _hint(f"tcp://127.0.0.1:{args.control_port + 500}", prompt, page),
+                False,
+            )
         if args.peer_prompts > 0:
             # Steady state: distinct prompts served once on the source, then
             # hinted on the target without flushing in between, so first
@@ -557,7 +618,7 @@ def scenario_peer(args, workdir: Path) -> dict:
                 result = target.generate(
                     tokens,
                     args.max_new_tokens,
-                    kv_hints=_hint(source_endpoint, tokens, page),
+                    kv_hints=hint_for(tokens),
                     stream=True,
                 )
                 entry = _summary(result)
@@ -608,6 +669,12 @@ def scenario_peer(args, workdir: Path) -> dict:
         report["runs"] = runs
         report["source_stats"] = source.stats()
         report["target_stats"] = target.stats()
+        if store_mode:
+            # The store backend has no stats line; keep its setup, prefetch
+            # and backup log lines for attribution instead.
+            pattern = r"[Pp]refetch|[Bb]ackup|Mooncake|storage"
+            report["source_store_lines"] = source.log_matches(pattern)[-200:]
+            report["target_store_lines"] = target.log_matches(pattern)[-400:]
         report["commands"] = {"source": source.command, "target": target.command}
     finally:
         source.stop()
@@ -631,17 +698,26 @@ def scenario_peer(args, workdir: Path) -> dict:
         ],
         "steady_short_ttft_s": [e.get("ttft_s") for e in runs.get("steady_short", [])],
         "hinted_restored": (runs["hinted"]["cached_tokens"] or 0) > 0,
-        "no_hint_recomputed": runs["no_hint"]["cached_tokens"] in (0, None),
-        "stale_hint_recomputed": runs["stale_hint"]["cached_tokens"] in (0, None),
-        "dead_peer_recomputed": runs["dead_peer"]["cached_tokens"] in (0, None),
-        "dead_peer_bounded_wait_s": runs["dead_peer"]["wall_s"],
         "outputs_identical": len(set(texts.values())) == 1,
-        # The comparison that judges the transfer: bytes restored from the
-        # peer must produce what the target's own recompute produces.
-        "hinted_matches_recompute": texts["hinted"]
-        == texts["no_hint"]
-        == texts["control_source"],
     }
+    if store_mode:
+        # The store has no hint to withhold; the source's recompute is the
+        # reference for the bytes the target read back from the store.
+        report["checks"]["hinted_matches_recompute"] = (
+            texts["hinted"] == texts["control_source"]
+        )
+    else:
+        report["checks"].update(
+            no_hint_recomputed=runs["no_hint"]["cached_tokens"] in (0, None),
+            stale_hint_recomputed=runs["stale_hint"]["cached_tokens"] in (0, None),
+            dead_peer_recomputed=runs["dead_peer"]["cached_tokens"] in (0, None),
+            dead_peer_bounded_wait_s=runs["dead_peer"]["wall_s"],
+            # The comparison that judges the transfer: bytes restored from
+            # the peer must produce what the target's own recompute produces.
+            hinted_matches_recompute=texts["hinted"]
+            == texts["no_hint"]
+            == texts["control_source"],
+        )
     return report
 
 
@@ -816,6 +892,33 @@ def main() -> int:
         type=int,
         default=None,
         help="peer scenario: numactl both servers onto this NUMA node",
+    )
+    parser.add_argument(
+        "--store-backend",
+        choices=["mooncake"],
+        default=None,
+        help="peer scenario: run HiCache over this storage backend instead "
+        "of the linker (no hints; the store's prefetch serves the cold target)",
+    )
+    parser.add_argument("--store-master", default="127.0.0.1:50051")
+    parser.add_argument("--store-protocol", choices=["tcp", "rdma"], default="tcp")
+    parser.add_argument("--store-device", default="", help="RDMA device name")
+    parser.add_argument(
+        "--store-segment-gib",
+        type=int,
+        default=32,
+        help="store memory each server contributes, split across its TP ranks",
+    )
+    parser.add_argument("--hicache-ratio", type=float, default=4.0)
+    parser.add_argument(
+        "--store-prefetch-policy",
+        choices=["best_effort", "wait_complete", "timeout"],
+        default="timeout",
+    )
+    parser.add_argument(
+        "--store-config-json",
+        default=None,
+        help="JSON merged into the storage backend extra config",
     )
     # Unknown flags are forwarded to sglang.launch_server verbatim.
     args, args.extra = parser.parse_known_args()
