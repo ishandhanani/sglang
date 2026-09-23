@@ -152,6 +152,8 @@ def _cache_for_wrapper(**kwargs):
         "write_through_threshold": 256,
         "pp_size": 1,
         "pp_group": None,
+        # Behave like several attention ranks so faked reductions are exercised.
+        "_attn_groups_reduce": True,
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -999,6 +1001,29 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
     assert wrapper.pending_loads == {}
 
 
+def test_check_hicache_events_on_one_rank_skips_the_collective():
+    committed = []
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.linker = SimpleNamespace(
+        num_completed_loads=lambda: 2,
+        drain_loads=lambda count: committed.append(("load", count)),
+        num_completed_offloads=lambda: 2,
+        take_completed_offloads=lambda count: [True, False][:count],
+        commit_completed_offloads=committed.append,
+        drain_external_inventory=lambda: None,
+    )
+
+    def no_collective(value, op):
+        raise AssertionError("a single rank must not reduce")
+
+    cache._all_reduce_attn_groups = no_collective
+    cache._attn_groups_reduce = False
+
+    cache.check_hicache_events()
+
+    assert committed == [("load", 2), [True, False]]
+
+
 def test_check_hicache_events_commits_common_rank_results():
     committed = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
@@ -1008,6 +1033,7 @@ def test_check_hicache_events_commits_common_rank_results():
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,
         commit_completed_offloads=committed.append,
+        drain_external_inventory=lambda: None,
     )
 
     reduce_calls = 0
@@ -1022,6 +1048,8 @@ def test_check_hicache_events_commits_common_rank_results():
             value.fill_(0)
 
     cache._all_reduce_attn_groups = reduce_to_common_state
+    # Several attention ranks: the counts must go through the reduction.
+    cache._attn_groups_reduce = True
 
     cache.check_hicache_events()
 

@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Any
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
@@ -41,6 +42,7 @@ class DevicePoolEntry:
         self.packed = packed
         self._index_mapper = index_mapper
         self._page_offsets = torch.arange(page_size)
+        self._page_offsets_np = np.arange(page_size, dtype=np.int64)
         self._row_span = 1 if rows_are_pages else page_size
 
         if not self.components or any(not component for component in self.components):
@@ -78,26 +80,25 @@ class DevicePoolEntry:
         return self._index_mapper(indices) if self._index_mapper else indices
 
     def _rows(self, indices: torch.Tensor) -> list[int]:
-        slots = indices.detach().to(device="cpu", dtype=torch.int64).flatten()
-        if slots.numel() % self.page_size:
+        # numpy, not torch, for these few thousand integers: every small torch
+        # CPU op pays dispatch and intra-op thread-pool costs that dwarf the
+        # arithmetic on a many-core host.
+        slots = indices.detach().to(device="cpu", dtype=torch.int64).flatten().numpy()
+        if slots.size % self.page_size:
             raise ValueError(
-                f"Pool {self.name} got {slots.numel()} indices, expected a "
+                f"Pool {self.name} got {slots.size} indices, expected a "
                 f"multiple of page_size={self.page_size}."
             )
-        if not slots.numel():
+        if not slots.size:
             return []
 
         pages = slots.reshape(-1, self.page_size)
         starts = pages[:, 0]
-        if torch.any(starts.remainder(self.page_size)) or not torch.equal(
-            pages, starts[:, None] + self._page_offsets
+        if (starts % self.page_size).any() or not np.array_equal(
+            pages, starts[:, None] + self._page_offsets_np
         ):
             raise ValueError(f"Pool {self.name} requires aligned contiguous pages.")
-        rows = (
-            starts.div(self.page_size, rounding_mode="floor")
-            if self._row_span == 1
-            else starts
-        )
+        rows = starts // self.page_size if self._row_span == 1 else starts
         first_row = int(rows.min())
         last_row = int(rows.max()) + self._row_span
         if first_row < 0 or last_row > self._row_count:
@@ -423,6 +424,87 @@ def _build_dsa_device_pool_group(
         ),
     ]
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
+
+
+def _plain_kv_rows_are_pages(
+    kv_buffer: torch.Tensor, page_size: int, size: int
+) -> bool:
+    # hnd and vectorized_5d lead with pages; the flat nhd layout leads with slots.
+    return kv_buffer.shape[0] * page_size == size + page_size
+
+
+def _build_plain_kv_device_pool_group(
+    kvcache: Any,
+    page_size: int,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
+) -> DevicePoolGroup:
+    """Dense MHA or MLA pools, with packed draft layers when a draft pool exists."""
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+
+    if kvcache.page_size != page_size:
+        raise ValueError(
+            "Dense KV page size must match the tree page size: "
+            f"{kvcache.page_size} != {page_size}."
+        )
+    pools = (kvcache, *mtp_draft_device_pools)
+    if any(type(pool) is not type(kvcache) for pool in pools):
+        raise ValueError(
+            "The direct external linker needs draft pools of the target's pool "
+            f"type; got {[type(pool).__name__ for pool in pools]}."
+        )
+    if any(pool.page_size != page_size for pool in mtp_draft_device_pools):
+        raise ValueError("Dense MTP page size must match the tree page size.")
+
+    if type(kvcache) is MLATokenToKVPool:
+        components = [[buffer for pool in pools for buffer in pool.kv_buffer]]
+        rank_replicated = True
+    elif type(kvcache) is MHATokenToKVPool:
+        if kvcache.is_quantized_kv_cache:
+            raise ValueError(
+                "The direct external linker does not support quantized MHA pools "
+                "with scale buffers."
+            )
+        components = [
+            [buffer for pool in pools for buffer in pool.k_buffer],
+            [buffer for pool in pools for buffer in pool.v_buffer],
+        ]
+        rank_replicated = False
+    else:
+        raise ValueError(
+            "The direct external linker does not support the "
+            f"{type(kvcache).__name__} device pool layout."
+        )
+    layouts = {
+        _plain_kv_rows_are_pages(component[0], page_size, pool.size)
+        for pool in pools
+        for component in (
+            [pool.kv_buffer]
+            if type(kvcache) is MLATokenToKVPool
+            else [pool.k_buffer, pool.v_buffer]
+        )
+    }
+    if len(layouts) != 1:
+        raise ValueError("Dense target and draft pools must share one row layout.")
+    rows_are_pages = layouts.pop()
+    num_layers = kvcache.layer_num
+    draft_layer_num = sum(pool.layer_num for pool in mtp_draft_device_pools)
+    layer_mapping = _with_packed_draft_mapping(
+        {layer: layer for layer in range(num_layers)},
+        target_device_layer_num=num_layers,
+        draft_layer_num=draft_layer_num,
+    )
+    entry = DevicePoolEntry(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        device_pool=kvcache,
+        components=components,
+        layer_mapping=layer_mapping,
+        page_size=page_size,
+        rows_are_pages=rows_are_pages,
+    )
+    return DevicePoolGroup(
+        [entry], num_layers, page_size, rank_replicated=rank_replicated
+    )
 
 
 def resolve_hybrid_device_pool_group(

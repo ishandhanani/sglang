@@ -3176,6 +3176,17 @@ class Scheduler(
                     storage_hit_end=storage_hit_end,
                 )
 
+    def _prepare_linker_request(self, req: Req) -> None:
+        """Let a direct external linker confirm residency before admission."""
+        if self.enable_unified_cache_external_linker:
+            self.tree_cache.prepare_linker_request(req)
+
+    def _sync_linker_preparation(self) -> Optional[set[str]]:
+        """Waiting requests every attention rank may admit this pass."""
+        if not self.enable_unified_cache_external_linker:
+            return None
+        return self.tree_cache.sync_linker_preparation(self.waiting_queue)
+
     def _process_storage_prefetch_retries(self):
         """Issue due L3 attempts in the current waiting-queue order."""
         retries = self.tree_cache.storage_prefetch_retries
@@ -3275,11 +3286,13 @@ class Scheduler(
                 self._release_aborted_request(req)
                 return
             self._prefetch_kvcache(req)
+            self._prepare_linker_request(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
+            self._prepare_linker_request(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
@@ -3946,9 +3959,14 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        linker_ready = self._sync_linker_preparation()
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                continue
+            if linker_ready is not None and req.rid not in linker_ready:
+                # External residency is still being confirmed; unrelated
+                # requests continue.
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -4920,10 +4938,13 @@ class Scheduler(
                 )
             if (
                 self.enable_hicache_storage
+                or self.enable_unified_cache_external_linker
                 or self.disaggregation_mode != DisaggregationMode.NULL
             ):
-                # Storage and transfer workers need the GIL between I/O calls.
-                # Singleton PD polls no longer yield through a collective.
+                # Storage and transfer workers and the external linker's owner
+                # and progress threads need the GIL between I/O calls. Yield
+                # while there is no GPU batch so polling cannot starve their
+                # acks. Singleton PD polls no longer yield through a collective.
                 time.sleep(0)
             return
         self.metrics_reporter.record_scheduler_idle()
@@ -4982,6 +5003,11 @@ class Scheduler(
 
         # sleep until next event
         self.maybe_sleep_on_idle()
+        if self.idle_sleeper is None and self.enable_unified_cache_external_linker:
+            # Without a sleeper this loop spins through the checks above. An
+            # idle worker still serves peer reads through the linker's owner
+            # and progress threads, which need the GIL between I/O calls.
+            time.sleep(0)
         self.metrics_reporter.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:

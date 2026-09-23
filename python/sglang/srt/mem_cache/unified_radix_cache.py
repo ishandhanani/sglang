@@ -255,6 +255,12 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.tp_group is None
             else torch.distributed.get_world_size(group=self.tp_group)
         )
+        # Whether attention-group consensus needs a collective at all; on a
+        # single rank the per-step linker polls stay on plain integers.
+        self._attn_groups_reduce = self.tp_world_size > 1 or any(
+            group is not None and torch.distributed.get_world_size(group=group) > 1
+            for group in (self.attn_cp_group, self.attn_tp_group)
+        )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
@@ -370,6 +376,17 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
+
+    def prepare_linker_request(self, req: Req) -> None:
+        """Start external residency preparation for a newly queued request."""
+        if self.linker is not None:
+            self.linker.prepare_request(req)
+
+    def sync_linker_preparation(self, reqs: Sequence[Req]) -> Optional[set[str]]:
+        """Request IDs admissible this pass, or None when no gating applies."""
+        if self.linker is None or not self.linker.prepares_requests:
+            return None
+        return self.linker.sync_preparation(reqs)
 
     def reset(self) -> None:
         if self.linker is not None:
@@ -969,6 +986,9 @@ class UnifiedRadixCache(BasePrefixCache):
             and req.finished()
         ):
             self.cache_controller.release_pp_prefetch(req.rid)
+
+        if self.linker is not None:
+            self.linker.finish_request(req.rid)
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
@@ -3441,24 +3461,31 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
-            finish_counts = torch.tensor(
-                [
-                    self.linker.num_completed_loads(),
-                    self.linker.num_completed_offloads(),
-                ],
-                dtype=torch.int,
-                device="cpu",
-            )
-            self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
+            load_count = self.linker.num_completed_loads()
+            offload_count = self.linker.num_completed_offloads()
+            if self._attn_groups_reduce:
+                finish_counts = torch.tensor(
+                    [load_count, offload_count], dtype=torch.int, device="cpu"
+                )
+                self._all_reduce_attn_groups(
+                    finish_counts, torch.distributed.ReduceOp.MIN
+                )
+                load_count, offload_count = map(int, finish_counts.tolist())
             self.linker.drain_loads(load_count)
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:
-                successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
-                self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+                if self._attn_groups_reduce:
+                    successes = torch.tensor(
+                        local_successes, dtype=torch.int, device="cpu"
+                    )
+                    self._all_reduce_attn_groups(
+                        successes, torch.distributed.ReduceOp.MIN
+                    )
+                    local_successes = successes.tolist()
                 self.linker.commit_completed_offloads(
-                    [bool(success) for success in successes.tolist()]
+                    [bool(success) for success in local_successes]
                 )
+            self.linker.drain_external_inventory()
             return
 
         # Reap the previous round's PP-sync sends before issuing new ones.
