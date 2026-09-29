@@ -595,6 +595,65 @@ def _build_plain_kv_device_pool_group(
     )
 
 
+def _build_hybrid_mamba_device_pool_group(
+    kvcache: Any,
+    req_to_token_pool: Any,
+    page_size: int,
+) -> DevicePoolGroup:
+    """Dense full-attention KV plus one checkpointed linear-state slot.
+
+    Mamba/KDA checkpoints are indexed by a state slot rather than by token
+    pages.  Each transferable state tensor is laid out
+    ``[layer, slot, ...]``; expose its per-layer ``[slot, ...]`` view as one
+    packed component of the MAMBA object.  A logical MAMBA object therefore
+    contains every conv/temporal span needed to resume at one prefix boundary.
+    """
+    full_group = _build_plain_kv_device_pool_group(kvcache.full_kv_pool, page_size)
+    # ``full_kv_pool`` is dense in full-attention-layer order, while linker
+    # callbacks are addressed by the model's global layer ids.  Preserve that
+    # global-to-dense mapping for hybrid models instead of the plain pool's
+    # synthetic 0..N-1 mapping.
+    start_layer = kvcache.start_layer
+    full_mapping = {
+        layer - start_layer: index
+        for layer, index in kvcache.full_attention_layer_id_mapping.items()
+    }
+    full_group.entries[0].layer_mapping = full_mapping
+    mamba_pool = req_to_token_pool.mamba_pool
+    buffers = []
+    mamba_mapping = {}
+    # The current pool iterator also includes slot-indexed sibling state.
+    # Flatten entries instead of assuming every state tensor has all layers.
+    for _, tensor, _, layer in mamba_pool._iter_transfer_state_entries():
+        mamba_mapping.setdefault(layer - start_layer, []).append(len(buffers))
+        buffers.append(tensor)
+    if not buffers:
+        raise ValueError("The direct external linker found no Mamba state buffers.")
+
+    entries = list(full_group.entries)
+    entries.append(
+        DevicePoolEntry(
+            name=PoolName.MAMBA,
+            indices_from_pool=PoolName.MAMBA,
+            device_pool=mamba_pool,
+            components=[buffers],
+            layer_mapping=mamba_mapping,
+            page_size=1,
+            rows_are_pages=True,
+            index_mapper=req_to_token_pool.translate_mamba_indices,
+        )
+    )
+    num_layers = max(set(full_mapping) | set(mamba_mapping)) + 1
+    # The full MLA bytes are replicated, but the KDA state is TP-sharded.  The
+    # group must consequently use rank-qualified external keys.
+    return DevicePoolGroup(
+        entries,
+        num_layers,
+        page_size,
+        rank_replicated=False,
+    )
+
+
 def resolve_hybrid_device_pool_group(
     *,
     kvcache: Any,
