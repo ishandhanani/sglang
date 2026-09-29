@@ -64,7 +64,13 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LinkerRequestContext,
     UnifiedCacheLinker,
 )
-from sglang.srt.runtime_context import get_memory, get_model, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_model,
+    get_parallel,
+    get_spec,
+    mamba_track_grid,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import freeze_gc, get_device_module
 from sglang.srt.utils.common import is_hip
@@ -328,7 +334,14 @@ class _Preparation:
 
 
 class _LoadPool:
-    __slots__ = ("pool", "page_hashes", "indices", "claims", "spans")
+    __slots__ = (
+        "pool",
+        "page_hashes",
+        "indices",
+        "claims",
+        "spans",
+        "request_id",
+    )
 
     def __init__(
         self,
@@ -337,6 +350,7 @@ class _LoadPool:
         indices: torch.Tensor,
         claims: list[int],
         spans: list,
+        request_id: str,
     ):
         self.pool = pool
         self.page_hashes = page_hashes
@@ -344,6 +358,8 @@ class _LoadPool:
         self.claims = claims
         # Claimed slot descriptors per page (None when fetch reported none).
         self.spans = spans
+        # KVCR request scope retaining the peer hint for direct remote delivery.
+        self.request_id = request_id
 
 
 class _LoadBatch:
@@ -360,6 +376,7 @@ class _LoadBatch:
         "submit_at",
         "handles",
         "next_handle",
+        "layer_outstanding",
     )
 
     def __init__(
@@ -381,6 +398,7 @@ class _LoadBatch:
         # Direct restore: (logical layers, copy handle) in submission order.
         self.handles: list[tuple[list[int], Any]] = []
         self.next_handle = 0
+        self.layer_outstanding: dict[int, int] = {}
 
 
 class _OffloadTask:
@@ -569,7 +587,20 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._validate_speculative(params)
         self.digest = compatibility_digest_for(self._compatibility_identity())
 
-        self.plan: CapacityPlan = plan_capacity(self.layouts, self._rank_budget_bytes())
+        capacity_divisors = {}
+        if str(PoolName.MAMBA) in self.layouts:
+            track_grid = mamba_track_grid(self.page_size)
+            if track_grid % self.page_size:
+                raise ValueError(
+                    "Mamba checkpoint grid must be divisible by the linker page "
+                    f"size: {track_grid} vs {self.page_size}."
+                )
+            capacity_divisors[str(PoolName.MAMBA)] = track_grid // self.page_size
+        self.plan: CapacityPlan = plan_capacity(
+            self.layouts,
+            self._rank_budget_bytes(),
+            capacity_divisors=capacity_divisors,
+        )
         self._local_dram = torch.empty(
             self.plan.total_bytes,
             dtype=torch.uint8,
@@ -596,8 +627,15 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._restore_plans = _build_restore_plans(
             self.pool_group, self.layouts, self.num_layers
         )
+        # MemDescriptor geometry is immutable while these registered HBM pools
+        # live. The owner thread is the sole reader/writer of this lazy cache.
+        self._direct_remote_descriptors: dict[tuple[str, int], tuple[Any, ...]] = {}
 
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
+        if PoolName.MAMBA in self.pools:
+            params.req_to_token_pool.register_layer_transfer_counter(
+                self.layer_done_counter
+            )
         # Reentrant: owner-thread completions hold it while releasing claims,
         # and the synchronous release path takes it again to count results.
         self._lock = threading.RLock()
@@ -634,8 +672,6 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self.stats: dict[str, float] = collections.defaultdict(float)
         self._next_stats_log = time.monotonic() + self.config.stats_log_interval_s
 
-        if PoolName.MAMBA in self.pools:
-            raise ValueError("KVCR linker does not support Mamba pools.")
         self._kvcr = self._build_kvcr()
         self._adapter = self._start_adapter(self._kvcr)
         self._log_startup()
@@ -882,7 +918,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def _log_startup(self) -> None:
         logger.info(
             "KVCRDirectLinker rank=%d/%d agent=%s digest=%s pools=%s page_bytes=%d "
-            "page_capacity=%d dram_bytes=%d unused_tail_bytes=%d remote_hint=%s "
+            "page_capacity=%d pool_capacities=%s dram_bytes=%d "
+            "unused_tail_bytes=%d remote_hint=%s "
             "control=%s",
             self.world_rank,
             self.local_ranks,
@@ -891,6 +928,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             {name: list(layout.span_sizes) for name, layout in self.layouts.items()},
             self._object_bytes,
             self.plan.page_capacity,
+            self.plan.pool_capacities,
             self.plan.total_bytes,
             self.plan.unused_bytes,
             self.config.enable_remote_hint,
@@ -923,6 +961,19 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         from kvcr.types import MemDescriptor
 
         return page_descriptors(self.layouts[pool], row, self.agent_name, MemDescriptor)
+
+    def _direct_remote_page_descriptors(self, pool: str, row: int) -> tuple:
+        if not self.config.direct_remote_descriptor_cache:
+            return tuple(self._descriptors(pool, row))
+        cache_key = (pool, row)
+        descriptors = self._direct_remote_descriptors.get(cache_key)
+        if descriptors is None:
+            descriptors = tuple(self._descriptors(pool, row))
+            self._direct_remote_descriptors[cache_key] = descriptors
+            self.stats["direct_remote_descriptor_cache_misses"] += 1
+        else:
+            self.stats["direct_remote_descriptor_cache_hits"] += 1
+        return descriptors
 
     def _rows(self, pool: str, indices: torch.Tensor) -> list[int]:
         return self.pools[PoolName(pool)].prepare_locations(
@@ -1116,11 +1167,57 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         boundaries = restorable_boundaries(candidates, policies, num_pages)
         prep.query_done_at = time.monotonic()
         limit = boundaries[-1] if boundaries else 0
-        # Bound the bytes one request may pull into DRAM.
-        max_pages = self.config.max_prepare_bytes_per_request // max(
-            1, self._object_bytes
-        )
+        # Bound one request's restore footprint. A direct remote load transfers
+        # every ALL_PAGES object but only the selected tail window for a
+        # TRAILING_PAGES pool. Charging the latter on every anchor page makes a
+        # K3 Mamba checkpoint look 1,812 times larger than the one state object
+        # that is actually restored.
+        if self.config.direct_remote_restore:
+            all_pages_bytes = sum(
+                self.layouts[pool].object_bytes
+                for pool, plan in prep.pools.items()
+                if plan.policy == "all_pages"
+            )
+            trailing_bytes = sum(
+                self.layouts[pool].object_bytes * max(1, plan.window)
+                for pool, plan in prep.pools.items()
+                if plan.policy == "trailing_pages"
+            )
+            available = max(
+                0, self.config.max_prepare_bytes_per_request - trailing_bytes
+            )
+            max_pages = (
+                available // all_pages_bytes
+                if all_pages_bytes
+                else (
+                    limit
+                    if self.config.max_prepare_bytes_per_request >= trailing_bytes
+                    else 0
+                )
+            )
+        else:
+            # Staged preparation may materialize every candidate pool object.
+            max_pages = self.config.max_prepare_bytes_per_request // max(
+                1, self._object_bytes
+            )
         limit = min(limit, max_pages)
+        if self.config.direct_remote_restore:
+            # This experimental path deliberately leaves bytes at the peer
+            # until device slots exist. Query is only an advisory lookup; the
+            # later deliver remains authoritative and fails the layer counter
+            # if any advertised object disappeared before the pull.
+            with self._lock:
+                if limit <= 0:
+                    self._finish_preparation_locked(prep, reason="no_candidates")
+                    self._discard_hint(prep)
+                    return
+                for pool, plan in prep.pools.items():
+                    plan.present[:limit] = candidates[pool][:limit]
+                prep.fetch_issued_at = prep.query_done_at
+                prep.fetched_at = prep.query_done_at
+                self._finish_preparation_locked(prep, reason=None)
+                self.stats["direct_remote_prepared_pages"] += limit
+            return
         with self._lock:
             room = self.config.max_inflight_prepare_bytes - self._inflight_prepare_bytes
             limit = min(limit, max(0, room // max(1, self._object_bytes)))
@@ -1464,26 +1561,42 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 spans = []
                 for page in pages:
                     index = prep.page_index.get(page)
-                    claim = (
-                        prep.claims.pop((pool, index), None)
-                        if index is not None
-                        else None
-                    )
-                    if claim is None:
-                        raise RuntimeError(
-                            f"KVCR load for rid={rid} pool={pool} page has no held "
-                            "claim; residency was not prepared for this page."
+                    if self.config.direct_remote_restore:
+                        if index is None:
+                            raise RuntimeError(
+                                f"KVCR direct remote load for rid={rid} pool={pool} "
+                                "contains a page outside the prepared prefix."
+                            )
+                        spans.append(None)
+                    else:
+                        claim = (
+                            prep.claims.pop((pool, index), None)
+                            if index is not None
+                            else None
                         )
-                    claims.append(claim)
-                    spans.append(prep.spans.pop((pool, index), None))
+                        if claim is None:
+                            raise RuntimeError(
+                                f"KVCR load for rid={rid} pool={pool} page has no "
+                                "held claim; residency was not prepared for this page."
+                            )
+                        claims.append(claim)
+                        spans.append(prep.spans.pop((pool, index), None))
                 pools.append(
-                    _LoadPool(pool, pages, transfer.host_indices, claims, spans)
+                    _LoadPool(
+                        pool,
+                        pages,
+                        transfer.host_indices,
+                        claims,
+                        spans,
+                        prep.request_id,
+                    )
                 )
             leftover = list(prep.claims.values())
             prep.claims = {}
             prep.state = _State.MISS
             self._release_handles(leftover)
-            self._discard_hint(prep)
+            if not self.config.direct_remote_restore:
+                self._discard_hint(prep)
             self._pending_loads[rid] = pools
             self._load_requested_at[rid] = time.monotonic()
             # The widest pool is the all-pages prefix; trailing-window pools
@@ -1540,6 +1653,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._deferred.append((event, submit))
 
     def _submit_load(self, batch: _LoadBatch) -> None:
+        if self.config.direct_remote_restore:
+            self._submit_direct_remote_load(batch)
+            return
         if self._copy_engine is not None and all(
             span is not None for pool in batch.pools for span in pool.spans
         ):
@@ -1571,6 +1687,159 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             batch.success = False
             logger.exception("KVCR load submission failed")
             self._finish_load(batch, error=error)
+
+    def _submit_direct_remote_load(self, batch: _LoadBatch) -> None:
+        """Pull selected object spans from the hinted peer straight into HBM.
+
+        One KVCR deliver operation covers one request and logical layer.  The
+        destination descriptor layout is an ordered subset of the stored
+        object's full layout; the paired KVCR ablation patch resolves the
+        matching source spans by their ``info`` labels.  Completion therefore
+        releases the model's layer future without a target-DRAM staging copy.
+        """
+        kvcr = self._adapter.kvcr
+        started = time.perf_counter()
+        batch.submit_at = time.monotonic()
+        try:
+            grouped: dict[int, dict[str, dict[Any, list[Any]]]] = {}
+            pool_rows = self._rows_for_pools(
+                [(pool.pool, pool.indices) for pool in batch.pools]
+            )
+            rows_done = time.perf_counter()
+            for pool, rows in zip(batch.pools, pool_rows):
+                plan = self._restore_plans[pool.pool]
+                if len(rows) != len(pool.page_hashes):
+                    raise RuntimeError(
+                        f"KVCR direct remote load pool={pool.pool} rows={len(rows)} "
+                        f"pages={len(pool.page_hashes)}"
+                    )
+                # A page's full descriptor list and encoded key do not change
+                # across logical layers. Build them once, then partition the
+                # descriptor references according to the precomputed plan.
+                page_entries = [
+                    (
+                        self._key(page, pool.pool),
+                        self._direct_remote_page_descriptors(pool.pool, row),
+                    )
+                    for page, row in zip(pool.page_hashes, rows)
+                ]
+                for layer, start, end in plan.layer_slices:
+                    span_indices = plan.order[start:end]
+                    blocks = grouped.setdefault(layer, {}).setdefault(
+                        pool.request_id, {}
+                    )
+                    for key, descriptors in page_entries:
+                        blocks[key] = [
+                            descriptors[int(index)] for index in span_indices
+                        ]
+            assembled = time.perf_counter()
+            operations: list[tuple[list[int], str, dict[Any, list[Any]]]] = []
+            for layer in range(self.num_layers):
+                request_batches = grouped.get(layer)
+                if not request_batches:
+                    # Shared spans are delivered at their earliest consumer.
+                    # Sequential forward execution has already waited there.
+                    if self.config.progressive_remote_restore:
+                        self.layer_done_counter.complete(batch.counter_index, layer)
+                    continue
+                for request_id, blocks in request_batches.items():
+                    items = list(blocks.items())
+                    if not items:
+                        continue
+                    chunk_pages = self.config.direct_remote_chunk_pages or len(items)
+                    for start in range(0, len(items), chunk_pages):
+                        chunk = dict(items[start : start + chunk_pages])
+                        operations.append(([layer], request_id, chunk))
+                        batch.layer_outstanding[layer] = (
+                            batch.layer_outstanding.get(layer, 0) + 1
+                        )
+
+            next_operation = 0
+            window = self.config.direct_remote_inflight_layers or len(operations)
+
+            def make_completion(layers, keys, *, refill: bool):
+                def completion(entries) -> None:
+                    ok = all(
+                        (entry := entries.get(key)) is not None and entry.success
+                        for key in keys
+                    )
+                    batch.success = batch.success and ok
+                    batch.outstanding -= 1
+                    for layer in layers:
+                        batch.layer_outstanding[layer] -= 1
+                        if (
+                            self.config.progressive_remote_restore
+                            and batch.layer_outstanding[layer] == 0
+                            and batch.success
+                        ):
+                            with self._lock:
+                                self.stats[
+                                    f"restore_layer_completion_s_sum[{layer}]"
+                                ] += time.monotonic() - batch.submit_at
+                                self.stats[
+                                    f"restore_layer_completion_count[{layer}]"
+                                ] += 1
+                            self.layer_done_counter.complete(batch.counter_index, layer)
+                    if batch.success and refill:
+                        try:
+                            submit_more()
+                        except Exception:
+                            # Keep existing deliveries tracked until DMA drains.
+                            batch.success = False
+                            logger.exception("KVCR direct remote refill failed")
+                    if batch.outstanding == 0 and (
+                        not batch.success or next_operation == len(operations)
+                    ):
+                        self._finish_load(batch)
+
+                return completion
+
+            def submit_more() -> None:
+                nonlocal next_operation
+                while (
+                    batch.success
+                    and next_operation < len(operations)
+                    and batch.outstanding < window
+                ):
+                    layers, request_id, blocks = operations[next_operation]
+                    next_operation += 1
+                    op = kvcr.deliver(blocks, request_id=request_id)
+                    batch.outstanding += 1
+                    keys = list(blocks)
+                    self._adapter.track(
+                        op,
+                        make_completion(layers, keys, refill=True),
+                    )
+
+            submit_more()
+            submitted = time.perf_counter()
+            with self._lock:
+                self.stats["restore_direct_remote_batches"] += 1
+                self.stats["restore_direct_remote_operations"] += len(operations)
+                self.stats["restore_direct_remote_chunk_pages"] += (
+                    self.config.direct_remote_chunk_pages
+                )
+                self.stats["restore_direct_remote_keys"] += sum(
+                    len(blocks) for _, _, blocks in operations
+                )
+                self.stats["restore_direct_remote_descriptors"] += sum(
+                    sum(len(descriptors) for descriptors in blocks.values())
+                    for _, _, blocks in operations
+                )
+                self.stats["restore_direct_remote_initial_inflight"] += min(
+                    len(operations), window
+                )
+                self.stats["restore_rows_s_sum"] += rows_done - started
+                self.stats["restore_assemble_s_sum"] += assembled - rows_done
+                self.stats["restore_submit_s_sum"] += submitted - assembled
+                self.stats["restore_build_s_sum"] += submitted - started
+            if not operations:
+                self._finish_load(batch)
+        except Exception as error:  # noqa: BLE001 - propagated through the counter
+            batch.success = False
+            logger.exception("KVCR direct remote restore submission failed")
+            if batch.outstanding == 0:
+                self._finish_load(batch, error=error)
 
     def _load_completion(self, batch: _LoadBatch, keys: list):
         def completion(entries: Mapping[Any, Any]) -> None:
@@ -1707,6 +1976,12 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     ) -> None:
         now = time.monotonic()
         elapsed = now - batch.started_at
+        if self.config.direct_remote_restore:
+            for request_id in {pool.request_id for pool in batch.pools}:
+                try:
+                    self._adapter.kvcr.discard_hint(request_id)
+                except Exception:
+                    logger.debug("KVCR discard_hint failed", exc_info=True)
         claims = [claim for pool in batch.pools for claim in pool.claims]
         if batch.success and error is None:
             self.layer_done_counter.complete_all(batch.counter_index)

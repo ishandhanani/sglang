@@ -47,6 +47,26 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     # False routes restores through KVCR deliver and completes all layers at
     # the end.
     direct_restore: bool = True
+    # Experimental ablation: do not prefetch hinted objects into target DRAM.
+    # After lookup allocates device pages, pull selected object spans directly
+    # from the hinted peer into HBM and release each logical layer separately.
+    direct_remote_restore: bool = False
+    # Ablation switch for direct peer-to-HBM restores. When False, all layer
+    # transfers are still issued concurrently, but the model is released only
+    # after every layer has completed.
+    progressive_remote_restore: bool = True
+    # Destination descriptors are stable for the lifetime of the registered
+    # HBM pools. Cache them by physical pool and row so repeated restores do
+    # not rebuild thousands of MemDescriptor objects on the critical path.
+    direct_remote_descriptor_cache: bool = True
+    # Maximum direct peer-to-HBM layer operations in flight. Zero submits all
+    # layers at once; one prioritizes layers strictly in model execution order.
+    direct_remote_inflight_layers: int = 0
+    # Maximum page objects in one direct peer-to-HBM KVCR deliver. Large
+    # prefixes can otherwise create a single NIXL transfer with thousands of
+    # descriptors, which some UCX paths do not make progress on. Zero keeps
+    # one operation per grouped layer regardless of its page count.
+    direct_remote_chunk_pages: int = 0
     # Direct restores submit one copy batch per model layer so the forward
     # pass can start on layer 0 early; consecutive layers whose operands total
     # less than this many bytes are merged into one batch, because for models
@@ -140,6 +160,10 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError("KVCR gil_switch_interval_ms must be positive.")
         if self.direct_restore_min_batch_bytes < 0:
             raise ValueError("KVCR direct_restore_min_batch_bytes must be >= 0.")
+        if self.direct_remote_inflight_layers < 0:
+            raise ValueError("KVCR direct_remote_inflight_layers must be >= 0.")
+        if self.direct_remote_chunk_pages < 0:
+            raise ValueError("KVCR direct_remote_chunk_pages must be >= 0.")
         self._validate_remote_hint_endpoint()
 
     def _validate_remote_hint_endpoint(self) -> None:
