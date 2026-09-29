@@ -392,6 +392,13 @@ def harness():
 # ---------------------------------------------------------------------------
 
 
+def test_startup_logs_nixl_only_copy_paths(harness, caplog):
+    with caplog.at_level("INFO"):
+        harness(extra={"device_copy": False, "direct_restore": False})
+    assert "device_copy_requested=False local_restore=nixl_self" in caplog.text
+    assert "remote_restore=nixl_peer_to_dram_then_local_restore" in caplog.text
+
+
 def test_offload_prepare_lookup_load_round_trip_moves_bytes(harness):
     h = harness()
     hashes = _hashes("a", 4)

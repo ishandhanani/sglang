@@ -110,3 +110,45 @@ DP1 workers and 256-token pages; Kimi K3 used TP8 with DP2 attention across two
 four-GPU nodes and 64-token pages. Those GPU runs motivated these changes but
 used older runtime overlays. Do not attribute their timing numbers to these
 new rebased commits without repeating the workload.
+
+## Diagnose the NIXL / UCX path
+
+The default `device_copy=true` uses KVCR's CUDA-runtime engine for GPU offload;
+`direct_restore=true` uses the linker's CUDA-runtime engine for local restores
+when available. Those payload copies do **not** exercise NIXL/UCX. To inspect
+the complete staged path through NIXL, add these fields to the configuration:
+
+```json
+{
+  "device_copy": false,
+  "direct_restore": false,
+  "direct_remote_restore": false
+}
+```
+
+Set these variables before launching **both** workers:
+
+```bash
+export NIXL_LOG_LEVEL=DEBUG
+export UCX_LOG_LEVEL=DEBUG
+export UCX_PROTO_INFO=y
+```
+
+This tests source GPU -> source KVCR DRAM (self), source DRAM -> target DRAM
+(peer), then target DRAM -> target GPU (self). Setting
+`direct_remote_restore=true` instead tests source DRAM -> target GPU directly
+through NIXL; the cross-node transfer is expected to use network transport,
+not `cuda_copy`.
+
+The startup log names the configured backend, requested offload engine,
+effective local-restore engine, and remote-restore path. One scheduler rank
+owns one data agent; it registers both that rank's GPU pools and KVCR DRAM.
+The backend availability probe is a temporary agent, not another payload path.
+KVCR currently requests four NIXL worker threads. Same NIXL agent does not
+imply same UCX worker/interface or guarantee `cuda_copy` selection.
+
+Use the companion KVCR `tests/manual/nixl_ucx_self_copy.py` to isolate local
+copy selection and descriptor geometry. Check the actual CUDA/host memory-pair
+protocol table, not simply whether `cuda_copy` appears in the available lanes.
+Do not disable peer-error handling globally as a production performance fix.
+Keep DEBUG/protocol runs separate from quiet TTFT measurements.

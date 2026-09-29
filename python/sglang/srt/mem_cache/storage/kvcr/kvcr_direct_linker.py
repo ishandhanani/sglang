@@ -934,6 +934,18 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self.config.enable_remote_hint,
             self._control.endpoint if self._control is not None else None,
         )
+        logger.info(
+            "KVCRDirectLinker copy paths rank=%d nixl_backend=%s "
+            "device_copy_requested=%s local_restore=%s remote_restore=%s "
+            "(NIXL self-copy uses this rank's agent; UCX chooses the transport)",
+            self.world_rank,
+            self.config.nixl_backend,
+            self.config.device_copy,
+            "cuda_runtime" if self._copy_engine is not None else "nixl_self",
+            "nixl_peer_to_hbm"
+            if self.config.direct_remote_restore
+            else "nixl_peer_to_dram_then_local_restore",
+        )
 
     # ------------------------------------------------------------------
     # Keys and descriptors
