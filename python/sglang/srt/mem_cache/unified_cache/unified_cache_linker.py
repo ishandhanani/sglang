@@ -532,6 +532,23 @@ class UnifiedCacheLinkerWrapper:
         for component, transfer in transfers:
             component_canonical = canonical_full
             if phase == ExternalLinkerLoadPhase.COMMIT:
+                # Mamba indices identify one checkpoint at a resume boundary,
+                # not one token slot per KV page. The component must also run
+                # when the checkpoint already exists so it can select the
+                # canonical state instead of the freed duplicate destination.
+                if component.component_type == ComponentType.MAMBA:
+                    transfer = component.update_external_linker_load(
+                        phase,
+                        req,
+                        full,
+                        transfer,
+                        prefix_len,
+                        insert_result=insert_result,
+                        canonical_full=None,
+                    )
+                    if transfer is not None:
+                        result.append(transfer)
+                    continue
                 assert insert_result.adopted_ranges is not None
                 coverage_start = prefix_len - len(transfer.device_indices)
                 ranges = [

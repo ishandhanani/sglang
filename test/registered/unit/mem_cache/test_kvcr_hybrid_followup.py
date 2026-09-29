@@ -10,7 +10,7 @@ import torch
 
 pytest.importorskip("kvcr")
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
@@ -31,6 +31,9 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     LinkerTransferPhase,
 )
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    UnifiedCacheLinkerWrapper,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -156,6 +159,53 @@ def test_mamba_commit_does_not_deliver_into_freed_duplicate_checkpoint():
         insert_result=SimpleNamespace(last_device_node=1, mamba_exist=True),
     )
     assert result is None
+    assert req.kv.mamba_cow_src_index is canonical
+
+
+@pytest.mark.parametrize("duplicate_checkpoint", [False, True])
+@pytest.mark.parametrize("adopt_full_pages", [False, True])
+def test_wrapper_commits_mamba_slot_without_token_page_filtering(
+    duplicate_checkpoint, adopt_full_pages
+):
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = SimpleNamespace(page_size=64)
+    full = PoolTransfer(
+        name=PoolName.KV, keys=["a", "b"], device_indices=torch.arange(128)
+    )
+    full_component = SimpleNamespace(
+        component_type=ComponentType.FULL,
+        update_external_linker_load=Mock(return_value=full),
+    )
+    checkpoint = PoolTransfer(
+        name=PoolName.MAMBA, keys=["b"], device_indices=torch.tensor([7])
+    )
+    canonical = torch.tensor([9]) if duplicate_checkpoint else checkpoint.device_indices
+    node = SimpleNamespace(
+        component_data={ComponentType.MAMBA: SimpleNamespace(value=canonical)}
+    )
+    mamba = MambaComponent.__new__(MambaComponent)
+    mamba.tree_core = SimpleNamespace(node_by_id=lambda _: node)
+    req = SimpleNamespace(kv=SimpleNamespace(mamba_cow_src_index=None))
+    result = wrapper._update_load(
+        ExternalLinkerLoadPhase.COMMIT,
+        req,
+        [(full_component, full), (mamba, checkpoint)],
+        prefix_len=128,
+        insert_result=SimpleNamespace(
+            adopted_ranges={
+                ComponentType.FULL: [(0, 128)] if adopt_full_pages else [],
+            },
+            mamba_exist=duplicate_checkpoint,
+            last_device_node=1,
+        ),
+        canonical_full=torch.arange(128),
+    )
+    expected = ([full] if adopt_full_pages else []) + (
+        [] if duplicate_checkpoint else [checkpoint]
+    )
+    assert result == expected
+    assert checkpoint.device_indices.tolist() == [7]
+    assert checkpoint.keys == ["b"]
     assert req.kv.mamba_cow_src_index is canonical
 
 
