@@ -455,18 +455,18 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                         plan.device_pools if nextn_layers else (),
                     )
 
-    def test_unsupported_strategy_fails_with_context(self):
+    def test_mamba_strategy_rejects_unregistered_draft_pools(self):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
         with self.assertRaisesRegex(
             ValueError,
-            "does not support the direct external linker: _MambaStrategy",
+            "Mamba external linker does not support MTP draft pools",
         ):
             resolve_hybrid_device_pool_group(
                 kvcache=kvcache,
                 page_size=2,
-                params=SimpleNamespace(),
+                params=SimpleNamespace(mtp_draft_device_pools=(object(),)),
                 components={ComponentType.FULL, ComponentType.MAMBA},
             )
 

@@ -392,6 +392,13 @@ def harness():
 # ---------------------------------------------------------------------------
 
 
+def test_startup_logs_nixl_only_copy_paths(harness, caplog):
+    with caplog.at_level("INFO"):
+        harness(extra={"device_copy": False, "direct_restore": False})
+    assert "device_copy_requested=False local_restore=nixl_self" in caplog.text
+    assert "remote_restore=nixl_peer_to_dram_then_local_restore" in caplog.text
+
+
 def test_offload_prepare_lookup_load_round_trip_moves_bytes(harness):
     h = harness()
     hashes = _hashes("a", 4)
@@ -537,6 +544,34 @@ def test_direct_restore_merges_small_layers_into_one_batch(harness):
     assert stats["restore_direct_batches"] == 1
     assert stats["gpu_restore_bytes"] == stats["offload_bytes"]
     h.close()
+
+
+def test_direct_peer_path_also_restores_locally_resident_objects(harness):
+    # Core delivery chooses local DRAM before remote hints. The layer-subset
+    # protocol must therefore work for a target's existing local copy too.
+    h = harness(
+        with_swa=True,
+        extra={"direct_remote_restore": True, "direct_remote_chunk_pages": 1},
+    )
+    hashes = _hashes("peer-local", 4)
+    h.fill(0, 4, seed=42)
+    expected = h.snapshot(0, 4)
+    h.offload(hashes, first_page=0, swa_tail=2)
+    assert h.wait_offloads(1) == [True]
+    handle = h.prepare("local-peer", hashes, swa_window=2)
+    h.wait_ready(handle)
+    assert (
+        h.linker.lookup("local-peer", h.lookup_transfers(hashes, swa_window=2))[-1] == 4
+    )
+    assert h.public_claims() == 0
+    index = h.load("local-peer", hashes, first_page=8, swa_tail=2)
+    assert h.wait_loads(1) == [["local-peer"]]
+    h.linker.layer_done_counter.set_consumer(index)
+    h.linker.layer_done_counter.wait_until(LAYERS - 1)
+    restored = h.snapshot(8, 4)
+    for name in ("k", "v"):
+        for got, want in zip(restored[name], expected[name]):
+            assert torch.equal(got, want)
 
 
 def test_direct_restore_layer_lands_before_later_layers(harness):

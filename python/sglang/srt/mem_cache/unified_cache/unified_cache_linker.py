@@ -57,6 +57,7 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
         ComponentType.SWA,
+        ComponentType.MAMBA,
     }
 )
 
@@ -198,7 +199,7 @@ class UnifiedCacheLinkerWrapper:
                 component.name for component in sorted(unsupported, key=int)
             )
             raise ValueError(
-                "External cache linker supports only Full and SWA tree "
+                "External cache linker supports only Full, SWA and Mamba tree "
                 f"components; unsupported: {names}"
             )
 
@@ -301,7 +302,8 @@ class UnifiedCacheLinkerWrapper:
         if self._preparing:
             self.cache_linker.prepare_request(
                 LinkerRequestContext(
-                    request=req.cache_request_handle, router_hint=req.kv_hints
+                    request=req.cache_request_handle,
+                    router_hint=getattr(req, "kv_hints", None),
                 ),
                 lookup_transfers,
             )
@@ -530,6 +532,23 @@ class UnifiedCacheLinkerWrapper:
         for component, transfer in transfers:
             component_canonical = canonical_full
             if phase == ExternalLinkerLoadPhase.COMMIT:
+                # Mamba indices identify one checkpoint at a resume boundary,
+                # not one token slot per KV page. The component must also run
+                # when the checkpoint already exists so it can select the
+                # canonical state instead of the freed duplicate destination.
+                if component.component_type == ComponentType.MAMBA:
+                    transfer = component.update_external_linker_load(
+                        phase,
+                        req,
+                        full,
+                        transfer,
+                        prefix_len,
+                        insert_result=insert_result,
+                        canonical_full=None,
+                    )
+                    if transfer is not None:
+                        result.append(transfer)
+                    continue
                 assert insert_result.adopted_ranges is not None
                 coverage_start = prefix_len - len(transfer.device_indices)
                 ranges = [
