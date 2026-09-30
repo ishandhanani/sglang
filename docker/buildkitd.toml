@@ -1,0 +1,7 @@
+# One shared builder per self-hosted runner retains both image targets' caches.
+# These images and Cargo/Python caches exceed BuildKit's small default budget.
+[worker.oci]
+  gc = true
+  reservedSpace = "150GB"
+  maxUsedSpace = "250GB"
+  minFreeSpace = "20GB"

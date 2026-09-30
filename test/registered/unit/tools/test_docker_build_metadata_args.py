@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import re
 import subprocess
 import unittest
 from pathlib import Path
@@ -162,14 +163,10 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
 
     def test_final_dockerfile_stages_embed_metadata_contract(self):
         dockerfile = DOCKERFILE_PATH.read_text()
-        framework_stage = dockerfile.split("FROM framework AS framework_final", 1)[
-            1
-        ].split("FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime")[
-            0
-        ]
-        runtime_stage = dockerfile.split(
-            "FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime", 1
-        )[1]
+        stages = re.split(r"(?im)^FROM \S+ AS (\w+)\s*$", dockerfile)
+        stages_by_name = dict(zip(stages[1::2], stages[2::2]))
+        framework_stage = stages_by_name["framework_final"]
+        runtime_stage = stages_by_name["runtime"]
 
         for stage in (framework_stage, runtime_stage):
             for expected in (
