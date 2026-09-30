@@ -393,3 +393,16 @@ class Model(msgspec.Struct):
             help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
         ),
     ] = 1800
+    weight_cache_transport: A[
+        str,
+        Arg(
+            help="How the weight cache daemon shares tensors with engines. 'torch_ipc': "
+            "legacy CUDA IPC handles; mappings dangle when the daemon exits, so engines "
+            "watch its PID and stop, and daemon and engines must share PID and IPC "
+            "namespaces. 'vmm_fd': CUDA VMM arenas exported as POSIX file descriptors over "
+            "the daemon socket; imported mappings outlive the daemon and need no shared "
+            "namespace. 'auto' currently selects torch_ipc. Read by the daemon; an engine "
+            "follows whatever transport the daemon serves.",
+            choices=["auto", "torch_ipc", "vmm_fd"],
+        ),
+    ] = "auto"

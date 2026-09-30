@@ -348,6 +348,21 @@ def _is_pid_alive(pid: int) -> bool:
         return True
 
 
+def daemon_files_stale(device_uuid: str) -> bool:
+    """Whether the daemon files for this GPU are leftovers of a daemon that is gone.
+
+    A daemon writes ``.ready`` with its PID after binding its socket and unlinks
+    both on a clean exit; a SIGKILLed daemon leaves both behind, and a client that
+    connects then gets ECONNREFUSED. Missing or unreadable ``.ready``, or a PID
+    that is no longer alive, means no daemon owns that socket.
+    """
+    ready_path = get_ready_path(device_uuid)
+    if not os.path.exists(ready_path):
+        return True
+    pid = _read_ready_pid(ready_path)
+    return pid is None or not _is_pid_alive(pid)
+
+
 def cleanup_stale_daemon_files(device_uuid: str, *, force: bool = False) -> None:
     """Validate and clean up .ready/.sock files for a daemon's physical GPU.
 

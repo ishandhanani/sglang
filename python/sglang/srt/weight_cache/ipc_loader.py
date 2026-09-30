@@ -29,13 +29,14 @@ from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
     compute_env_stamp,
+    daemon_files_stale,
     get_quant_method_name,
     get_socket_path,
     hash_quant_config,
     recv_msg,
     send_msg,
 )
-from .transport import TORCH_IPC_BACKEND, get_client_transport_backend
+from .transport import TORCH_IPC_BACKEND, VMM_FD_BACKEND, get_client_transport_backend
 
 logger = logging.getLogger(__name__)
 
@@ -169,9 +170,17 @@ class IpcModelLoader(BaseModelLoader):
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
 
-        # The model now points into the daemon's GPU memory via CUDA IPC. If the
-        # daemon dies, those pointers dangle, so watch it and fail loud.
-        self._start_daemon_liveness_watchdog(cache_data.get("pid"))
+        if self._transport_backend.name == VMM_FD_BACKEND:
+            # Imported VMM mappings keep the physical memory alive on their own, so
+            # the model survives the daemon; nothing to watch.
+            logger.info(
+                "[IpcModelLoader] vmm_fd: weights are mapped from imported VMM "
+                "handles and stay valid if the daemon exits; no liveness watchdog"
+            )
+        else:
+            # The model now points into the daemon's GPU memory via CUDA IPC. If the
+            # daemon dies, those pointers dangle, so watch it and fail loud.
+            self._start_daemon_liveness_watchdog(cache_data.get("pid"))
 
         logger.info(
             f"[IpcModelLoader] Loaded model via IPC (mode={self.weight_cache_mode}), "
@@ -457,6 +466,7 @@ class IpcModelLoader(BaseModelLoader):
         """
         import socket as socket_mod
 
+        device_uuid = None
         if self.socket_path is None:
             device_uuid = current_platform.get_device_uuid(int(device_config.gpu_id))
             self.socket_path = get_socket_path(device_uuid)
@@ -487,6 +497,22 @@ class IpcModelLoader(BaseModelLoader):
             return None
         except ConnectionRefusedError:
             sock.close()
+            if (
+                self.weight_cache_mode == "client"
+                and device_uuid is not None
+                and daemon_files_stale(device_uuid)
+            ):
+                # A daemon that was killed leaves its socket and .ready behind.
+                # In client mode the GPU is not shared with a live daemon, so a
+                # disk load is safe; the next daemon start cleans the files up.
+                logger.warning(
+                    "[IpcModelLoader] Daemon socket %s refused the connection and its "
+                    ".ready file names no live daemon: leftovers of a daemon that exited "
+                    "without cleanup. Falling back to a disk load (client mode); restart "
+                    "the daemon to serve later engines from the cache.",
+                    self.socket_path,
+                )
+                return None
             raise RuntimeError(
                 f"[IpcModelLoader] Daemon socket exists at {self.socket_path} but "
                 f"refused the connection. The daemon may have crashed after "
@@ -570,6 +596,7 @@ class IpcModelLoader(BaseModelLoader):
 
             backend_name = result.get("transport_backend", TORCH_IPC_BACKEND)
             self._transport_backend = get_client_transport_backend(backend_name)
+            self._transport_backend.bind_device(int(device_config.gpu_id))
             result = self._transport_backend.recv_fetch_state_response(sock, result)
             return result
 

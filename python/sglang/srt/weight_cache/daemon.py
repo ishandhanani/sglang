@@ -72,7 +72,7 @@ from .protocol import (
     recv_msg,
     send_msg,
 )
-from .transport import choose_daemon_transport_backend
+from .transport import AUTO_TRANSPORT, VMM_FD_BACKEND, choose_daemon_transport_backend
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +188,10 @@ class WeightCacheDaemon:
         # name -> transport-specific tensor entry metadata (shape/dtype/is_param + payload metadata)
         self.state_entries: Dict[str, Dict[str, Any]] = {}
         self.preloaded_weights_bytes = 0
+        # --weight-cache-transport: how tensors reach the engines (see transport.py).
+        self.transport_request = getattr(
+            server_args, "weight_cache_transport", AUTO_TRANSPORT
+        )
         self.transport_backend = None
 
     def _init_distributed(self, server_args, model_config):
@@ -266,7 +270,10 @@ class WeightCacheDaemon:
         # that cannot be exported via _share_cuda_, so the IPC export below would
         # die mid-way with an opaque CUDA error. Fail fast with an actionable
         # message before touching the device.
-        self._assert_ipc_compatible_allocator()
+        # torch_ipc exports torch's own allocations, which expandable_segments
+        # breaks; vmm_fd copies into its own arenas and does not care.
+        if self.transport_request != VMM_FD_BACKEND:
+            self._assert_ipc_compatible_allocator()
         current_platform.set_device(current_platform.get_device(self.gpu_id))
 
         # Reduce thread contention during multi-process loading
@@ -454,8 +461,30 @@ class WeightCacheDaemon:
                 state_tensors[name] = (buf.data, False)
                 non_persistent_count += 1
 
-        self.transport_backend = choose_daemon_transport_backend(state_tensors)
+        self.transport_backend = choose_daemon_transport_backend(
+            state_tensors, self.transport_request, device_id=self.gpu_id
+        )
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
+
+        # A transport that copied the weights (vmm_fd) hands back a view per name
+        # over its copies: rebind the model onto them and free the originals, so
+        # the daemon holds one copy, and count the copies as the resident weights
+        # an engine on this GPU must budget for.
+        views = getattr(self.transport_backend, "daemon_views", {})
+        if views:
+            from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+            for name, (_, is_param) in state_tensors.items():
+                IpcModelLoader._set_module_tensor(
+                    self.model, name, views[name], is_param=is_param
+                )
+            state_tensors = {}
+            current_platform.synchronize()
+            current_platform.empty_cache()
+            self.preloaded_weights_bytes = max(
+                self.preloaded_weights_bytes,
+                int(getattr(self.transport_backend, "resident_bytes", 0)),
+            )
 
         # Log approximate serialized metadata size (not payload-backed bytes).
         # Only the handle blob carries real weight, so measure it directly:
