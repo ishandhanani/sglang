@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 from collections import defaultdict
 from pathlib import Path
 
@@ -100,7 +101,7 @@ def deduplicate_library_aliases(site_packages):
     return linked
 
 
-def separate_editable_metadata(site_packages, destination):
+def separate_editable_metadata(site_packages, destination, *, copy=False):
     """Keep source/version-dependent files out of the large dependency layer."""
     distributions = list(site_packages.glob("sglang-*.dist-info"))
     editable = list(site_packages.glob("__editable__*sglang*"))
@@ -110,24 +111,52 @@ def separate_editable_metadata(site_packages, destination):
     for path in sorted(distributions + editable):
         if (destination / path.name).exists():
             raise RuntimeError(f"metadata destination already exists: {path.name}")
-        shutil.move(path, destination / path.name)
+        if copy:
+            # The framework payload is mounted read-only. cp -a also preserves
+            # ownership, xattrs and directory metadata, unlike shutil.copytree.
+            subprocess.run(
+                ["cp", "-a", "--", str(path), str(destination / path.name)], check=True
+            )
+        else:
+            shutil.move(path, destination / path.name)
     # A Python invocation after pip's editable install may have compiled the
     # generated finder. Keep that version-dependent cache with its source.
     for path in sorted((site_packages / "__pycache__").glob("__editable__*sglang*")):
         cache = destination / "__pycache__"
         cache.mkdir(exist_ok=True)
-        shutil.move(path, cache / path.name)
+        if copy:
+            subprocess.run(
+                ["cp", "-a", "--", str(path), str(cache / path.name)], check=True
+            )
+        else:
+            shutil.move(path, cache / path.name)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--site-packages", type=Path, required=True)
     parser.add_argument("--cuda-root", type=Path, default=Path("/usr/local/cuda"))
-    parser.add_argument("--metadata-dir", type=Path, required=True)
+    parser.add_argument("--metadata-dir", type=Path)
+    parser.add_argument(
+        "--mode", choices=("all", "dependencies", "metadata"), default="all"
+    )
     args = parser.parse_args()
-    cuda = deduplicate_cuda(args.site_packages, args.cuda_root)
-    aliases = deduplicate_library_aliases(args.site_packages)
-    separate_editable_metadata(args.site_packages, args.metadata_dir)
+    if args.mode != "dependencies" and args.metadata_dir is None:
+        parser.error("--metadata-dir is required when preparing metadata")
+    if args.mode == "dependencies" and (
+        any(args.site_packages.glob("sglang-*.dist-info"))
+        or any(args.site_packages.glob("__editable__*sglang*"))
+        or any((args.site_packages / "__pycache__").glob("__editable__*sglang*"))
+    ):
+        raise RuntimeError("dependency layer contains editable SGLang metadata")
+    cuda = aliases = []
+    if args.mode != "metadata":
+        cuda = deduplicate_cuda(args.site_packages, args.cuda_root)
+        aliases = deduplicate_library_aliases(args.site_packages)
+    if args.mode != "dependencies":
+        separate_editable_metadata(
+            args.site_packages, args.metadata_dir, copy=args.mode == "metadata"
+        )
     print(json.dumps({"cuda_libraries": cuda, "library_aliases": aliases}, indent=2))
 
 

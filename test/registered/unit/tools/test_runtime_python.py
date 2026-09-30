@@ -115,6 +115,23 @@ class TestRuntimePython(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "editable SGLang"):
             helper.separate_editable_metadata(self.packages, self.root / "metadata")
 
+    def test_metadata_copy_preserves_read_only_input(self):
+        metadata = self.write(
+            self.packages / "sglang-1.2.3.dist-info/METADATA", b"sglang"
+        )
+        pth = self.write(self.packages / "__editable__.sglang-1.2.3.pth", b"/workspace")
+        bytecode = self.write(
+            self.packages
+            / "__pycache__/__editable___sglang_1_2_3_finder.cpython-312.pyc",
+            b"compiled finder",
+        )
+        destination = self.root / "metadata"
+        helper.separate_editable_metadata(self.packages, destination, copy=True)
+        for source in (metadata, pth, bytecode):
+            copied = destination / source.relative_to(self.packages)
+            self.assertEqual(source.read_bytes(), copied.read_bytes())
+            self.assertEqual(helper.file_key(source), helper.file_key(copied))
+
 
 if __name__ == "__main__":
     unittest.main()

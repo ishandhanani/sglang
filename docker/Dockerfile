@@ -549,6 +549,12 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt-${TARGETARCH},shar
     dpkg dpkg-dev libdpkg-perl \
     && rm -rf /var/lib/apt/lists/*
 
+# Cache the small build backends so editable installs can reuse the installed
+# Torch instead of extracting another copy into a temporary build environment.
+# install_sglang.py falls back to isolation if the selected source needs others.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install "setuptools-rust>=1.11" "setuptools-scm>=8.0"
+
 # Install pre-built gateway artifacts from parallel builder
 COPY --link --from=gateway_builder /build/sgl-model-gateway-bin /opt/sglang/bin/sgl-model-gateway
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -593,8 +599,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cargo/git,id=cargo-git \
     --mount=type=cache,target=/sgl-workspace/sglang/rust/target,id=sglang-target-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/sgl-workspace/sglang/rust/sglang-radix-tree/target,id=sglang-radix-target-${TARGETARCH},sharing=locked \
+    --mount=type=bind,source=docker/install_sglang.py,target=/tmp/install_sglang.py \
     cd /sgl-workspace/sglang \
-    && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
+    && python3 /tmp/install_sglang.py "python[${BUILD_TYPE}]" \
     && kernels lock python \
     && ( success=0; \
          # aarch64: kernels-community/sgl-flash-attn3 ships no arm variants; JIT-compile at runtime.
@@ -604,9 +611,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
              success=1; \
          else \
              for i in 1 2 3; do \
-                 echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
-                 kernels download python && \
-                 success=1 && break; \
+                 echo "Attempt $i/3: downloading sgl-kernel cubins..."; \
+                 if kernels download python > /tmp/kernels-download.log 2>&1; then \
+                     cat /tmp/kernels-download.log; success=1; break; \
+                 fi; \
+                 cat /tmp/kernels-download.log; \
+                 # A missing variant cannot be fixed by retrying the same revision. \
+                 if grep -Fq "Cannot find a build variant for this system" /tmp/kernels-download.log; then \
+                     break; \
+                 fi; \
+                 [ "$i" = "3" ] && break; \
                  echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
              done; \
              # x86: if no prebuilt sgl-flash-attn3 variant matches this torch+CUDA \
@@ -618,6 +632,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
              fi; \
          fi; \
          [ "$success" = "1" ] ) \
+    && rm -f /tmp/kernels-download.log \
     && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
     && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
     && ( find /opt/sglang/lib/python3.12/site-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
@@ -782,10 +797,22 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt-${TARGETARCH},sharin
 # Only byte-identical shared libraries are deduplicated; every package, GPU
 # architecture, source/header and prebuilt kernel remains available.
 FROM runtime_base AS runtime_python
-COPY --link --from=framework_final /opt/sglang/lib/python3.12/site-packages /opt/sglang/lib/python3.12/site-packages
+COPY --link --from=framework_final \
+    --exclude=sglang-*.dist-info \
+    --exclude=__editable__*sglang* \
+    --exclude=**/__editable__*sglang* \
+    /opt/sglang/lib/python3.12/site-packages /opt/sglang/lib/python3.12/site-packages
 RUN --mount=type=bind,source=docker/runtime_python.py,target=/tmp/runtime_python.py \
-    python3 -B /tmp/runtime_python.py \
-        --site-packages /opt/sglang/lib/python3.12/site-packages \
+    python3 -B /tmp/runtime_python.py --mode dependencies \
+        --site-packages /opt/sglang/lib/python3.12/site-packages
+
+# Extract only metadata through a bind mount: changing a source version must
+# not create another complete site-packages blob in the registry build cache.
+FROM runtime_base AS runtime_metadata
+RUN --mount=type=bind,from=framework_final,source=/opt/sglang/lib/python3.12/site-packages,target=/framework-python-packages \
+    --mount=type=bind,source=docker/runtime_python.py,target=/tmp/runtime_python.py \
+    python3 -B /tmp/runtime_python.py --mode metadata \
+        --site-packages /framework-python-packages \
         --metadata-dir /runtime-python-metadata
 
 FROM runtime_base AS runtime
@@ -793,7 +820,7 @@ FROM runtime_base AS runtime
 # Independent layers let source/version edits reuse the large dependency blob.
 # The small editable-install metadata is copied separately at its original path.
 COPY --link --from=runtime_python /opt/sglang/lib/python3.12/site-packages /opt/sglang/lib/python3.12/site-packages
-COPY --link --from=runtime_python /runtime-python-metadata/ /opt/sglang/lib/python3.12/site-packages/
+COPY --link --from=runtime_metadata /runtime-python-metadata/ /opt/sglang/lib/python3.12/site-packages/
 
 # Keep installed extensions and sources, excluding Cargo's intermediate output.
 COPY --link --from=framework_final --exclude=**/target /sgl-workspace /sgl-workspace
