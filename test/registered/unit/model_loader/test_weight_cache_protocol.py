@@ -34,6 +34,7 @@ from sglang.srt.weight_cache.protocol import (
     cleanup_stale_daemon_files,
     compute_global_rank,
     compute_local_gpu_id,
+    daemon_files_stale,
     get_quant_method_name,
     get_ready_path,
     get_socket_path,
@@ -520,6 +521,104 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
             )
         get_uuid.assert_called_once_with(5)
         self.assertIsNone(result)  # no real daemon at that socket -> absent
+
+
+class TestStaleSocketFallback(CustomTestCase):
+    """A SIGKILLed daemon leaves its socket and .ready behind, and connecting to
+    the socket gets ECONNREFUSED. In client mode that is a leftover, not a live
+    daemon sharing the GPU, so the engine falls back to a disk load. It stays a
+    hard error in daemon mode (shared GPU) and whenever .ready names a live
+    process (a daemon that is up but not accepting).
+    """
+
+    KEY = "test-stale-socket-fallback"
+
+    def setUp(self):
+        import subprocess
+        import sys
+        from unittest import mock
+
+        self.ready_path = get_ready_path(self.KEY)
+        self.socket_path = get_socket_path(self.KEY)
+        self._unlink()
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(self.socket_path)
+        listener.close()  # the file stays behind; connects are refused
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait(timeout=30)
+        self.dead_pid = child.pid
+        patcher = mock.patch(
+            "sglang.srt.platforms.current_platform.get_device_uuid",
+            return_value=self.KEY,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        self._unlink()
+
+    def _unlink(self):
+        for path in (self.ready_path, self.socket_path):
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def _write_ready(self, pid):
+        with open(self.ready_path, "w") as f:
+            f.write(f"pid={pid}\n")
+
+    @staticmethod
+    def _model_config():
+        hf_config = SimpleNamespace(
+            architectures=["LlamaForCausalLM"], quantization_config=None
+        )
+        return SimpleNamespace(
+            model_path="/models/demo",
+            hf_config=hf_config,
+            quantization=None,
+            revision=None,
+            dtype="torch.float16",
+        )
+
+    def _fetch(self, mode):
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        loader = IpcModelLoader(
+            load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE),
+            weight_cache_mode=mode,
+            fallback_load_format="auto",
+        )
+        return loader._fetch_from_cache(self._model_config(), SimpleNamespace(gpu_id=0))
+
+    def test_helper_reads_the_ready_file(self):
+        self.assertTrue(daemon_files_stale(self.KEY))  # no .ready at all
+        self._write_ready(self.dead_pid)
+        self.assertTrue(daemon_files_stale(self.KEY))
+        self._write_ready(os.getpid())
+        self.assertFalse(daemon_files_stale(self.KEY))
+
+    def test_client_mode_falls_back_when_the_daemon_is_dead(self):
+        import logging
+
+        self._write_ready(self.dead_pid)
+        with self.assertLogs(
+            "sglang.srt.weight_cache.ipc_loader", level=logging.WARNING
+        ) as logs:
+            self.assertIsNone(self._fetch("client"))
+        self.assertTrue(any("leftovers" in r.getMessage() for r in logs.records))
+
+    def test_client_mode_falls_back_when_ready_is_missing(self):
+        self.assertIsNone(self._fetch("client"))
+
+    def test_client_mode_raises_when_the_ready_pid_is_alive(self):
+        self._write_ready(os.getpid())
+        with self.assertRaisesRegex(RuntimeError, "refused the connection"):
+            self._fetch("client")
+
+    def test_daemon_mode_raises_on_a_stale_socket(self):
+        self._write_ready(self.dead_pid)
+        with self.assertRaisesRegex(RuntimeError, "refused the connection"):
+            self._fetch("daemon")
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
     compute_env_stamp,
+    daemon_files_stale,
     get_quant_method_name,
     get_socket_path,
     hash_quant_config,
@@ -465,6 +466,7 @@ class IpcModelLoader(BaseModelLoader):
         """
         import socket as socket_mod
 
+        device_uuid = None
         if self.socket_path is None:
             device_uuid = current_platform.get_device_uuid(int(device_config.gpu_id))
             self.socket_path = get_socket_path(device_uuid)
@@ -495,6 +497,22 @@ class IpcModelLoader(BaseModelLoader):
             return None
         except ConnectionRefusedError:
             sock.close()
+            if (
+                self.weight_cache_mode == "client"
+                and device_uuid is not None
+                and daemon_files_stale(device_uuid)
+            ):
+                # A daemon that was killed leaves its socket and .ready behind.
+                # In client mode the GPU is not shared with a live daemon, so a
+                # disk load is safe; the next daemon start cleans the files up.
+                logger.warning(
+                    "[IpcModelLoader] Daemon socket %s refused the connection and its "
+                    ".ready file names no live daemon: leftovers of a daemon that exited "
+                    "without cleanup. Falling back to a disk load (client mode); restart "
+                    "the daemon to serve later engines from the cache.",
+                    self.socket_path,
+                )
+                return None
             raise RuntimeError(
                 f"[IpcModelLoader] Daemon socket exists at {self.socket_path} but "
                 f"refused the connection. The daemon may have crashed after "
