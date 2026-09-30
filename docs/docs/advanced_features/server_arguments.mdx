@@ -2672,6 +2672,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--memory-saver-hook-mode`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>How torch_memory_saver intercepts allocations under `--enable-memory-saver`. `preload` hooks cudaMalloc through LD_PRELOAD in every scheduler subprocess and is the only mode that can pause CUDA-graph memory. `torch` installs an in-process pluggable allocator instead: no LD_PRELOAD, graph memory stays resident, and it is the mode an external memory owner (a weight cache or a VMM memory service) plugs into. Default: `torch` on Intel XPU, `preload` elsewhere.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>preload</code>, <code>torch</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-weights-cpu-backup`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Save model weights to CPU memory during release_weights_occupation and resume_weights_occupation</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
