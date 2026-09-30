@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.19
+
 ARG CUDA_VERSION=13.0.3
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
@@ -654,8 +656,9 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
 # - JIT compilation support for FP8/microscaling kernels
 # - Ready-to-run inference server environment
 #
-# Note: Uses devel base for complete NVCC toolchain required by DeepGEMM JIT
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
+# Install the devel image's CUDA packages without its Nsight Compute dependency.
+# Starting from runtime keeps Nsight out of the inherited image layers.
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu24.04 AS runtime
 
 ARG CUDA_VERSION
 ARG TARGETARCH
@@ -664,13 +667,32 @@ ARG GDRCOPY_VERSION=2.5.1
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    SGLANG_RUST_BUILD_MODE=never
+    SGLANG_RUST_BUILD_MODE=never \
+    LIBRARY_PATH=/usr/local/cuda/lib64/stubs
 
 # Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT
 ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 
-# Install runtime dependencies (devel base provides gcc/g++/build tools)
+# Keep the full CUDA compilation toolchain and development libraries for JIT.
+# These are the packages installed by NVIDIA's devel image, excluding Nsight.
+RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
+    CUDA_PKG_VERSION=$(echo "${CUDA_VERSION}" | cut -d. -f1,2 | tr . -) \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    cuda-cudart-dev-${CUDA_PKG_VERSION} \
+    cuda-command-line-tools-${CUDA_PKG_VERSION}=${NV_CUDA_LIB_VERSION} \
+    cuda-minimal-build-${CUDA_PKG_VERSION}=${NV_CUDA_LIB_VERSION} \
+    cuda-libraries-dev-${CUDA_PKG_VERSION}=${NV_CUDA_LIB_VERSION} \
+    cuda-nvml-dev-${CUDA_PKG_VERSION} \
+    libnpp-dev-${CUDA_PKG_VERSION}=${NV_LIBNPP_VERSION} \
+    libcusparse-dev-${CUDA_PKG_VERSION}=${NV_LIBCUSPARSE_VERSION} \
+    libcublas-dev-${CUDA_PKG_VERSION}=${NV_LIBCUBLAS_VERSION} \
+    libcudnn9-dev-cuda-13=${NV_CUDNN_VERSION} \
+    libcudnn9-headers-cuda-13=${NV_CUDNN_VERSION} \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Install runtime dependencies.
 # Python 3.12 ships in Ubuntu 24.04 main, so no deadsnakes PPA needed.
 RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
@@ -750,8 +772,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
 # Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
 COPY --from=framework_final /opt/sglang/lib/python3.12/site-packages /opt/sglang/lib/python3.12/site-packages
 
-# Copy SGLang workspace
-COPY --from=framework_final /sgl-workspace /sgl-workspace
+# Keep installed extensions and sources, excluding Cargo's intermediate output.
+COPY --from=framework_final --exclude=**/target /sgl-workspace /sgl-workspace
 
 # Copy sgl-model-gateway binary
 COPY --from=framework_final /opt/sglang/bin/sgl-model-gateway /opt/sglang/bin/sgl-model-gateway
