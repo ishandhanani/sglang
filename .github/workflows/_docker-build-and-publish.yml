@@ -7,7 +7,7 @@ on:
   workflow_call:
     inputs:
       docker_target:
-        description: "Dockerfile target stage (framework or runtime)"
+        description: "Dockerfile target stage (framework_final or runtime)"
         required: true
         type: string
       sgl_version:
@@ -39,6 +39,16 @@ on:
         required: false
         type: string
         default: "lmsysorg/sglang"
+      dependency_cache_key:
+        description: "Refresh key for unpinned dependencies; empty uses the current UTC date"
+        required: false
+        type: string
+        default: ""
+      image_compression:
+        description: "Layer compression: gzip (compatible default) or zstd for supporting runtimes"
+        required: false
+        type: string
+        default: "gzip"
 
 jobs:
   build-x86:
@@ -49,6 +59,9 @@ jobs:
       TAG_CONFIG: ${{ inputs.tag_config }}
       SGL_VERSION: ${{ inputs.sgl_version }}
       IMAGE_REPO: ${{ inputs.image_repo }}
+      DOCKER_TARGET: ${{ inputs.docker_target }}
+      IMAGE_COMPRESSION: ${{ inputs.image_compression }}
+      DEPENDENCY_CACHE_KEY: ${{ inputs.dependency_cache_key }}
     outputs:
       digest-cu130: ${{ steps.build-cu130.outputs.digest }}
     steps:
@@ -68,6 +81,17 @@ jobs:
           set -euo pipefail
           BUILD_COMMIT="$(git rev-parse HEAD)"
           BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          case "${IMAGE_COMPRESSION}" in
+            gzip|zstd) ;;
+            *) echo "Unsupported image compression: ${IMAGE_COMPRESSION}" >&2; exit 1 ;;
+          esac
+          case "${DOCKER_TARGET}" in
+            framework_final|runtime) ;;
+            *) echo "Unsupported Docker target: ${DOCKER_TARGET}" >&2; exit 1 ;;
+          esac
+          BUILDER_NAME="sglang-${RUNNER_NAME//[^a-zA-Z0-9_.-]/-}-cu130"
+          echo "BUILDER_NAME=${BUILDER_NAME}" >> "$GITHUB_ENV"
+          echo "DEPENDENCY_CACHE_EPOCH=${DEPENDENCY_CACHE_KEY:-$(date -u +%Y-%m-%d)}" >> "$GITHUB_ENV"
           python3 scripts/ci/utils/docker_build_metadata_args.py \
             --cuda cu130 \
             --tag-config "${TAG_CONFIG}" \
@@ -81,24 +105,27 @@ jobs:
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
-          docker-images: true
+          docker-images: false
           android: true
           dotnet: true
           haskell: true
           large-packages: true
           swap-storage: true
 
-      - name: Prune Docker to reclaim disk space
-        run: |
-          docker buildx prune --filter "until=72h" -f
-          docker system prune -af --filter "until=72h"
-          docker volume prune -af
-
-      - name: Set up Docker Buildx
+      - name: Set up persistent Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          name: ${{ env.BUILDER_NAME }}
+          keep-state: true
+          buildkitd-config: docker/buildkitd.toml
+
+      - name: Bound old Docker cache usage
+        run: |
+          docker buildx prune --builder "${BUILDER_NAME}" --filter "until=72h" --keep-storage 150GB -f
+          docker image prune -af --filter "until=72h"
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -113,18 +140,22 @@ jobs:
           mapfile -t METADATA_ARGS < /tmp/docker-metadata-cu130.args
 
           docker buildx build \
-            --target ${{ inputs.docker_target }} \
+            --target "${DOCKER_TARGET}" \
             --platform linux/amd64 \
-            --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
+            --pull \
+            --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true,compression=${IMAGE_COMPRESSION},compression-level=6" \
+            --cache-from "type=registry,ref=${IMAGE_REPO}:buildcache-cu130-amd64-framework_final" \
+            --cache-from "type=registry,ref=${IMAGE_REPO}:buildcache-cu130-amd64-runtime" \
+            --cache-to "type=registry,ref=${IMAGE_REPO}:buildcache-cu130-amd64-${DOCKER_TARGET},mode=max,compression=${IMAGE_COMPRESSION}" \
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=13.0.3 \
             --build-arg BUILD_TYPE=all \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg "DEPENDENCY_CACHE_EPOCH=${DEPENDENCY_CACHE_EPOCH}" \
             "${METADATA_ARGS[@]}" \
             ${VERSION_ARG} \
             ${{ inputs.extra_build_args }} \
             --metadata-file /tmp/metadata-cu130.json \
-            --no-cache \
             .
 
           DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130.json'))['containerimage.digest'])")
@@ -139,6 +170,9 @@ jobs:
       TAG_CONFIG: ${{ inputs.tag_config }}
       SGL_VERSION: ${{ inputs.sgl_version }}
       IMAGE_REPO: ${{ inputs.image_repo }}
+      DOCKER_TARGET: ${{ inputs.docker_target }}
+      IMAGE_COMPRESSION: ${{ inputs.image_compression }}
+      DEPENDENCY_CACHE_KEY: ${{ inputs.dependency_cache_key }}
     outputs:
       digest-cu130: ${{ steps.build-cu130.outputs.digest }}
     steps:
@@ -158,6 +192,17 @@ jobs:
           set -euo pipefail
           BUILD_COMMIT="$(git rev-parse HEAD)"
           BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          case "${IMAGE_COMPRESSION}" in
+            gzip|zstd) ;;
+            *) echo "Unsupported image compression: ${IMAGE_COMPRESSION}" >&2; exit 1 ;;
+          esac
+          case "${DOCKER_TARGET}" in
+            framework_final|runtime) ;;
+            *) echo "Unsupported Docker target: ${DOCKER_TARGET}" >&2; exit 1 ;;
+          esac
+          BUILDER_NAME="sglang-${RUNNER_NAME//[^a-zA-Z0-9_.-]/-}-cu130"
+          echo "BUILDER_NAME=${BUILDER_NAME}" >> "$GITHUB_ENV"
+          echo "DEPENDENCY_CACHE_EPOCH=${DEPENDENCY_CACHE_KEY:-$(date -u +%Y-%m-%d)}" >> "$GITHUB_ENV"
           python3 scripts/ci/utils/docker_build_metadata_args.py \
             --cuda cu130 \
             --tag-config "${TAG_CONFIG}" \
@@ -167,17 +212,20 @@ jobs:
             --build-url "${BUILD_URL}" \
             > /tmp/docker-metadata-cu130.args
 
-      - name: Prune Docker to reclaim disk space
-        run: |
-          docker buildx prune --filter "until=72h" -f
-          docker system prune -af --filter "until=72h"
-          docker volume prune -af
-
-      - name: Set up Docker Buildx
+      - name: Set up persistent Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          name: ${{ env.BUILDER_NAME }}
+          keep-state: true
+          buildkitd-config: docker/buildkitd.toml
+
+      - name: Bound old Docker cache usage
+        run: |
+          docker buildx prune --builder "${BUILDER_NAME}" --filter "until=72h" --keep-storage 150GB -f
+          docker image prune -af --filter "until=72h"
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -192,18 +240,22 @@ jobs:
           mapfile -t METADATA_ARGS < /tmp/docker-metadata-cu130.args
 
           docker buildx build \
-            --target ${{ inputs.docker_target }} \
+            --target "${DOCKER_TARGET}" \
             --platform linux/arm64 \
-            --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
+            --pull \
+            --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true,compression=${IMAGE_COMPRESSION},compression-level=6" \
+            --cache-from "type=registry,ref=${IMAGE_REPO}:buildcache-cu130-arm64-framework_final" \
+            --cache-from "type=registry,ref=${IMAGE_REPO}:buildcache-cu130-arm64-runtime" \
+            --cache-to "type=registry,ref=${IMAGE_REPO}:buildcache-cu130-arm64-${DOCKER_TARGET},mode=max,compression=${IMAGE_COMPRESSION}" \
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=13.0.3 \
             --build-arg BUILD_TYPE=all \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg "DEPENDENCY_CACHE_EPOCH=${DEPENDENCY_CACHE_EPOCH}" \
             "${METADATA_ARGS[@]}" \
             ${VERSION_ARG} \
             ${{ inputs.extra_build_args }} \
             --metadata-file /tmp/metadata-cu130.json \
-            --no-cache \
             .
 
           DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130.json'))['containerimage.digest'])")
@@ -220,7 +272,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}

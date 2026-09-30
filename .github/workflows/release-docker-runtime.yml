@@ -1,6 +1,6 @@
 name: Release Docker Runtime Images
 #
-# Builds and publishes runtime Docker images (production-optimized, ~50% smaller):
+# Builds and publishes runtime Docker images (production environment with CUDA JIT support):
 #   - lmsysorg/sglang:v{version}-runtime, lmsysorg/sglang:latest-runtime
 #   - lmsysorg/sglang:v{version}-cu130-runtime, lmsysorg/sglang:latest-cu130-runtime
 #
