@@ -87,6 +87,28 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
     )
 
 
+def validate_memory_saver_hook_mode(cfg: Any) -> None:
+    """``--memory-saver-hook-mode`` only selects how torch_memory_saver hooks allocations.
+
+    It means nothing without ``--enable-memory-saver``, and ``preload`` (LD_PRELOAD
+    interception of cudaMalloc) does not exist on Intel XPU, where torch_memory_saver
+    only ships the in-process pluggable allocator.
+    """
+    mode = cfg.memory_saver_hook_mode
+    if mode is None:
+        return
+    if not cfg.enable_memory_saver:
+        raise ValueError(
+            f"--memory-saver-hook-mode {mode} requires --enable-memory-saver: the hook mode only "
+            "chooses how torch_memory_saver intercepts allocations once the memory saver is on."
+        )
+    if mode == "preload" and cfg.device == "xpu":
+        raise ValueError(
+            "--memory-saver-hook-mode preload is not available on Intel XPU: LD_PRELOAD "
+            "interception is CUDA/HIP-only. Use --memory-saver-hook-mode torch (the XPU default)."
+        )
+
+
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
@@ -113,6 +135,8 @@ def check_server_args(server_args: Any):
 
     if cfg.pp_size > 1:
         check_pipeline_parallel_compat(cfg)
+
+    validate_memory_saver_hook_mode(cfg)
 
     assert not (cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention), (
         "multi-node data parallel is not supported unless dp attention!"

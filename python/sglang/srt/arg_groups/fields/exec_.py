@@ -56,6 +56,18 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Allow saving memory using release_memory_occupation and resume_memory_occupation",
     ] = False
+    memory_saver_hook_mode: A[
+        Optional[str],
+        Arg(
+            help="How torch_memory_saver intercepts allocations under --enable-memory-saver. "
+            "'preload' hooks cudaMalloc through LD_PRELOAD in every scheduler subprocess and is "
+            "the only mode that can pause CUDA-graph memory. 'torch' installs an in-process "
+            "pluggable allocator instead: no LD_PRELOAD, graph memory stays resident, and it is "
+            "the mode an external memory owner (a weight cache or a VMM memory service) plugs "
+            "into. Default: 'torch' on Intel XPU, 'preload' elsewhere.",
+            choices=["preload", "torch"],
+        ),
+    ] = None
     enable_weights_cpu_backup: A[
         bool,
         "Save model weights (both main model and draft model, if any) to CPU memory during release_weights_occupation and resume_weights_occupation",
