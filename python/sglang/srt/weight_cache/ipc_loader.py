@@ -35,7 +35,7 @@ from .protocol import (
     recv_msg,
     send_msg,
 )
-from .transport import TORCH_IPC_BACKEND, get_client_transport_backend
+from .transport import TORCH_IPC_BACKEND, VMM_FD_BACKEND, get_client_transport_backend
 
 logger = logging.getLogger(__name__)
 
@@ -169,9 +169,17 @@ class IpcModelLoader(BaseModelLoader):
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
 
-        # The model now points into the daemon's GPU memory via CUDA IPC. If the
-        # daemon dies, those pointers dangle, so watch it and fail loud.
-        self._start_daemon_liveness_watchdog(cache_data.get("pid"))
+        if self._transport_backend.name == VMM_FD_BACKEND:
+            # Imported VMM mappings keep the physical memory alive on their own, so
+            # the model survives the daemon; nothing to watch.
+            logger.info(
+                "[IpcModelLoader] vmm_fd: weights are mapped from imported VMM "
+                "handles and stay valid if the daemon exits; no liveness watchdog"
+            )
+        else:
+            # The model now points into the daemon's GPU memory via CUDA IPC. If the
+            # daemon dies, those pointers dangle, so watch it and fail loud.
+            self._start_daemon_liveness_watchdog(cache_data.get("pid"))
 
         logger.info(
             f"[IpcModelLoader] Loaded model via IPC (mode={self.weight_cache_mode}), "
@@ -570,6 +578,7 @@ class IpcModelLoader(BaseModelLoader):
 
             backend_name = result.get("transport_backend", TORCH_IPC_BACKEND)
             self._transport_backend = get_client_transport_backend(backend_name)
+            self._transport_backend.bind_device(int(device_config.gpu_id))
             result = self._transport_backend.recv_fetch_state_response(sock, result)
             return result
 
