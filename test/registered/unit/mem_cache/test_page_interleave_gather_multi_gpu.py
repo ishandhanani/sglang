@@ -61,7 +61,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=77, stage="base-b", runner_config="2-gpu-large")
 
 _GATHER_WORLD = 2
 _GATHER_LAYER_NUM = 4
