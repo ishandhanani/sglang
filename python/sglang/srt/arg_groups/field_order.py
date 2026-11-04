@@ -512,6 +512,7 @@ POSITIONAL_FIELD_ORDER = (
     "_radix_eviction_policy_explicitly_set",
     "hicache_host_memory_fraction",
     "enable_linker_mla_dedup",
+    "prefetch_max_tokens",
     "_swa_full_tokens_ratio_explicitly_set",
     "swa_prefix_tails",
     "enable_encoder_swa_bounded_replay",

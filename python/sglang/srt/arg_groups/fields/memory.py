@@ -288,6 +288,10 @@ class Memory(msgspec.Struct):
         bool,
         "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",
     ] = False
+    prefetch_max_tokens: A[
+        Optional[int],
+        "Longest prefix a cache hint (PrefetchReqInput) may prefetch from the external linker, in tokens; longer hints are refused and a hit is truncated to the KV headroom left after the running batch's decode reserve. Defaults to the context length.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention

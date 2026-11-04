@@ -732,6 +732,38 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 10,
             ),
         )
+        self.prefetch_latency_seconds = Histogram(
+            name="sglang:prefetch_latency_seconds",
+            documentation="Histogram of prefetch hint handling time in seconds, "
+            "from scheduler dispatch to the loaded tail joining the radix tree.",
+            labelnames=labels.keys(),
+            buckets=(
+                0.001,
+                0.002,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1,
+                2.5,
+                5,
+                10,
+            ),
+        )
+        self.prefetch_loaded_tokens_total = Counter(
+            name="sglang:prefetch_loaded_tokens_total",
+            documentation="Tokens /prefetch loaded from the external store into "
+            "the radix tree.",
+            labelnames=labels.keys(),
+        )
+        self.prefetch_requests_total = Counter(
+            name="sglang:prefetch_requests_total",
+            documentation="Completed prefetch requests by outcome.",
+            labelnames=list(labels.keys()) + ["outcome"],
+        )
         self.linker_phase_seconds = Histogram(
             name="sglang:linker_phase_seconds",
             documentation="Per store-hit phase wall-clock in seconds, by phase: "
@@ -1582,6 +1614,16 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 ).observe(value / 1000.0)
         for layer_ms in timing.load_layers_ms:
             self._log_histogram(self.linker_load_layer_seconds, layer_ms / 1000.0)
+
+    def observe_prefetch(
+        self, loaded_tokens: int, latency_ms: float, success: bool
+    ) -> None:
+        self._log_histogram(self.prefetch_latency_seconds, latency_ms / 1000.0)
+        if loaded_tokens:
+            self.prefetch_loaded_tokens_total.labels(**self.labels).inc(loaded_tokens)
+        self.prefetch_requests_total.labels(
+            **self.labels, outcome="landed" if success else "failed"
+        ).inc()
 
     def observe_kv_transfer_bootstrap(
         self,

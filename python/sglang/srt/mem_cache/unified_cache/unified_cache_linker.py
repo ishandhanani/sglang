@@ -430,6 +430,13 @@ class UnifiedCacheLinkerWrapper:
         timing.sync_ms = (time.perf_counter() - sync_start) * 1000.0
         return hit_pages
 
+    def mark_timing_kind(self, rid: str, kind: str) -> None:
+        """Label the open timing record of ``rid`` (``prefetch`` for a
+        controller-driven load; records start as ``request``)."""
+        timing = self.timings.get(rid)
+        if timing is not None:
+            timing.kind = kind
+
     def adopt_load_timing(self, counter_index: int, rids: Sequence[str]) -> None:
         """Copy the load thread's per-batch timings onto the batch's requests."""
         load_timing = getattr(self.cache_linker, "load_timings", {}).pop(

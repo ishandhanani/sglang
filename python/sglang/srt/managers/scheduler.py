@@ -170,6 +170,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PrefetchReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ReleaseUocrDocReqInput,
@@ -281,6 +282,9 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
+)
+from sglang.srt.managers.scheduler_components.prefetch_wrapper import (
+    SchedulerPrefetchWrapper,
 )
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
@@ -855,6 +859,17 @@ class Scheduler(
         )
         self.metrics_collector = self.metrics_collector_context.collector
 
+    @property
+    def served_dp_rank(self) -> int:
+        """Index of the KV cache this scheduler serves: the attention-DP rank
+        under DP attention, else the pure-DP replica (0 without DP)."""
+        from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
+
+        parallel = get_parallel()
+        return select_kv_publisher_dp_rank(
+            parallel.attn_dp_size, parallel.attn_dp_rank, parallel.dp_rank
+        )
+
     def init_ipc_channels(self, port_args: PortArgs):
         is_rank_zero = (
             get_parallel().pp_rank == 0
@@ -1392,6 +1407,11 @@ class Scheduler(
             is_fully_idle=self.is_fully_idle,
             send_output=self.send_control_output,
         )
+        self.prefetch_wrapper = SchedulerPrefetchWrapper(
+            scheduler=self,
+            send_output=self.send_control_output,
+            served_dp_rank=self.served_dp_rank,
+        )
         self._init_linker_load_observer()
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
@@ -1890,6 +1910,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
+                (PrefetchReqInput, self.prefetch_wrapper.handle),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -2019,6 +2040,7 @@ class Scheduler(
         return result_dict
 
     def release_host_resources(self) -> None:
+        self.prefetch_wrapper.abort()
         self.request_receiver.close()
         if self.uocr_runtime is not None:
             self.uocr_runtime.close()
@@ -2312,6 +2334,7 @@ class Scheduler(
                     self.send_control_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
+        self.prefetch_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
@@ -5615,8 +5638,15 @@ class Scheduler(
             self.disaggregation_mode == DisaggregationMode.DECODE
             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
         )
+        # A prefetch load likewise holds request-private slots (and a request
+        # row) that no queued or running request accounts for until it lands.
+        prefetch_pending = self.prefetch_wrapper.has_pending()
         with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
-            if not self.enable_hisparse and not deferred_pending:
+            if (
+                not self.enable_hisparse
+                and not deferred_pending
+                and not prefetch_pending
+            ):
                 has_leak, messages = self.invariant_checker._check_all_pools(
                     self.pool_stats_observer.get_pool_stats(),
                 )
@@ -5652,9 +5682,10 @@ class Scheduler(
             self.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
 
-        if self.deferred_responses.has_pending():
-            # Held responses are released by polling, not by a socket event:
-            # keep polling, and yield the GIL to the completion's worker.
+        if self.deferred_responses.has_pending() or self.prefetch_wrapper.has_pending():
+            # Held responses and an in-flight prefetch are released by
+            # polling, not by a socket event: keep polling, and yield the GIL
+            # to the completion's worker.
             time.sleep(0)
         else:
             # sleep until next event
@@ -5710,6 +5741,8 @@ class Scheduler(
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
             idle &= not self.request_receiver.has_pending()
+            # A prefetch holds a request row and private KV slots until it lands.
+            idle &= not self.prefetch_wrapper.has_pending()
             if self.uocr_runtime is not None:
                 idle &= not self.uocr_runtime.blocks_flush(
                     ignore_waiting=ignore_waiting
