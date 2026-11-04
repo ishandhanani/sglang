@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+import time
+from collections.abc import Callable
 from copy import deepcopy
 from queue import Empty, Queue
 
@@ -137,9 +139,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self._broadcast_loaded_layers if self.mla_broadcaster else None,
         )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
+        # (bytes, pages, wall-clock ms) per landed load batch; set by the
+        # scheduler to feed its metrics. Called from the load thread.
+        self.load_observer: Callable[[int, int, float], None] | None = None
+        # counter index -> {"queue_wait_ms", "total_ms", "layers_ms", "done_at"}
+        # of a landed load batch; the tree-side wrapper pops it.
+        self.load_timings: dict[int, dict] = {}
         self.gc_frozen = False
         self.load_queue: Queue[
-            tuple[int, dict[str, list[PoolTransfer]], object] | None
+            tuple[int, dict[str, list[PoolTransfer]], object, float] | None
         ] = Queue()
         self.offload_queue: Queue[
             tuple[list[PoolTransfer], int, list[object], str | None] | None
@@ -264,7 +272,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if broadcaster is not None:
             self.broadcast_loads[counter_index] = (0, prepared, ready)
         if broadcaster is None or broadcaster.is_src:
-            self.load_queue.put((counter_index, pending, ready))
+            self.load_queue.put((counter_index, pending, ready, time.perf_counter()))
         self.stats["load"] += len(pending)
         return counter_index
 
@@ -294,10 +302,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, pending, ready = task
+                counter_index, pending, ready, queued_at = task
                 try:
                     ready.synchronize()
-                    self.load_layer_wise(counter_index, list(pending.values()))
+                    self.load_layer_wise(
+                        counter_index, list(pending.values()), queued_at=queued_at
+                    )
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
@@ -305,13 +315,25 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.load_queue.task_done()
 
     def load_layer_wise(
-        self, counter_index: int, request_transfers: list[list[PoolTransfer]]
+        self,
+        counter_index: int,
+        request_transfers: list[list[PoolTransfer]],
+        queued_at: float | None = None,
     ) -> None:
         started = []
+        load_start = time.perf_counter()
+        queue_wait_ms = (
+            (load_start - queued_at) * 1000.0 if queued_at is not None else None
+        )
+        layer_done_at = []
+        num_bytes = 0
+        num_pages = 0
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for transfers in request_transfers:
                 for transfer in transfers:
+                    if transfer.name == PoolName.KV:
+                        num_pages += len(transfer.keys)
                     keys, locations = batches.setdefault(transfer.name, ([], []))
                     component_keys, _ = self.storage._get_hybrid_page_component_keys(
                         list(transfer.keys), transfer
@@ -356,7 +378,32 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             f"layer={layer}: transferred={result}, "
                             f"expected={expected}"
                         )
+                    num_bytes += sum(expected)
+                layer_done_at.append(time.perf_counter())
                 self.layer_done_counter.complete(counter_index, layer)
+            done_at = time.perf_counter()
+            elapsed_ms = (done_at - load_start) * 1000.0
+            self.load_timings[counter_index] = {
+                "queue_wait_ms": queue_wait_ms,
+                "total_ms": elapsed_ms,
+                "layers_ms": [
+                    (t1 - t0) * 1000.0
+                    for t0, t1 in zip([load_start] + layer_done_at[:-1], layer_done_at)
+                ],
+                "done_at": done_at,
+            }
+            logger.debug(
+                "Mooncake direct linker load: requests=%d pages=%d bytes=%d "
+                "layers=%d elapsed_ms=%.1f throughput_gb_s=%.2f",
+                len(request_transfers),
+                num_pages,
+                num_bytes,
+                self.num_layers,
+                elapsed_ms,
+                num_bytes / max(elapsed_ms, 1e-3) / 1e6,
+            )
+            if self.load_observer is not None:
+                self.load_observer(num_bytes, num_pages, elapsed_ms)
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
@@ -419,6 +466,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def reset(self) -> None:
         self.pending_loads.clear()
         self.load_queue.join()
+        self.load_timings.clear()
         self.offload_queue.join()
         self.broadcast_loads.clear()
         while True:

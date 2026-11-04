@@ -1392,6 +1392,7 @@ class Scheduler(
             is_fully_idle=self.is_fully_idle,
             send_output=self.send_control_output,
         )
+        self._init_linker_load_observer()
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
@@ -2438,6 +2439,19 @@ class Scheduler(
         self.profiler_manager = SchedulerProfilerManager(
             get_forward_ct=lambda: self.forward_ct,
         )
+
+    def _init_linker_load_observer(self) -> None:
+        """Route per-load linker telemetry into the scheduler's metrics."""
+        if self.metrics_collector is None:
+            return
+        linker = getattr(self.tree_cache, "linker", None)
+        if linker is None:
+            return
+        linker.timing_observer = self.metrics_collector.observe_linker_timing
+        if hasattr(linker.cache_linker, "load_observer"):
+            linker.cache_linker.load_observer = (
+                self.metrics_collector.observe_linker_load
+            )
 
     def init_weight_updater(self) -> None:
         self.weight_updater = SchedulerWeightUpdaterManager(

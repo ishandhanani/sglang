@@ -23,11 +23,12 @@ reaches nothing but its own requests, which the scheduler aborts.
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
@@ -236,6 +237,49 @@ class UnifiedCacheLinker(ABC):
         """Quiesce all transfers and release backend resources."""
 
 
+@dataclass
+class L3Timing:
+    """Where the time goes between a request's match and its loaded KV joining
+    the tree. ``kind`` is ``prefetch`` for a controller-driven load, else
+    ``request``. Durations in ms; ``None`` means the phase did not run."""
+
+    rid: str
+    kind: str
+    started_at: float
+    pages: int = 0
+    tree_walk_ms: float = 0.0
+    hash_ms: float = 0.0
+    lookup_ms: float = 0.0
+    sync_ms: float = 0.0
+    load_back_ms: Optional[float] = None
+    queue_wait_ms: Optional[float] = None
+    load_total_ms: Optional[float] = None
+    load_layers_ms: list[float] = field(default_factory=list)
+    load_done_at: Optional[float] = None
+    complete_to_insert_ms: Optional[float] = None
+    match_to_insert_ms: Optional[float] = None
+
+    def log_line(self) -> str:
+        layers = self.load_layers_ms
+        layer_summary = (
+            f"{min(layers):.2f}/{sum(layers) / len(layers):.2f}/{max(layers):.2f}"
+            if layers
+            else "-"
+        )
+        fmt = lambda v: "-" if v is None else f"{v:.2f}"
+        return (
+            f"L3 timing rid={self.rid} kind={self.kind} pages={self.pages} "
+            f"tree_walk_ms={self.tree_walk_ms:.2f} hash_ms={self.hash_ms:.2f} "
+            f"lookup_ms={self.lookup_ms:.2f} sync_ms={self.sync_ms:.2f} "
+            f"load_back_ms={fmt(self.load_back_ms)} "
+            f"queue_wait_ms={fmt(self.queue_wait_ms)} "
+            f"load_total_ms={fmt(self.load_total_ms)} "
+            f"layer_ms(min/mean/max)={layer_summary} "
+            f"complete_to_insert_ms={fmt(self.complete_to_insert_ms)} "
+            f"match_to_insert_ms={fmt(self.match_to_insert_ms)}"
+        )
+
+
 class ExternalCacheHitMarker(NamedTuple):
     """What ``match`` found in the external store, consumed by ``load_back``.
 
@@ -293,6 +337,9 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
+        # rid -> phase timings of a store hit, logged when its KV joins the tree.
+        self.timings: dict[str, L3Timing] = {}
+        self.timing_observer: Optional[Callable[[L3Timing], None]] = None
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -314,7 +361,10 @@ class UnifiedCacheLinkerWrapper:
         if device_hit_len >= len(key):
             return result
 
+        timing = self._new_timing(req.rid)
+        hash_start = time.perf_counter()
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
+        timing.hash_ms = (time.perf_counter() - hash_start) * 1000.0
         if not tail_hashes:
             return result
 
@@ -329,14 +379,12 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
-        hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
-            num_pages=len(tail_hashes),
-            device_hit_pages=0,
-        )
+        hit_pages = self._lookup_timed(req.rid, lookup_transfers, timing)
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page
+        timing.pages = hit_pages
+        self.timings[req.rid] = timing
 
         swa_transfer = by_pool.get(PoolName.SWA)
         swa_host_hit_length = (
@@ -359,6 +407,58 @@ class UnifiedCacheLinkerWrapper:
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
         )
+
+    def _new_timing(self, rid: str) -> L3Timing:
+        timing = L3Timing(rid=rid, kind="request", started_at=time.perf_counter())
+        # The tree walk ran just before, timed by the cache.
+        timing.tree_walk_ms = getattr(self.cache, "_l3_tree_walk_ms", 0.0)
+        timing.started_at -= timing.tree_walk_ms / 1000.0
+        return timing
+
+    def _lookup_timed(
+        self, rid: str, lookup_transfers: list[PoolTransfer], timing: L3Timing
+    ) -> int:
+        """Store lookup plus the cross-rank intersection, each timed."""
+        lookup_start = time.perf_counter()
+        restorable = self.cache_linker.lookup(rid, lookup_transfers)
+        sync_start = time.perf_counter()
+        timing.lookup_ms = (sync_start - lookup_start) * 1000.0
+        kv = next(t for t in lookup_transfers if t.name == PoolName.KV)
+        hit_pages = self._sync_restorable_prefix(
+            restorable, num_pages=len(kv.keys), device_hit_pages=0
+        )
+        timing.sync_ms = (time.perf_counter() - sync_start) * 1000.0
+        return hit_pages
+
+    def adopt_load_timing(self, counter_index: int, rids: Sequence[str]) -> None:
+        """Copy the load thread's per-batch timings onto the batch's requests."""
+        load_timing = getattr(self.cache_linker, "load_timings", {}).pop(
+            counter_index, None
+        )
+        if load_timing is None:
+            return
+        for rid in rids:
+            timing = self.timings.get(rid)
+            if timing is None:
+                continue
+            timing.queue_wait_ms = load_timing.get("queue_wait_ms")
+            timing.load_total_ms = load_timing.get("total_ms")
+            timing.load_layers_ms = list(load_timing.get("layers_ms", ()))
+            timing.load_done_at = load_timing.get("done_at")
+
+    def note_insert(self, rid: str) -> None:
+        """The request's KV is about to join the tree: close its timing record,
+        log it and hand it to the metrics observer."""
+        timing = self.timings.pop(rid, None)
+        if timing is None:
+            return
+        now = time.perf_counter()
+        if timing.load_done_at is not None:
+            timing.complete_to_insert_ms = (now - timing.load_done_at) * 1000.0
+        timing.match_to_insert_ms = (now - timing.started_at) * 1000.0
+        logger.debug(timing.log_line())
+        if self.timing_observer is not None:
+            self.timing_observer(timing)
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
@@ -415,6 +515,8 @@ class UnifiedCacheLinkerWrapper:
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
             return 0, req.last_node
+        load_back_start = time.perf_counter()
+        timing = self.timings.get(req.rid)
 
         device_hit_len = hit.device_hit_len
         tail_hashes = hit.tail_hashes
@@ -480,6 +582,8 @@ class UnifiedCacheLinkerWrapper:
             req.swa_branching_seqlen = None
         self.private_load_indices[req.rid] = full_transfer.device_indices
         self.inflight_load_rids.append(req.rid)
+        if timing is not None:
+            timing.load_back_ms = (time.perf_counter() - load_back_start) * 1000.0
         return len(full_transfer.device_indices), req.last_node
 
     def _update_load(
@@ -637,6 +741,7 @@ class UnifiedCacheLinkerWrapper:
             [int(self.cache_linker.finish_layer_wise_loading(index))],
             dtype=torch.int,
         )
+        self.adopt_load_timing(index, rids)
         self.cache._all_reduce_attn_groups(landed, torch.distributed.ReduceOp.MIN)
         for rid in rids:
             self.private_load_indices.pop(rid, None)
@@ -652,6 +757,7 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
+        self.timings.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
@@ -667,6 +773,7 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self.timings.pop(rid, None)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):

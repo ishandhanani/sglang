@@ -6,7 +6,7 @@ from array import array
 from collections import defaultdict
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 import torch
@@ -1761,7 +1761,7 @@ class TestTransferReadyEvents(CustomTestCase):
                 call.record_transfer_ready(),
                 call.indices_ready.synchronize(),
                 call.forward_done.synchronize(),
-                call.load_layer_wise(3, [["transfer"]]),
+                call.load_layer_wise(3, [["transfer"]], queued_at=ANY),
             ],
         )
         linker.layer_done_counter.fail.assert_not_called()
