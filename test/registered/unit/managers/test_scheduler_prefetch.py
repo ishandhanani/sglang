@@ -423,11 +423,92 @@ class TestSchedulerPrefetch(unittest.TestCase):
 
         self.assertFalse(scheduler.prefetch_wrapper.has_pending())
         linker.cache_linker.finish_layer_wise_loading.assert_called_once_with(0)
+        linker.cache_linker.discard_broadcast.assert_called_once_with(0)
         _, kwargs = scheduler.release_kv_cache.call_args
         self.assertFalse(kwargs["checkpoint"])
         self.assertTrue(req.skip_radix_cache_insert)
         out = scheduler.send_output.call_args.args[0]
         self.assertIn("aborted", out.error)
+
+    def test_mla_dedup_broadcasts_layers_as_they_land_then_inserts(self):
+        """With --enable-linker-mla-dedup the completion poll launches the
+        broadcast of the layers the source has landed so far (one reduction
+        per iteration), deferred while another batch's layer broadcasts are
+        pending, and the insert waits for the final broadcast event."""
+        scheduler = self._new_scheduler()
+        linker = scheduler.linker
+        backend = linker.cache_linker
+        backend.pending_broadcast.return_value = True
+        backend.has_other_broadcasts.return_value = True
+        event = MagicMock()
+        event.query.return_value = False
+
+        def launch(index, last_layer):
+            if last_layer == NUM_LAYERS - 1:
+                backend.pending_broadcast.return_value = False
+                return event
+            return None
+
+        backend.broadcast_bulk_layers.side_effect = launch
+        self._handle(scheduler)
+        linker.counter.complete(0, 0)
+        reduces = scheduler.tree_cache._all_reduce_attn_groups.call_count
+
+        # One layer landed, but a request batch is still broadcasting: wait.
+        self._check_pending(scheduler)
+        backend.broadcast_bulk_layers.assert_not_called()
+
+        # Clear: the landed layer is broadcast while the rest still loads.
+        backend.has_other_broadcasts.return_value = False
+        self._check_pending(scheduler)
+        backend.broadcast_bulk_layers.assert_called_once_with(0, 0)
+        backend.finish_layer_wise_loading.assert_not_called()
+
+        # Nothing new landed: no launch, no finish.
+        self._check_pending(scheduler)
+        backend.broadcast_bulk_layers.assert_called_once()
+
+        for layer in range(1, NUM_LAYERS):
+            linker.counter.complete(0, layer)
+        self._check_pending(scheduler)
+        self.assertEqual(
+            backend.broadcast_bulk_layers.call_args_list[-1].args, (0, NUM_LAYERS - 1)
+        )
+        backend.finish_layer_wise_loading.assert_called_once_with(0)
+        # The read landed and every layer is launched; the insert waits for
+        # the broadcast event on every rank.
+        self.assertTrue(scheduler.prefetch_wrapper.has_pending())
+        scheduler.release_kv_cache.assert_not_called()
+
+        event.query.return_value = True
+        self._check_pending(scheduler)
+        self.assertFalse(scheduler.prefetch_wrapper.has_pending())
+        _, kwargs = scheduler.release_kv_cache.call_args
+        self.assertTrue(kwargs["checkpoint"])
+        backend.discard_broadcast.assert_not_called()
+        out = scheduler.send_output.call_args.args[0]
+        self.assertIsNone(out.error)
+        self.assertEqual(out.loaded_tokens, STORE_HIT)
+        # One all-reduce per poll.
+        self.assertEqual(
+            scheduler.tree_cache._all_reduce_attn_groups.call_count - reduces, 5
+        )
+
+    def test_mla_dedup_failed_load_drops_the_broadcast(self):
+        scheduler = self._new_scheduler()
+        linker = scheduler.linker
+        backend = linker.cache_linker
+        backend.pending_broadcast.return_value = True
+        self._handle(scheduler)
+        linker.counter.fail(0, RuntimeError("store read failed"))
+
+        self._check_pending(scheduler)
+
+        self.assertFalse(scheduler.prefetch_wrapper.has_pending())
+        backend.discard_broadcast.assert_called_once_with(0)
+        backend.broadcast_bulk_layers.assert_not_called()
+        _, kwargs = scheduler.release_kv_cache.call_args
+        self.assertFalse(kwargs["checkpoint"])
 
     def test_hint_socket_round_trip(self):
         """A DEALER (and a REQ) peer sends one msgpack frame on the hint

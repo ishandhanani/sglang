@@ -1842,6 +1842,83 @@ class TestTransferReadyEvents(CustomTestCase):
             with self.assertRaises(ValueError):
                 _layers_per_get({"k": bad}, "k", 1)
 
+    def test_mla_bulk_broadcast_hooks(self):
+        """A bulk load with MLA dedup is broadcast from the completion poll,
+        layer range by layer range as the source lands them, on the caller's
+        stream, behind one event recorded after the last layer. While it is
+        in progress request batches read for themselves; a failed one is
+        dropped."""
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        order = MagicMock()
+        linker.mla_broadcaster = order.broadcaster
+        linker.num_layers = 3
+        linker.bulk_broadcast_index = None
+        ready = TransferReady([order.indices_ready])
+        linker.broadcast_loads = {3: (0, "prepared", ready), 7: (1, "other", ready)}
+        self.assertTrue(linker.pending_broadcast(3))
+        self.assertFalse(linker.pending_broadcast(9))
+        self.assertTrue(linker.has_other_broadcasts(3))
+        device = MagicMock(name="device_module")
+        device.current_stream.return_value = order.stream
+        device.Event.return_value = order.event
+        with patch(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker.device_module",
+            device,
+        ):
+            self.assertIsNone(linker.broadcast_bulk_layers(9, 2))
+            self.assertIsNone(linker.broadcast_bulk_layers(3, 1))
+            self.assertEqual(linker.bulk_broadcast_index, 3)
+            self.assertIs(linker.broadcast_bulk_layers(3, 2), order.event)
+        self.assertIsNone(linker.bulk_broadcast_index)
+        self.assertEqual(
+            order.mock_calls,
+            [
+                call.stream.wait_event(order.indices_ready),
+                call.broadcaster.broadcast_loaded_layer(0, "prepared"),
+                call.broadcaster.broadcast_loaded_layer(1, "prepared"),
+                call.broadcaster.broadcast_loaded_layer(2, "prepared"),
+                call.event.record(),
+            ],
+        )
+        self.assertEqual(set(linker.broadcast_loads), {7})
+        self.assertFalse(linker.has_other_broadcasts(7))
+        linker.bulk_broadcast_index = 7
+        linker.discard_broadcast(7)
+        linker.discard_broadcast(7)
+        self.assertEqual(linker.broadcast_loads, {})
+        self.assertIsNone(linker.bulk_broadcast_index)
+
+    def test_request_batches_read_for_themselves_during_a_bulk_broadcast(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        order = MagicMock()
+        linker.record_transfer_ready = order.record_transfer_ready
+        order.record_transfer_ready.return_value = TransferReady([order.ev])
+        linker.mla_broadcaster = order.broadcaster
+        linker.tp_group = order.group
+        linker.num_layers = 2
+        linker.layer_done_counter = MagicMock()
+        linker.layer_done_counter.update_producer.return_value = 5
+        linker.gc_frozen = True
+        linker.load_layers_per_get = 1
+        linker.bulk_broadcast_index = 4
+        linker.broadcast_loads = {}
+        linker.pending_loads = {"rid": [PoolTransfer(name=PoolName.KV, keys=["k"])]}
+        linker.stats = {"load": 0}
+        linker.load_queue = queue.Queue()
+
+        def gather(out, digest, group):
+            out[:] = [digest] * len(out)
+
+        with (
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_gather_object", side_effect=gather),
+        ):
+            self.assertEqual(linker.start_layer_wise_loading(), 5)
+        # No broadcast entry: every rank queued its own read.
+        self.assertEqual(linker.broadcast_loads, {})
+        self.assertEqual(linker.load_queue.qsize(), 1)
+        order.broadcaster.prepare_broadcast.assert_not_called()
+
     @staticmethod
     def _bulk_linker(*, num_layers, pages):
         """A MooncakeDirectLinker over a recording fake store and one KV pool

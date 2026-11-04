@@ -145,6 +145,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.mla_broadcaster = None
         self.tp_group = tp_group
         self.broadcast_loads = {}
+        # Counter index of a bulk load whose broadcast is being launched over
+        # several scheduler iterations; request batches read for themselves
+        # meanwhile so the two collectives never interleave.
+        self.bulk_broadcast_index: int | None = None
         if server_args.enable_linker_mla_dedup and rank_replicated and tp_size > 1:
             self.mla_broadcaster = LinkerMLADedupBroadcaster.build(
                 self.pool_group, params.tp_cache_group, params.attn_tp_cache_group
@@ -273,6 +277,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if any(other != digest for other in digests):
                 logger.warning("MLA linker load plans differ; using all-rank reads.")
                 broadcaster = None
+            elif self.bulk_broadcast_index is not None:
+                broadcaster = None
         if not self.pending_loads:
             return -1
         self.freeze_gc_once()
@@ -321,6 +327,35 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 prepared,
                 ready,
             )
+
+    def pending_broadcast(self, counter_index: int) -> bool:
+        return counter_index in self.broadcast_loads
+
+    def has_other_broadcasts(self, counter_index: int) -> bool:
+        # Read from the scheduler thread while the forward thread may drop
+        # entries; the list() snapshot is atomic under the GIL.
+        return any(index != counter_index for index in list(self.broadcast_loads))
+
+    def broadcast_bulk_layers(self, counter_index: int, last_layer: int):
+        if counter_index not in self.broadcast_loads:
+            return None
+        # No forward waits on a bulk load: its broadcasts are launched from
+        # the scheduler's completion poll, on this thread's stream, as the
+        # source's layers land. The event the caller polls before it
+        # publishes the pages is recorded behind the last layer.
+        self.bulk_broadcast_index = counter_index
+        self._broadcast_loaded_layers(counter_index, last_layer)
+        if counter_index in self.broadcast_loads:
+            return None
+        self.bulk_broadcast_index = None
+        landed = device_module.Event()
+        landed.record()
+        return landed
+
+    def discard_broadcast(self, counter_index: int) -> None:
+        self.broadcast_loads.pop(counter_index, None)
+        if self.bulk_broadcast_index == counter_index:
+            self.bulk_broadcast_index = None
 
     def load_thread_func(self) -> None:
         while True:

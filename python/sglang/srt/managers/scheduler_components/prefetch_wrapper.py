@@ -46,6 +46,11 @@ Per page, the path a hit takes:
   layer of every page (``bulk_load_layers_per_get`` chunks them) straight
   into the registered device pages, completing the layer futures
   (``LayerWiseLoadCounter``) as each get lands.
+* With ``--enable-linker-mla-dedup`` only attention-TP rank 0 reads the
+  store; the completion poll launches the NVLink broadcast of each layer on
+  every rank as soon as the ranks agree the source has landed it, so the
+  broadcast overlaps the remaining reads, and the pages are published once
+  the last broadcast has landed everywhere.
 * When every rank agrees the pages landed, the request is released with
   ``checkpoint=True``: ``UnifiedRadixCache.checkpoint_into_tree`` inserts
   ``[0, prefix_len)`` from the request row (the device prefix dedups against
@@ -91,6 +96,10 @@ class _PendingPrefetch:
     started_at: float
     # Set once every rank agreed whether the store read landed.
     landed: Optional[bool] = None
+    # MLA dedup: layers whose broadcast has been launched, and the device
+    # event the peers' copies land on once all of them have.
+    broadcast_layers: int = 0
+    broadcast_event: Optional[torch.cuda.Event] = None
 
 
 class SchedulerPrefetchWrapper:
@@ -148,9 +157,6 @@ class SchedulerPrefetchWrapper:
             # The sliding-window pages of a prefix nobody decoded through are
             # tombstoned on insert; the prefetched prefix would be unusable.
             return "Prefetch is not supported with SWA trees."
-        if getattr(self._linker.cache_linker, "mla_broadcaster", None) is not None:
-            # The dedup broadcast is driven by the forward's per-layer waits.
-            return "Prefetch is not supported with --enable-linker-mla-dedup."
         return None
 
     def _validate(self, recv_req: PrefetchReqInput) -> Optional[str]:
@@ -362,36 +368,81 @@ class SchedulerPrefetchWrapper:
         if pending is None:
             return
         self._pending = None
+        backend = self._linker.cache_linker
         if pending.landed is None:
             # Blocks until every layer future resolved on this rank.
-            self._linker.cache_linker.finish_layer_wise_loading(pending.counter_index)
+            backend.finish_layer_wise_loading(pending.counter_index)
+        # A partially launched broadcast is dropped on every rank alike; the
+        # layers already in flight land in slots that are freed below once
+        # the stream drained them.
+        backend.discard_broadcast(pending.counter_index)
+        if pending.broadcast_event is not None:
+            pending.broadcast_event.synchronize()
+        elif pending.broadcast_layers:
+            torch.cuda.current_stream().synchronize()
         self._finish(pending, landed=False, error="Prefetch aborted.")
 
     def _check_pending(self, pending: _PendingPrefetch) -> None:
-        """Poll the store read with one reduction per scheduler iteration.
-        Every rank must take the same step in the same iteration: loads land
-        at different times per rank and the insert is collective state, so
-        the per-rank verdicts are reduced (MIN) before they are acted on."""
+        """Advance the prefetch one step per scheduler iteration with a single
+        reduction: the store read, the (MLA dedup) broadcast of the layers the
+        source has landed so far, then the insert. Every rank must take the
+        same step in the same iteration: loads land at different times per
+        rank and the insert is collective state, so the per-rank verdicts are
+        reduced (MIN) together before any of them is acted on."""
         linker = self._linker
+        backend = linker.cache_linker
         futures = linker.layer_done_counter.futures.get(pending.counter_index)
         if futures is None:
             # The counter was reset under the load: done, but nothing can
             # vouch for the slots.
-            done, landed = 1, 0
+            done, landed, layers = 1, 0, 0
         else:
-            done = int(all(future.done() for future in futures))
-            landed = int(done and all(future.exception() is None for future in futures))
-        verdict = torch.tensor([done, landed], dtype=torch.int64)
+            resolved = [future for future in futures if future.done()]
+            done = int(len(resolved) == len(futures))
+            layers = sum(future.exception() is None for future in resolved)
+            landed = int(done and layers == len(futures))
+        verdict = torch.tensor(
+            [
+                done,
+                landed,
+                layers,
+                int(not backend.has_other_broadcasts(pending.counter_index)),
+                int(pending.broadcast_event is None or pending.broadcast_event.query()),
+            ],
+            dtype=torch.int64,
+        )
         self._scheduler.tree_cache._all_reduce_attn_groups(
             verdict, torch.distributed.ReduceOp.MIN
         )
-        done, landed = verdict.tolist()
-        if not done:
+        done, landed, layers, no_other_broadcast, broadcast_done = verdict.tolist()
+
+        if pending.landed is None and done:
+            # Non-blocking now that every layer resolved; drops the counter entry.
+            backend.finish_layer_wise_loading(pending.counter_index)
+            linker.adopt_load_timing(pending.counter_index, [pending.req.rid])
+            pending.landed = bool(landed)
+            if not landed:
+                backend.discard_broadcast(pending.counter_index)
+
+        if pending.landed is not False and backend.pending_broadcast(
+            pending.counter_index
+        ):
+            # Launch the broadcasts of the layers every rank agrees the source
+            # has landed, from where the last iteration stopped; the first
+            # launch waits until no request batch's layer broadcasts are
+            # still being issued from its forward, so the two collectives
+            # cannot be ordered differently per rank.
+            if pending.broadcast_layers == 0 and not no_other_broadcast:
+                return
+            if layers > pending.broadcast_layers:
+                pending.broadcast_event = backend.broadcast_bulk_layers(
+                    pending.counter_index, layers - 1
+                )
+                pending.broadcast_layers = layers
             return
-        # Non-blocking now that every layer resolved; drops the counter entry.
-        linker.cache_linker.finish_layer_wise_loading(pending.counter_index)
-        linker.adopt_load_timing(pending.counter_index, [pending.req.rid])
-        pending.landed = bool(landed)
+
+        if not done or not broadcast_done:
+            return
         self._pending = None
         self._finish(pending, pending.landed)
 

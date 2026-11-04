@@ -207,6 +207,26 @@ class UnifiedCacheLinker(ABC):
         layer-wise path."""
         return self.start_layer_wise_loading()
 
+    def pending_broadcast(self, counter_index: int) -> bool:
+        """Whether bulk load ``counter_index`` still has to be replicated to
+        ranks that did not read the store (MLA dedup). Uniform across ranks."""
+        return False
+
+    def has_other_broadcasts(self, counter_index: int) -> bool:
+        """Whether a cross-rank broadcast of another load batch is still
+        pending; a bulk load must not interleave its own with it."""
+        return False
+
+    def broadcast_bulk_layers(self, counter_index: int, last_layer: int):
+        """Replicate layers ``[.., last_layer]`` of bulk load ``counter_index``
+        to the ranks that did not read the store (MLA dedup), continuing from
+        where the previous call stopped. Returns the device event the data
+        lands on once the last layer has been launched, else None."""
+        return None
+
+    def discard_broadcast(self, counter_index: int) -> None:
+        """Drop the pending broadcast of a bulk load that failed."""
+
     @abstractmethod
     def finish_layer_wise_loading(self, counter_index: int) -> bool:
         """Wait until the batch started as ``counter_index`` stops writing to
