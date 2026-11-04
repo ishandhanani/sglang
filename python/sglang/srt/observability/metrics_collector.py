@@ -793,9 +793,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 5,
             ),
         )
-        self.linker_load_layer_seconds = Histogram(
-            name="sglang:linker_load_layer_seconds",
-            documentation="External linker load time per layer in seconds.",
+        self.linker_load_get_seconds = Histogram(
+            name="sglang:linker_load_get_seconds",
+            documentation="External linker time per ranged store get in seconds "
+            "(one get carries load_layers_per_get layers of every page).",
             labelnames=labels.keys(),
             buckets=(
                 0.00005,
@@ -811,6 +812,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 0.1,
                 0.25,
                 0.5,
+                1,
             ),
         )
         self.kv_transfer_total_mb = Histogram(
@@ -1612,8 +1614,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 self.linker_phase_seconds.labels(
                     **self.labels, kind=timing.kind, phase=phase
                 ).observe(value / 1000.0)
-        for layer_ms in timing.load_layers_ms:
-            self._log_histogram(self.linker_load_layer_seconds, layer_ms / 1000.0)
+        for get_ms in timing.load_gets_ms:
+            self._log_histogram(self.linker_load_get_seconds, get_ms / 1000.0)
 
     def observe_prefetch(
         self, loaded_tokens: int, latency_ms: float, success: bool

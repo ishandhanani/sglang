@@ -48,9 +48,12 @@ class _FakeLinker:
     def __init__(self):
         self.counter = LayerWiseLoadCounter(NUM_LAYERS)
         self.cache_linker = SimpleNamespace(
-            mla_broadcaster=None,
-            start_layer_wise_loading=MagicMock(side_effect=self._start),
+            start_bulk_loading=MagicMock(side_effect=self._start),
             finish_layer_wise_loading=MagicMock(side_effect=self.counter.finish),
+            pending_broadcast=MagicMock(return_value=False),
+            has_other_broadcasts=MagicMock(return_value=False),
+            broadcast_bulk_layers=MagicMock(return_value=None),
+            discard_broadcast=MagicMock(),
         )
         self.hit_rids = set()
         self.inflight_load_rids = []
@@ -202,7 +205,7 @@ class TestSchedulerPrefetch(unittest.TestCase):
         # with it, and started its own load batch.
         self.assertEqual(linker.inflight_load_rids, [])
         self.assertNotIn(req.rid, linker.private_load_indices)
-        linker.cache_linker.start_layer_wise_loading.assert_called_once()
+        linker.cache_linker.start_bulk_loading.assert_called_once()
         # The row holds the device prefix followed by the loaded tail.
         self.assertEqual(req.prefix_len, DEVICE_HIT + STORE_HIT)
         (row_slice, indices), _ = scheduler.req_to_token_pool.write.call_args
@@ -272,7 +275,7 @@ class TestSchedulerPrefetch(unittest.TestCase):
         self.assertEqual(output.loaded_tokens, 0)
         self.assertFalse(scheduler.prefetch_wrapper.has_pending())
         scheduler.storage.acquire.assert_not_called()
-        scheduler.linker.cache_linker.start_layer_wise_loading.assert_not_called()
+        scheduler.linker.cache_linker.start_bulk_loading.assert_not_called()
 
     def test_refusals(self):
         scheduler = self._new_scheduler()

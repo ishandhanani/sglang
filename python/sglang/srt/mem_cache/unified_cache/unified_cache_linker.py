@@ -201,6 +201,12 @@ class UnifiedCacheLinker(ABC):
     def start_layer_wise_loading(self) -> int:
         """Start queued loads and return the layer-counter consumer index."""
 
+    def start_bulk_loading(self) -> int:
+        """Start queued loads that no forward waits on (a prefetch). A backend
+        may fetch whole pages instead of layer slices; by default this is the
+        layer-wise path."""
+        return self.start_layer_wise_loading()
+
     @abstractmethod
     def finish_layer_wise_loading(self, counter_index: int) -> bool:
         """Wait until the batch started as ``counter_index`` stops writing to
@@ -254,16 +260,17 @@ class L3Timing:
     load_back_ms: Optional[float] = None
     queue_wait_ms: Optional[float] = None
     load_total_ms: Optional[float] = None
-    load_layers_ms: list[float] = field(default_factory=list)
+    load_layers_per_get: Optional[int] = None
+    load_gets_ms: list[float] = field(default_factory=list)
     load_done_at: Optional[float] = None
     complete_to_insert_ms: Optional[float] = None
     match_to_insert_ms: Optional[float] = None
 
     def log_line(self) -> str:
-        layers = self.load_layers_ms
-        layer_summary = (
-            f"{min(layers):.2f}/{sum(layers) / len(layers):.2f}/{max(layers):.2f}"
-            if layers
+        gets = self.load_gets_ms
+        get_summary = (
+            f"{min(gets):.2f}/{sum(gets) / len(gets):.2f}/{max(gets):.2f}"
+            if gets
             else "-"
         )
         fmt = lambda v: "-" if v is None else f"{v:.2f}"
@@ -274,7 +281,8 @@ class L3Timing:
             f"load_back_ms={fmt(self.load_back_ms)} "
             f"queue_wait_ms={fmt(self.queue_wait_ms)} "
             f"load_total_ms={fmt(self.load_total_ms)} "
-            f"layer_ms(min/mean/max)={layer_summary} "
+            f"layers_per_get={self.load_layers_per_get or '-'} "
+            f"get_ms(min/mean/max)={get_summary} "
             f"complete_to_insert_ms={fmt(self.complete_to_insert_ms)} "
             f"match_to_insert_ms={fmt(self.match_to_insert_ms)}"
         )
@@ -450,7 +458,8 @@ class UnifiedCacheLinkerWrapper:
                 continue
             timing.queue_wait_ms = load_timing.get("queue_wait_ms")
             timing.load_total_ms = load_timing.get("total_ms")
-            timing.load_layers_ms = list(load_timing.get("layers_ms", ()))
+            timing.load_layers_per_get = load_timing.get("layers_per_get")
+            timing.load_gets_ms = list(load_timing.get("gets_ms", ()))
             timing.load_done_at = load_timing.get("done_at")
 
     def note_insert(self, rid: str) -> None:

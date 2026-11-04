@@ -40,11 +40,12 @@ Per page, the path a hit takes:
 * ``load_back`` builds a LOAD ``PoolTransfer`` per component: the FULL
   component evicts for any shortfall and takes device slots for the hit pages;
   ``linker.load`` resolves the transfers and queues them under the rid.
-* ``start_layer_wise_loading`` moves the queued transfers to the load thread
-  with a transfer-ready event; the thread opens a Mooncake get session per
-  pool and, layer by layer, issues ``batch_get_into_multi_buffer_ranges``
-  straight into the registered device pages, completing one layer future at a
-  time (``LayerWiseLoadCounter``).
+* ``start_bulk_loading`` moves the queued transfers to the load thread with
+  a transfer-ready event. No forward waits on a prefetch, so the thread opens
+  a Mooncake get session per pool and issues ranged gets that carry every
+  layer of every page (``bulk_load_layers_per_get`` chunks them) straight
+  into the registered device pages, completing the layer futures
+  (``LayerWiseLoadCounter``) as each get lands.
 * When every rank agrees the pages landed, the request is released with
   ``checkpoint=True``: ``UnifiedRadixCache.checkpoint_into_tree`` inserts
   ``[0, prefix_len)`` from the request row (the device prefix dedups against
@@ -306,7 +307,9 @@ class SchedulerPrefetchWrapper:
         # The prefetch is not part of the batch the wrapper is building:
         # finish_loads after the next forward must not wait on or drop it.
         linker.inflight_load_rids.remove(req.rid)
-        counter_index = linker.cache_linker.start_layer_wise_loading()
+        # A bulk load: nothing waits on layers, so the backend may fetch
+        # whole pages.
+        counter_index = linker.cache_linker.start_bulk_loading()
 
         # Register the loaded tail in the request row, as prepare_for_extend
         # would; release_kv_cache reads the row when it inserts or frees.

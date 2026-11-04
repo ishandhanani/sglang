@@ -1749,6 +1749,8 @@ class TestTransferReadyEvents(CustomTestCase):
         linker.layer_done_counter.update_producer.return_value = 3
         linker.mla_broadcaster = None
         linker.gc_frozen = True
+        linker.load_layers_per_get = 1
+        linker.bulk_load_layers_per_get = 0
         linker.pending_loads = {"rid": ["transfer"]}
         linker.stats = {"load": 0}
         linker.load_queue = queue.Queue()
@@ -1761,10 +1763,132 @@ class TestTransferReadyEvents(CustomTestCase):
                 call.record_transfer_ready(),
                 call.indices_ready.synchronize(),
                 call.forward_done.synchronize(),
-                call.load_layer_wise(3, [["transfer"]], queued_at=ANY),
+                call.load_layer_wise(
+                    3, [["transfer"]], queued_at=ANY, layers_per_get=1
+                ),
             ],
         )
         linker.layer_done_counter.fail.assert_not_called()
+
+        # A bulk load (prefetch) rides the same queue with the bulk knob.
+        linker.pending_loads = {"rid2": ["transfer2"]}
+        linker.layer_done_counter.update_producer.return_value = 4
+        self.assertEqual(linker.start_bulk_loading(), 4)
+        linker.load_queue.put(None)
+        linker.load_thread_func()
+        self.assertEqual(
+            order.mock_calls[-1],
+            call.load_layer_wise(4, [["transfer2"]], queued_at=ANY, layers_per_get=0),
+        )
+
+    def test_mooncake_bulk_load_fetches_whole_pages_in_one_get(self):
+        """layers_per_get groups layers into ranged gets: 0 is one get per
+        pool for the whole page, k is ceil(num_layers / k) gets, 1 is the
+        layer-wise path. Layer futures complete as their get lands."""
+        for layers_per_get, expected_gets in ((1, 3), (2, 2), (0, 1), (5, 1)):
+            with self.subTest(layers_per_get=layers_per_get):
+                linker, store, counter = self._bulk_linker(num_layers=3, pages=2)
+                counter_index = counter.update_producer()
+                transfer = PoolTransfer(
+                    name=PoolName.KV, keys=["p0", "p1"], host_indices=torch.arange(2)
+                )
+                linker.load_layer_wise(
+                    counter_index, [[transfer]], layers_per_get=layers_per_get
+                )
+                self.assertEqual(store.session_starts, [["p0_k", "p1_k"]])
+                self.assertEqual(store.session_ends, [["p0_k", "p1_k"]])
+                self.assertEqual(len(store.gets), expected_gets)
+                # Every (page, layer) range was requested exactly once.
+                requested = sorted(
+                    (key, offset)
+                    for keys, _, _, offsets in store.gets
+                    for key, row_offsets in zip(keys, offsets)
+                    for offset in row_offsets
+                )
+                self.assertEqual(
+                    requested,
+                    sorted(
+                        (key, layer * 10)
+                        for key in ("p0_k", "p1_k")
+                        for layer in range(3)
+                    ),
+                )
+                self.assertTrue(counter.finish(counter_index))
+                timing = linker.load_timings[counter_index]
+                self.assertEqual(len(timing["gets_ms"]), expected_gets)
+                self.assertEqual(timing["layers_per_get"], layers_per_get or 3)
+
+    def test_mooncake_bulk_load_short_get_fails_the_batch(self):
+        linker, store, counter = self._bulk_linker(num_layers=3, pages=1)
+        store.short = True
+        counter_index = counter.update_producer()
+        transfer = PoolTransfer(
+            name=PoolName.KV, keys=["p0"], host_indices=torch.arange(1)
+        )
+        linker.load_layer_wise(counter_index, [[transfer]], layers_per_get=0)
+        self.assertFalse(counter.finish(counter_index))
+        self.assertEqual(store.session_ends, [["p0_k"]])
+
+    def test_layers_per_get_knob_validation(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+            _layers_per_get,
+        )
+
+        config = {"load_layers_per_get": 4, "other": 1}
+        self.assertEqual(_layers_per_get(config, "load_layers_per_get", 1), 4)
+        self.assertEqual(config, {"other": 1})  # consumed, not passed to the store
+        self.assertEqual(_layers_per_get({}, "bulk_load_layers_per_get", 0), 0)
+        for bad in (-1, True, "2", 1.5):
+            with self.assertRaises(ValueError):
+                _layers_per_get({"k": bad}, "k", 1)
+
+    @staticmethod
+    def _bulk_linker(*, num_layers, pages):
+        """A MooncakeDirectLinker over a recording fake store and one KV pool
+        whose page objects hold ``num_layers`` ranges of 10 bytes."""
+
+        class _Store:
+            def __init__(self):
+                self.session_starts, self.session_ends, self.gets = [], [], []
+                self.short = False
+
+            def batch_get_session_start(self, keys):
+                self.session_starts.append(list(keys))
+                return [0] * len(keys)
+
+            def batch_get_session_end(self, keys):
+                self.session_ends.append(list(keys))
+                return 0
+
+            def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+                self.gets.append((list(keys), ptrs, sizes, offsets))
+                return [sum(row) - (1 if self.short else 0) for row in sizes]
+
+        pool = SimpleNamespace(
+            prepare_locations=lambda indices: indices.tolist(),
+            get_prepared_layers_range_meta=lambda locations, layers: (
+                [[1000 * row + layer for layer in layers] for row in locations],
+                [[10] * len(layers) for _ in locations],
+                [[layer * 10 for layer in layers] for _ in locations],
+            ),
+        )
+        store = _Store()
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.num_layers = num_layers
+        linker.pools = {PoolName.KV: pool}
+        linker.storage = SimpleNamespace(
+            store=store,
+            _get_hybrid_page_component_keys=lambda keys, transfer: (
+                [f"{key}_k" for key in keys],
+                1,
+            ),
+            _tag_keys=lambda keys: keys,
+        )
+        counter = LayerWiseLoadCounter(num_layers)
+        linker.layer_done_counter = counter
+        linker.load_timings = {}
+        linker.load_observer = None
+        return linker, store, counter
 
     def test_mla_broadcast_waits_on_every_event_before_the_first_layer(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
