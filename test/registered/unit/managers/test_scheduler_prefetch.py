@@ -10,8 +10,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+import zmq
 
 from sglang.srt.managers.io_struct import (
+    FlushCacheReqInput,
     PrefetchReqInput,
     PrefetchReqOutput,
     msgpack_decode,
@@ -20,6 +22,9 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.scheduler_components.prefetch_wrapper import (
     NOT_SERVED_ERROR,
     SchedulerPrefetchWrapper,
+)
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
 )
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -420,6 +425,84 @@ class TestSchedulerPrefetch(unittest.TestCase):
         self.assertTrue(req.skip_radix_cache_insert)
         out = scheduler.send_output.call_args.args[0]
         self.assertIn("aborted", out.error)
+
+    def test_hint_socket_round_trip(self):
+        """A DEALER (and a REQ) peer sends one msgpack frame on the hint
+        socket; the request joins the recv list and the reply goes back to
+        the same identity."""
+        ctx = zmq.Context.instance()
+        router = ctx.socket(zmq.ROUTER)
+        router.setsockopt(zmq.LINGER, 0)
+        endpoint = "inproc://hint-test"
+        router.bind(endpoint)
+        dealer = ctx.socket(zmq.DEALER)
+        dealer.setsockopt(zmq.LINGER, 0)
+        dealer.connect(endpoint)
+        rq = ctx.socket(zmq.REQ)
+        rq.setsockopt(zmq.LINGER, 0)
+        rq.connect(endpoint)
+        receiver = SchedulerRequestReceiver(
+            recv_from_tokenizer=MagicMock(),
+            recv_from_rpc=None,
+            recv_skipper=None,
+            input_blocker=None,
+            mm_receiver=None,
+            server_args=MagicMock(),
+            model_config=MagicMock(),
+            max_recv_per_poll=-1,
+            stream_output=MagicMock(),
+            get_last_batch=MagicMock(),
+            rust_server_mode=False,
+            hint_socket=router,
+        )
+        try:
+            dealer.send(msgpack_encode(PrefetchReqInput(rid="d1", token_ids=[1, 2])))
+            rq.send(msgpack_encode(PrefetchReqInput(rid="r1", token_ids=[3])))
+            dealer.send(b"not msgpack")
+            # Another struct of the shared IPC codec is not a hint: the strict
+            # decoder rejects anything but a PrefetchReqInput.
+            dealer.send(msgpack_encode(FlushCacheReqInput()))
+            recv_reqs = []
+            deadline = 50
+            while len(recv_reqs) < 2 and deadline:
+                receiver._pull_hint_reqs(recv_reqs)  # one hint per poll
+                deadline -= 1
+            self.assertEqual(sorted(r.rid for r in recv_reqs), ["d1", "r1"])
+            self.assertTrue(all(isinstance(r, PrefetchReqInput) for r in recv_reqs))
+            self.assertEqual(set(receiver.hint_routes), {"d1", "r1"})
+            # REQ peers carry the empty delimiter, DEALER peers do not.
+            self.assertEqual(len(receiver.hint_routes["r1"]), 2)
+            self.assertEqual(len(receiver.hint_routes["d1"]), 1)
+
+            # A second hint with an in-flight rid is answered at once.
+            dealer.send(msgpack_encode(PrefetchReqInput(rid="d1", token_ids=[9])))
+            for _ in range(50):
+                receiver._pull_hint_reqs(recv_reqs)
+                if dealer.poll(10):
+                    break
+            dup = msgpack_decode(dealer.recv())
+            self.assertEqual((dup.rid, dup.loaded_tokens), ("d1", 0))
+            self.assertIn("in flight", dup.error)
+            self.assertEqual(len(recv_reqs), 2)
+
+            self.assertTrue(
+                receiver.reply_hint(PrefetchReqOutput(rid="d1", loaded_tokens=8))
+            )
+            self.assertTrue(
+                receiver.reply_hint(PrefetchReqOutput(rid="r1", error="nope"))
+            )
+            self.assertFalse(receiver.reply_hint(PrefetchReqOutput(rid="other")))
+            out = msgpack_decode(dealer.recv())
+            self.assertEqual((out.rid, out.loaded_tokens), ("d1", 8))
+            out = msgpack_decode(rq.recv())
+            self.assertEqual((out.rid, out.error), ("r1", "nope"))
+            self.assertEqual(receiver.hint_routes, {})
+            receiver.close()
+            self.assertTrue(router.closed)
+        finally:
+            dealer.close()
+            rq.close()
+            router.close()
 
     def test_ipc_round_trip(self):
         """The type rides the scheduler's input socket as a tagged msgpack array."""

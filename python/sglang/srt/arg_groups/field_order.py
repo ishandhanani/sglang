@@ -190,6 +190,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_request_time_stats_logging",
     "kv_events_config",
     "load_publish_endpoint",
+    "hint_zmq_endpoint",
     "enable_forward_pass_metrics",
     "forward_pass_metrics_worker_id",
     "forward_pass_metrics_ipc_name",

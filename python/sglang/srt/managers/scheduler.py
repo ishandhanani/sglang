@@ -889,6 +889,9 @@ class Scheduler(
                 or get_observability().enable_metrics_for_all_schedulers
             ),
             enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
+            hint_zmq_endpoint=get_observability().hint_zmq_endpoint,
+            hint_dp_rank=self.served_dp_rank,
+            num_dp_ranks=get_parallel().num_dp_ranks,
         )
 
         self.load_snapshot_writer = None
@@ -918,8 +921,13 @@ class Scheduler(
         ):
             self.idle_sleeper = IdleSleeper(
                 sockets=[
-                    self.ipc_channels.recv_from_tokenizer,
-                    self.ipc_channels.recv_from_rpc,
+                    socket
+                    for socket in (
+                        self.ipc_channels.recv_from_tokenizer,
+                        self.ipc_channels.recv_from_rpc,
+                        self.ipc_channels.hint_socket,
+                    )
+                    if socket is not None
                 ],
                 can_empty_cache=lambda: not self._engine_paused,
             )
@@ -2357,6 +2365,9 @@ class Scheduler(
 
     def send_control_output(self, output, recv_req) -> None:
         """Answer a control request, at dispatch or later (a deferred flush)."""
+        if self.request_receiver.reply_hint(output):
+            # A hint that came in on --hint-zmq-endpoint is answered there.
+            return
         if self.rust_server is not None:
             # Embedded Rust server: every control-request response goes
             # back through the egress ring (the zmq tokenizer socket is
@@ -2618,6 +2629,7 @@ class Scheduler(
         self.request_receiver = receiver_factory(
             recv_from_tokenizer=self.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
+            hint_socket=self.ipc_channels.hint_socket,
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
             mm_receiver=self.mm_receiver,

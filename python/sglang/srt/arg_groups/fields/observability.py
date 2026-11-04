@@ -149,6 +149,10 @@ class Observability(msgspec.Struct):
         Optional[str],
         "Opt in to the runtime-load PUB socket that load-aware routers subscribe to. Off by default (unset or 'off'). Use 'auto' to reserve the dp_size ports packed after the --kv-events-config range, or a wildcard-host TCP address (e.g. tcp://*:6000) to place it explicitly; rank r binds port+r and /server_info advertises the base under the kv_events block. Requires --kv-events-config to describe a publisher (routers discover the base through /server_info); startup fails if this is set without one, is not bindable, or overlaps the KV range. Note: 'auto' reserves 2*dp_size ports from the KV base — space co-hosted engines accordingly. The router-facing update cadence follows --load-snapshot-publish-interval (shared to avoid double-collecting the snapshot), so a large value there also staleness-caps this feed.",
     ] = None
+    hint_zmq_endpoint: A[
+        Optional[str],
+        "Bind an inbound ZMQ ROUTER socket on each scheduler group leader for cache hints from an external controller such as NVIDIA Dynamo, e.g. tcp://127.0.0.1:5558. Each message is one msgpack frame holding a PrefetchReqInput; the PrefetchReqOutput goes back on the same socket to the sender's identity. With data parallelism rank r binds port+r and serves hints whose dp_rank is r. The socket is unauthenticated: a TCP address other than loopback requires SGLANG_ZMQ_ALLOWED_PEERS to list the controller's addresses, otherwise startup fails. Disabled when unset.",
+    ] = None
     enable_forward_pass_metrics: A[
         bool,
         "Enable per-iteration forward pass metrics via ZMQ IPC. External consumers (e.g. Dynamo planner) subscribe to the IPC endpoint exposed in server_args.forward_pass_metrics_ipc_name.",
