@@ -56,6 +56,15 @@ Per page, the path a hit takes:
   ``[0, prefix_len)`` from the request row (the device prefix dedups against
   the existing path), and the write-through chain skips nodes the store
   already holds. From then on a matching request is a device hit.
+
+Join-in-flight. The request a prefetch was sent for usually reaches the
+scheduler before the prefetch lands; its own match would then see the pages
+as missing (they join the tree only in ``_finish``) and load them from the
+store a second time. ``holds`` tells the batch builder to skip a waiting
+request whose prefix shares pages beyond its device hit with the pending
+prefetch; the request keeps its place and is admitted once the prefetch
+finishes, is aborted, or has been pending for ``JOIN_HOLD_CAP_S``, when its
+next match finds the pages on device.
 """
 
 from __future__ import annotations
@@ -63,7 +72,7 @@ from __future__ import annotations
 import logging
 import time
 from array import array
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
 import numpy as np
@@ -85,6 +94,10 @@ logger = logging.getLogger(__name__)
 # the tokenizer-side sender filters these out of the fan-out replies.
 NOT_SERVED_ERROR = "Hint targets dp_rank"
 
+# Longest a waiting request is held for a pending prefetch; past it the
+# request is admitted and loads whatever the prefetch has not landed.
+JOIN_HOLD_CAP_S = 2.0
+
 
 @dataclass
 class _PendingPrefetch:
@@ -100,6 +113,10 @@ class _PendingPrefetch:
     # event the peers' copies land on once all of them have.
     broadcast_layers: int = 0
     broadcast_event: Optional[torch.cuda.Event] = None
+    # Join-in-flight: rid -> pages a waiting request reuses from this prefetch
+    # (0: none), computed once per request; set once the holds were released.
+    join_pages: dict[str, int] = field(default_factory=dict)
+    join_released: bool = False
 
 
 class SchedulerPrefetchWrapper:
@@ -119,6 +136,82 @@ class SchedulerPrefetchWrapper:
 
     def has_pending(self) -> bool:
         return self._pending is not None
+
+    # ---- join-in-flight: hold the requests the pending prefetch is for ----
+
+    def holds(self, req: Req) -> bool:
+        """Whether the batch builder must skip ``req`` this iteration: the
+        pending prefetch is landing pages of its prefix that the request would
+        otherwise load from the store a second time.
+
+        Every rank takes the same decision in the same iteration: the verdict
+        is a pure function of the request's tokens and the prefetch's tokens,
+        device hit and loaded length, which are identical on every rank
+        (requests and hints are broadcast with the batch, the budget and the
+        store hit are reduced MIN, and load_back takes the same branch on
+        every rank). The cap is the only clock-based input and is reduced in
+        ``_check_pending`` before it is applied.
+        """
+        pending = self._pending
+        if pending is None or pending.join_released:
+            return False
+        pages = pending.join_pages.get(req.rid)
+        if pages is None:
+            linker = self._linker
+            if linker is not None and req.rid in linker.private_load_indices:
+                # Its own load already started: nothing left to join.
+                pages = 0
+            else:
+                pages = self._join_pages(
+                    req, pending, self._scheduler.tree_cache.page_size
+                )
+            pending.join_pages[req.rid] = pages
+            if pages:
+                logger.debug(
+                    "Prefetch %s holds request %s: %d pages in flight",
+                    pending.recv_req.rid,
+                    req.rid,
+                    pages,
+                )
+                collector = self._scheduler.metrics_collector
+                if collector is not None:
+                    collector.observe_prefetch_join(held=1)
+        return pages > 0
+
+    @staticmethod
+    def _join_pages(req: Req, pending: _PendingPrefetch, page: int) -> int:
+        """Pages of ``req``'s prefix the prefetch is loading that the request
+        lacks on device: the page-aligned common prefix of the two token
+        sequences, within the prefetch's loaded extent, past both device hits."""
+        ours = req.origin_input_ids
+        theirs = pending.req.origin_input_ids
+        n = min(len(ours), len(theirs), pending.req.prefix_len)
+        start = max(pending.device_hit_tokens, req.prefix_len)
+        if n <= start:
+            return 0
+        mismatch = np.flatnonzero(np.asarray(ours[:n]) != np.asarray(theirs[:n]))
+        common = n if mismatch.size == 0 else int(mismatch[0])
+        return max(0, common // page * page - start) // page
+
+    def _release_holds(self, pending: _PendingPrefetch, reason: str) -> None:
+        """Let the requests held for ``pending`` be admitted again. Called
+        where every rank reaches the same point: finish, abort, reduced cap."""
+        pending.join_released = True
+        held = [(rid, pages) for rid, pages in pending.join_pages.items() if pages]
+        pending.join_pages.clear()
+        if not held:
+            return
+        for rid, pages in held:
+            logger.debug(
+                "Prefetch %s (%s) releases request %s: %d pages",
+                pending.recv_req.rid,
+                reason,
+                rid,
+                pages,
+            )
+        collector = self._scheduler.metrics_collector
+        if collector is not None:
+            collector.observe_prefetch_join(released=len(held))
 
     @property
     def _linker(self) -> Optional[UnifiedCacheLinkerWrapper]:
@@ -368,6 +461,7 @@ class SchedulerPrefetchWrapper:
         if pending is None:
             return
         self._pending = None
+        self._release_holds(pending, "aborted")
         backend = self._linker.cache_linker
         if pending.landed is None:
             # Blocks until every layer future resolved on this rank.
@@ -385,10 +479,11 @@ class SchedulerPrefetchWrapper:
     def _check_pending(self, pending: _PendingPrefetch) -> None:
         """Advance the prefetch one step per scheduler iteration with a single
         reduction: the store read, the (MLA dedup) broadcast of the layers the
-        source has landed so far, then the insert. Every rank must take the
-        same step in the same iteration: loads land at different times per
-        rank and the insert is collective state, so the per-rank verdicts are
-        reduced (MIN) together before any of them is acted on."""
+        source has landed so far, the join hold cap, then the insert. Every
+        rank must take the same step in the same iteration: loads land at
+        different times per rank, the cap is read off each rank's clock and
+        the insert is collective state, so the per-rank verdicts are reduced
+        (MIN) together before any of them is acted on."""
         linker = self._linker
         backend = linker.cache_linker
         futures = linker.layer_done_counter.futures.get(pending.counter_index)
@@ -408,13 +503,18 @@ class SchedulerPrefetchWrapper:
                 layers,
                 int(not backend.has_other_broadcasts(pending.counter_index)),
                 int(pending.broadcast_event is None or pending.broadcast_event.query()),
+                int(time.perf_counter() - pending.started_at > JOIN_HOLD_CAP_S),
             ],
             dtype=torch.int64,
         )
         self._scheduler.tree_cache._all_reduce_attn_groups(
             verdict, torch.distributed.ReduceOp.MIN
         )
-        done, landed, layers, no_other_broadcast, broadcast_done = verdict.tolist()
+        done, landed, layers, no_other_broadcast, broadcast_done, hold_expired = (
+            verdict.tolist()
+        )
+        if hold_expired and not pending.join_released:
+            self._release_holds(pending, "cap")
 
         if pending.landed is None and done:
             # Non-blocking now that every layer resolved; drops the counter entry.
@@ -460,6 +560,7 @@ class SchedulerPrefetchWrapper:
         from sglang.srt.mem_cache.common import release_kv_cache
 
         req = pending.req
+        self._release_holds(pending, "landed" if landed else "failed")
         req.finished_reason = FINISH_LENGTH(0)
         if not landed:
             req.skip_radix_cache_insert = True

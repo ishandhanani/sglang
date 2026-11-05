@@ -7,6 +7,7 @@ sender."""
 import asyncio
 import time
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -24,6 +25,7 @@ from sglang.srt.managers.scheduler_components.idle_sleeper import (
     RustServerIdleSleeper,
 )
 from sglang.srt.managers.scheduler_components.prefetch_wrapper import (
+    JOIN_HOLD_CAP_S,
     NOT_SERVED_ERROR,
     SchedulerPrefetchWrapper,
 )
@@ -434,6 +436,114 @@ class TestSchedulerPrefetch(unittest.TestCase):
         self.assertTrue(req.skip_radix_cache_insert)
         out = scheduler.send_output.call_args.args[0]
         self.assertIn("aborted", out.error)
+
+    @staticmethod
+    def _waiting(rid, token_ids, prefix_len=0):
+        """The slice of a waiting Req the join test reads."""
+        return SimpleNamespace(
+            rid=rid, origin_input_ids=array("q", token_ids), prefix_len=prefix_len
+        )
+
+    @staticmethod
+    def _join_counts(scheduler):
+        held = released = 0
+        for call in scheduler.metrics_collector.observe_prefetch_join.call_args_list:
+            held += call.kwargs.get("held", 0)
+            released += call.kwargs.get("released", 0)
+        return held, released
+
+    def test_join_holds_requests_whose_pages_are_in_flight(self):
+        scheduler = self._new_scheduler()
+        scheduler.metrics_collector = MagicMock()
+        wrapper = scheduler.prefetch_wrapper
+        loading = TOKEN_IDS[: DEVICE_HIT + STORE_HIT]
+
+        # Nothing in flight: nobody is held.
+        self.assertFalse(wrapper.holds(self._waiting("r0", TOKEN_IDS)))
+        self._handle(scheduler)
+
+        # Shares every loading page (and goes on past the hint): held for them.
+        shared = self._waiting("r1", TOKEN_IDS + [1, 2])
+        self.assertTrue(wrapper.holds(shared))
+        self.assertEqual(wrapper._pending.join_pages["r1"], STORE_HIT // PAGE)
+        # Diverges inside the device hit: no loading page is shared.
+        self.assertFalse(wrapper.holds(self._waiting("r2", loading[:PAGE] + [0] * 20)))
+        # Diverges in the first loading page: page-aligned, that is the device hit.
+        self.assertFalse(
+            wrapper.holds(self._waiting("r3", loading[: DEVICE_HIT + PAGE - 1] + [0]))
+        )
+        # One whole loading page before diverging: held for that page.
+        partial = self._waiting("r4", loading[: DEVICE_HIT + PAGE + 1] + [0])
+        self.assertTrue(wrapper.holds(partial))
+        self.assertEqual(wrapper._pending.join_pages["r4"], 1)
+        # Already has the loading pages on device.
+        self.assertFalse(
+            wrapper.holds(
+                self._waiting("r5", TOKEN_IDS, prefix_len=DEVICE_HIT + STORE_HIT)
+            )
+        )
+        # Its own load already started: left alone.
+        scheduler.linker.private_load_indices["r6"] = scheduler.linker.tail
+        self.assertFalse(wrapper.holds(self._waiting("r6", TOKEN_IDS)))
+        # The verdict is computed once per request and prefetch.
+        with patch.object(wrapper, "_join_pages", return_value=0) as join:
+            self.assertTrue(wrapper.holds(shared))
+            join.assert_not_called()
+        self.assertEqual(self._join_counts(scheduler), (2, 0))
+
+        # Landing releases every hold; the next match finds the pages on device.
+        for layer in range(NUM_LAYERS):
+            scheduler.linker.counter.complete(0, layer)
+        self._check_pending(scheduler)
+        self.assertFalse(wrapper.has_pending())
+        self.assertFalse(wrapper.holds(shared))
+        self.assertFalse(wrapper.holds(partial))
+        self.assertEqual(self._join_counts(scheduler), (2, 2))
+
+    def test_join_releases_on_abort(self):
+        scheduler = self._new_scheduler()
+        scheduler.metrics_collector = MagicMock()
+        wrapper = scheduler.prefetch_wrapper
+        self._handle(scheduler)
+        shared = self._waiting("r1", TOKEN_IDS)
+        self.assertTrue(wrapper.holds(shared))
+        for layer in range(NUM_LAYERS):
+            scheduler.linker.counter.complete(0, layer)
+
+        with self._patches(scheduler)[2]:
+            wrapper.abort()
+
+        self.assertFalse(wrapper.holds(shared))
+        self.assertEqual(self._join_counts(scheduler), (1, 1))
+
+    def test_join_hold_is_capped_while_the_load_runs_on(self):
+        scheduler = self._new_scheduler()
+        scheduler.metrics_collector = MagicMock()
+        wrapper = scheduler.prefetch_wrapper
+        self._handle(scheduler)
+        shared = self._waiting("r1", TOKEN_IDS)
+        self.assertTrue(wrapper.holds(shared))
+
+        # Under the cap: still held after a poll.
+        self._check_pending(scheduler)
+        self.assertTrue(wrapper.holds(shared))
+        self.assertEqual(self._join_counts(scheduler), (1, 0))
+
+        # Past the cap: the poll releases the holds and takes no new ones,
+        # while the prefetch itself stays in flight.
+        wrapper._pending.started_at -= JOIN_HOLD_CAP_S + 1.0
+        self._check_pending(scheduler)
+        self.assertTrue(wrapper.has_pending())
+        self.assertFalse(wrapper.holds(shared))
+        self.assertFalse(wrapper.holds(self._waiting("r2", TOKEN_IDS)))
+        self.assertEqual(self._join_counts(scheduler), (1, 1))
+
+        # Landing afterwards releases nothing twice.
+        for layer in range(NUM_LAYERS):
+            scheduler.linker.counter.complete(0, layer)
+        self._check_pending(scheduler)
+        self.assertFalse(wrapper.has_pending())
+        self.assertEqual(self._join_counts(scheduler), (1, 1))
 
     def test_mla_dedup_broadcasts_layers_as_they_land_then_inserts(self):
         """With --enable-linker-mla-dedup the completion poll launches the

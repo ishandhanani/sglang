@@ -102,6 +102,17 @@ trees. A flush or memory release waits for an in-flight prefetch to land
 (`release_memory_occupation` and shutdown abort it: the load is waited for
 and its slots are freed without an insert).
 
+The request a prefetch was sent for usually reaches the scheduler before the
+prefetch has landed. While a prefetch is in flight, the batch builder holds back
+a waiting request whose prefix shares pages with the prefetch beyond what the
+request already has on device (**join-in-flight**), instead of admitting it and
+loading the same pages from the store a second time. The request keeps its
+place in the queue and is admitted as soon as the prefetch lands, fails or is
+aborted, or after at most 2 s of holding; its next match then finds the pages
+on device. Holds are counted in `sglang:prefetch_join_held_total` and
+`sglang:prefetch_join_released_total` and logged at debug level with the pages
+the request reuses.
+
 ```python
 import uuid, zmq
 from sglang.srt.managers.io_struct import PrefetchReqInput, msgpack_decode, msgpack_encode
@@ -162,6 +173,7 @@ With `--enable-metrics` the scheduler exports, per rank:
 | `sglang:prefetch_requests_total{outcome}` | counter | Completed prefetches, `landed` or `failed`. |
 | `sglang:prefetch_loaded_tokens_total` | counter | Tokens prefetch loaded into the tree. |
 | `sglang:prefetch_latency_seconds` | histogram | Scheduler dispatch to the loaded tail joining the tree. |
+| `sglang:prefetch_join_held_total`, `sglang:prefetch_join_released_total` | counter | Waiting requests held because an in-flight prefetch was loading pages of their prefix, and holds released (prefetch landed, failed, aborted, or the 2 s cap). |
 | `sglang:linker_load_bytes_total`, `sglang:linker_load_pages_total` | counter | Bytes and pages the linker loaded from the store (requests and prefetches). |
 | `sglang:linker_load_latency_seconds` | histogram | Load batch wall-clock, first store read to last layer. |
 | `sglang:linker_load_get_seconds` | histogram | Time per ranged store get. |

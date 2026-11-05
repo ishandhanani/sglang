@@ -4508,6 +4508,12 @@ class Scheduler(
                 ):
                     break
 
+            if self.prefetch_wrapper.holds(req):
+                # An in-flight prefetch is landing pages of this prefix that
+                # are not in the tree yet; admitted now, the request would
+                # load them from the store a second time. It keeps its place.
+                continue
+
             if self.enable_hicache_storage or self.enable_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle

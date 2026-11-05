@@ -764,6 +764,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="Completed prefetch requests by outcome.",
             labelnames=list(labels.keys()) + ["outcome"],
         )
+        self.prefetch_join_held_total = Counter(
+            name="sglang:prefetch_join_held_total",
+            documentation="Waiting requests held back because an in-flight "
+            "prefetch was loading pages of their prefix.",
+            labelnames=labels.keys(),
+        )
+        self.prefetch_join_released_total = Counter(
+            name="sglang:prefetch_join_released_total",
+            documentation="Held requests released once the prefetch finished, "
+            "was aborted or exceeded the hold cap.",
+            labelnames=labels.keys(),
+        )
         self.linker_phase_seconds = Histogram(
             name="sglang:linker_phase_seconds",
             documentation="Per store-hit phase wall-clock in seconds, by phase: "
@@ -1626,6 +1638,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.prefetch_requests_total.labels(
             **self.labels, outcome="landed" if success else "failed"
         ).inc()
+
+    def observe_prefetch_join(self, *, held: int = 0, released: int = 0) -> None:
+        if held:
+            self.prefetch_join_held_total.labels(**self.labels).inc(held)
+        if released:
+            self.prefetch_join_released_total.labels(**self.labels).inc(released)
 
     def observe_kv_transfer_bootstrap(
         self,
