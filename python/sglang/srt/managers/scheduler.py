@@ -5955,6 +5955,8 @@ class Scheduler(
     def _hicache_l3_layout(self) -> dict:
         from sglang.srt.mem_cache.hicache_storage import disabled_l3_layout
 
+        if self.enable_unified_cache_external_linker:
+            return self._linker_l3_layout()
         if not self.enable_hierarchical_cache:
             return disabled_l3_layout(
                 "Hierarchical cache is disabled", page_size=self.page_size
@@ -5987,6 +5989,29 @@ class Scheduler(
             swa = tree_cache.components.get(ComponentType.SWA)
         return storage_backend.describe_l3_object_layout(
             sidecar_pool_specs=sidecar_pool_specs,
+            swa_trailing_pages=swa.full_window_pages if swa is not None else None,
+            page_size=self.page_size,
+        )
+
+    def _linker_l3_layout(self) -> dict:
+        """The direct external linker's Mooncake objects, described like HiCache's:
+        the linker writes through its own MooncakeStore with the same key builders."""
+        from sglang.srt.mem_cache.hicache_storage import disabled_l3_layout
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+
+        tree_cache = self.tree_cache
+        wrapper = getattr(tree_cache, "linker", None)
+        storage = getattr(getattr(wrapper, "cache_linker", None), "storage", None)
+        if not isinstance(storage, MooncakeStore):
+            return disabled_l3_layout(
+                "Mooncake external linker is not attached", page_size=self.page_size
+            )
+        swa = tree_cache.components.get(ComponentType.SWA)
+        return storage.describe_l3_object_layout(
+            sidecar_pool_specs=tree_cache.sidecar_pool_specs,
             swa_trailing_pages=swa.full_window_pages if swa is not None else None,
             page_size=self.page_size,
         )
