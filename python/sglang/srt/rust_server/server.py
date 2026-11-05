@@ -483,11 +483,12 @@ class RustServer:
         surfaced on ``/server_info`` as ``rust_mm_transport``."""
         return MM_TRANSPORT_STATS.snapshot()
 
-    def wait_request(self, timeout_ms: int) -> None:
+    def wait_request(self, timeout_ms: int) -> bool:
         """Block until a request is pushed into the in-process ring or the timeout
-        elapses.
+        elapses. True when woken by a request (or the drain waker), False on
+        timeout.
         """
-        self.server.wait_request(timeout_ms)
+        return self.server.wait_request(timeout_ms)
 
     def drain(self, max_recv: int) -> List[Any]:
         """Ingress: non-blocking drain of the in-process ring → list of decoded

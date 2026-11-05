@@ -151,33 +151,36 @@ class SchedulerRequestReceiver:
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 recv_reqs = []
 
-                # Rust ringbuffer backend: drain the in-process ring fed by the
-                # embedded Rust TokenizerManager instead of a zmq socket. Same
-                # non-blocking, msgpack-decoded contract as the zmq path below.
                 if self.rust_server_mode:
+                    # Rust ringbuffer backend: drain the in-process ring fed by
+                    # the embedded Rust TokenizerManager instead of a zmq socket.
+                    # Same non-blocking, msgpack-decoded contract as the zmq
+                    # path below. Control requests arrive on the ring too, so
+                    # the rpc socket is not read on this branch.
                     recv_reqs.extend(
                         self.recv_from_tokenizer.drain(self.max_recv_per_poll)
                     )
-                    return recv_reqs
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                else:
+                    while True:
+                        try:
+                            if self.recv_limit_reached(len(recv_reqs)):
+                                break
+                            recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
+                        except zmq.ZMQError:
                             break
-                        recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
+                        recv_reqs.append(recv_req)
 
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                    while True:
+                        try:
+                            if self.recv_limit_reached(len(recv_reqs)):
+                                break
+                            recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
+                        except zmq.ZMQError:
                             break
-                        recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
+                        recv_reqs.append(recv_rpc)
 
+                # The hint socket is independent of the ingress: both branches
+                # take their one hint per poll here.
                 self._pull_hint_reqs(recv_reqs)
             else:
                 recv_reqs = None

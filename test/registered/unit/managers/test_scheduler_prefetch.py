@@ -5,6 +5,7 @@ the refusals, the memory gate, the hint socket and the tokenizer-side
 sender."""
 
 import asyncio
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -19,6 +20,9 @@ from sglang.srt.managers.io_struct import (
     msgpack_decode,
     msgpack_encode,
 )
+from sglang.srt.managers.scheduler_components.idle_sleeper import (
+    RustServerIdleSleeper,
+)
 from sglang.srt.managers.scheduler_components.prefetch_wrapper import (
     NOT_SERVED_ERROR,
     SchedulerPrefetchWrapper,
@@ -31,6 +35,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -586,6 +591,123 @@ class TestSchedulerPrefetch(unittest.TestCase):
         finally:
             dealer.close()
             rq.close()
+            router.close()
+
+    def test_hint_socket_in_rust_server_mode(self):
+        """With the embedded Rust server as the ingress (SGLANG_RUST_SERVER)
+        the poll drains the request ring and still reads the hint socket, one
+        hint per poll, and the reply goes back to the hint peer."""
+        ctx = zmq.Context.instance()
+        router = ctx.socket(zmq.ROUTER)
+        router.setsockopt(zmq.LINGER, 0)
+        endpoint = "inproc://hint-rust-server-test"
+        router.bind(endpoint)
+        dealer = ctx.socket(zmq.DEALER)
+        dealer.setsockopt(zmq.LINGER, 0)
+        dealer.connect(endpoint)
+        ring = MagicMock()
+        ring.drain.side_effect = [["req-a", "req-b"], [], []]
+        receiver = SchedulerRequestReceiver(
+            recv_from_tokenizer=ring,
+            recv_from_rpc=None,
+            recv_skipper=None,
+            input_blocker=None,
+            mm_receiver=None,
+            server_args=MagicMock(),
+            model_config=MagicMock(),
+            max_recv_per_poll=-1,
+            stream_output=MagicMock(),
+            get_last_batch=MagicMock(),
+            rust_server_mode=True,
+            hint_socket=router,
+        )
+        try:
+            dealer.send(msgpack_encode(PrefetchReqInput(rid="h1", token_ids=[1])))
+            dealer.send(msgpack_encode(PrefetchReqInput(rid="h2", token_ids=[2])))
+            self.assertTrue(router.poll(1000))
+            with get_parallel().override(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0):
+                first = receiver._pull_raw_reqs()
+                self.assertTrue(router.poll(1000))
+                second = receiver._pull_raw_reqs()
+                third = receiver._pull_raw_reqs()
+            ring.drain.assert_called_with(-1)
+            self.assertEqual(ring.drain.call_count, 3)
+            self.assertEqual(first[:2], ["req-a", "req-b"])
+            self.assertEqual([r.rid for r in first[2:]], ["h1"])
+            self.assertEqual([r.rid for r in second], ["h2"])
+            self.assertEqual(third, [])
+            self.assertEqual(set(receiver.hint_routes), {"h1", "h2"})
+            self.assertTrue(
+                receiver.reply_hint(PrefetchReqOutput(rid="h1", loaded_tokens=4))
+            )
+            out = msgpack_decode(dealer.recv())
+            self.assertEqual((out.rid, out.loaded_tokens), ("h1", 4))
+        finally:
+            dealer.close()
+            router.close()
+
+    def test_rust_server_idle_sleeper_wakes_on_hint(self):
+        """With a hint socket bound the ring park is sliced: a hint ends the
+        park within one slice (not the full timeout), a request still ends it
+        at once, and an idle park runs the whole timeout in slices."""
+        ctx = zmq.Context.instance()
+        router = ctx.socket(zmq.ROUTER)
+        router.setsockopt(zmq.LINGER, 0)
+        endpoint = "inproc://hint-sleeper-test"
+        router.bind(endpoint)
+        dealer = ctx.socket(zmq.DEALER)
+        dealer.setsockopt(zmq.LINGER, 0)
+        dealer.connect(endpoint)
+        waits = []
+
+        def wait_request(timeout_ms):
+            waits.append(timeout_ms)
+            time.sleep(timeout_ms / 1000)
+            return False
+
+        rust_server = SimpleNamespace(wait_request=wait_request)
+        sleeper = RustServerIdleSleeper(
+            rust_server,
+            timeout_ms=1000,
+            can_empty_cache=lambda: False,
+            hint_socket=router,
+            hint_poll_ms=20,
+        )
+        try:
+            dealer.send(msgpack_encode(PrefetchReqInput(rid="h", token_ids=[1])))
+            start = time.monotonic()
+            self.assertTrue(sleeper.park())
+            self.assertLess(time.monotonic() - start, 0.5)
+            self.assertTrue(all(w <= 20 for w in waits))
+            # The park only looked: the frame is still there for the receiver.
+            self.assertTrue(router.poll(0))
+            router.recv_multipart()
+
+            # A request ends the park at once.
+            rust_server.wait_request = lambda timeout_ms: True
+            self.assertTrue(sleeper.park())
+
+            # Nothing pending: the whole timeout, in slices.
+            rust_server.wait_request = wait_request
+            waits.clear()
+            sleeper.timeout_ms = 100
+            start = time.monotonic()
+            self.assertFalse(sleeper.park())
+            # The last slice is the remainder floored to whole milliseconds.
+            self.assertGreaterEqual(time.monotonic() - start, 0.095)
+            self.assertGreaterEqual(len(waits), 2)
+            self.assertTrue(95 <= sum(waits) <= 100, waits)
+            sleeper.maybe_sleep()
+
+            # Without a hint socket the park is one wait on the ring.
+            waits.clear()
+            plain = RustServerIdleSleeper(
+                rust_server, timeout_ms=7, can_empty_cache=lambda: False
+            )
+            self.assertFalse(plain.park())
+            self.assertEqual(waits, [7])
+        finally:
+            dealer.close()
             router.close()
 
     def test_ipc_round_trip(self):

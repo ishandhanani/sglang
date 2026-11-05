@@ -39,6 +39,13 @@ The group leader pulls the hint and broadcasts it to the other ranks of its KV
 cache with the rest of the batch, so every rank runs the handler; only the
 leader replies.
 
+The hint socket is independent of the request ingress. With the embedded Rust
+server as the ingress (`SGLANG_RUST_SERVER`, the gRPC deployment) the leader
+drains the request ring and then takes one hint per poll from the socket, as
+the ZMQ ingress does. While a hint socket is bound an idle scheduler parks on
+the ring in 20 ms slices and looks at the socket between them, so a hint waits
+at most 20 ms before it is read; a request still wakes the park at once.
+
 > **Security.** The hint socket is unauthenticated and its payload is decoded
 > by a strict `PrefetchReqInput`-only decoder (no pickle, no extension types).
 > A TCP endpoint other than loopback is refused at startup unless

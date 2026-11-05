@@ -2574,9 +2574,12 @@ class Scheduler(
         # The rust server *is* the ingress source: SchedulerRequestReceiver
         # drains its request ring (rust_server_mode) instead of a zmq socket.
         self.recv_from_tokenizer = rust_server
-        # Park the idle loop on the request ring within the rank-0 rust-server
+        # Park the idle loop on the request ring within the rank-0 rust-server;
+        # a bound --hint-zmq-endpoint socket is polled between ring waits.
         self.idle_sleeper = RustServerIdleSleeper(
-            rust_server, can_empty_cache=lambda: not self._engine_paused
+            rust_server,
+            can_empty_cache=lambda: not self._engine_paused,
+            hint_socket=self.ipc_channels.hint_socket,
         )
 
     def get_prefill_adder_class(self) -> type[PrefillAdder]:
