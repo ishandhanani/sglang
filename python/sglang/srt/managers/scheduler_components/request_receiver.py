@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -13,6 +13,7 @@ from typing import (
     Union,
 )
 
+import msgspec
 import torch
 import zmq
 from torch.distributed import ReduceOp, all_reduce, barrier
@@ -24,8 +25,11 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     MMInputsProcessError,
+    PrefetchReqInput,
+    PrefetchReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    msgpack_encode,
     sock_recv,
 )
 from sglang.srt.managers.mm_utils import (
@@ -59,6 +63,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The hint socket faces the network: decode exactly one struct type, with no
+# dec_hook, ext_hook or PickleWrapper arm (the shared IPC codec unpickles).
+_HINT_DECODER = msgspec.msgpack.Decoder(PrefetchReqInput)
+
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
@@ -77,6 +85,15 @@ class SchedulerRequestReceiver:
     rust_server_mode: bool
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
+    # --hint-zmq-endpoint: inbound ROUTER socket for cache hints from an
+    # external controller (group leader only). Each received message is the
+    # ZMQ envelope (the peer identity, plus an empty delimiter for REQ peers)
+    # followed by one payload frame, the tagged array ["PrefetchReqInput",
+    # rid, http_worker_ipc, token_ids, dp_rank]. The envelope is kept per rid
+    # and the PrefetchReqOutput goes back as the same envelope followed by one
+    # msgpack payload frame.
+    hint_socket: Optional[zmq.Socket] = None
+    hint_routes: dict = field(default_factory=dict)
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         return self.max_recv_per_poll >= 0 and num_recv_reqs >= self.max_recv_per_poll
@@ -88,7 +105,8 @@ class SchedulerRequestReceiver:
         pass
 
     def close(self) -> None:
-        pass
+        if self.hint_socket is not None:
+            self.hint_socket.close(linger=0)
 
     @scheduler_stage_method(SCHEDULER_STAGE_RECV_REQUESTS)
     def recv_requests(
@@ -133,32 +151,37 @@ class SchedulerRequestReceiver:
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 recv_reqs = []
 
-                # Rust ringbuffer backend: drain the in-process ring fed by the
-                # embedded Rust TokenizerManager instead of a zmq socket. Same
-                # non-blocking, msgpack-decoded contract as the zmq path below.
                 if self.rust_server_mode:
+                    # Rust ringbuffer backend: drain the in-process ring fed by
+                    # the embedded Rust TokenizerManager instead of a zmq socket.
+                    # Same non-blocking, msgpack-decoded contract as the zmq
+                    # path below. Control requests arrive on the ring too, so
+                    # the rpc socket is not read on this branch.
                     recv_reqs.extend(
                         self.recv_from_tokenizer.drain(self.max_recv_per_poll)
                     )
-                    return recv_reqs
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                else:
+                    while True:
+                        try:
+                            if self.recv_limit_reached(len(recv_reqs)):
+                                break
+                            recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
+                        except zmq.ZMQError:
                             break
-                        recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
+                        recv_reqs.append(recv_req)
 
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                    while True:
+                        try:
+                            if self.recv_limit_reached(len(recv_reqs)):
+                                break
+                            recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
+                        except zmq.ZMQError:
                             break
-                        recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
+                        recv_reqs.append(recv_rpc)
+
+                # The hint socket is independent of the ingress: both branches
+                # take their one hint per poll here.
+                self._pull_hint_reqs(recv_reqs)
             else:
                 recv_reqs = None
         else:
@@ -178,6 +201,59 @@ class SchedulerRequestReceiver:
             else:
                 recv_reqs = None
         return recv_reqs
+
+    def _pull_hint_reqs(self, recv_reqs: List) -> None:
+        """Take one hint per poll off the hint socket into the recv list; the
+        group broadcast carries it on like any request. One per poll bounds
+        the validation work a peer can push into a scheduler iteration; the
+        handler answers a hint that arrives while one is in flight."""
+        socket = self.hint_socket
+        if socket is None or self.recv_limit_reached(len(recv_reqs)):
+            return
+        try:
+            frames = socket.recv_multipart(zmq.NOBLOCK)
+        except zmq.ZMQError:
+            return
+        if len(frames) < 2:
+            logger.warning("Hint socket: dropping a message without an envelope")
+            return
+        try:
+            obj = _HINT_DECODER.decode(frames[-1])
+        except (msgspec.DecodeError, msgspec.ValidationError) as error:
+            logger.warning("Hint socket: undecodable payload dropped: %s", error)
+            return
+        route = frames[:-1]
+        if obj.rid in self.hint_routes:
+            self._send_hint_reply(
+                route,
+                PrefetchReqOutput(
+                    rid=obj.rid, error="A hint with this rid is in flight."
+                ),
+            )
+            return
+        self.hint_routes[obj.rid] = route
+        recv_reqs.append(obj)
+
+    def reply_hint(self, output: Any) -> bool:
+        """Send a PrefetchReqOutput back to the hint peer that asked for it.
+        False when the request did not arrive on the hint socket."""
+        if self.hint_socket is None or not isinstance(output, PrefetchReqOutput):
+            return False
+        route = self.hint_routes.pop(output.rid, None)
+        if route is None:
+            return False
+        self._send_hint_reply(route, output)
+        return True
+
+    def _send_hint_reply(self, route: List[bytes], output: PrefetchReqOutput) -> None:
+        try:
+            self.hint_socket.send_multipart(
+                [*route, msgpack_encode(output)], zmq.NOBLOCK
+            )
+        except zmq.ZMQError as error:
+            logger.warning(
+                "Hint socket: reply for rid=%s dropped: %s", output.rid, error
+            )
 
     def _broadcast_reqs_across_ranks(
         self, recv_reqs: Optional[List], local_reqs: Optional[List] = None

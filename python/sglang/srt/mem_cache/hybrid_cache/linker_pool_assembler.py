@@ -128,16 +128,26 @@ class DevicePoolEntry:
         return self._rows(indices)
 
     def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
-        mapped = self.layer_mapping.get(layer)
-        if mapped is None:
-            return None
-        buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
+        return self.get_prepared_layers_range_meta(locations, (layer,))
 
+    def get_prepared_layers_range_meta(
+        self, locations: list[int], layers: Sequence[int]
+    ):
+        """Per row, the (ptr, size, object offset) ranges of ``layers`` in
+        order, so one ranged get can fetch several layers of a page at once.
+        None when none of the layers maps onto this pool."""
         items = []
-        for component, offsets in zip(self.buffer_meta, self._component_offsets):
-            for buffer_index in buffer_indices:
-                base_ptr, row_stride, size = component[buffer_index]
-                items.append((base_ptr, row_stride, size, offsets[buffer_index]))
+        for layer in layers:
+            mapped = self.layer_mapping.get(layer)
+            if mapped is None:
+                continue
+            buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
+            for component, offsets in zip(self.buffer_meta, self._component_offsets):
+                for buffer_index in buffer_indices:
+                    base_ptr, row_stride, size = component[buffer_index]
+                    items.append((base_ptr, row_stride, size, offsets[buffer_index]))
+        if not items:
+            return None
 
         ptrs, sizes, offsets = [], [], []
         for row in locations:

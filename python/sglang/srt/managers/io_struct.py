@@ -1925,6 +1925,51 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class PrefetchReqInput(BaseReq, kw_only=True):
+    """Load the external-linker (L3) hit for ``token_ids`` into the device
+    radix tree without a forward pass.
+
+    Arrives on the scheduler's tokenizer input socket like any control
+    request (``TokenizerManager.prefetch`` is the in-process sender), or on
+    the ``--hint-zmq-endpoint`` ROUTER socket from an external controller.
+    On the wire it is one msgpack payload frame, the tagged array
+    ``["PrefetchReqInput", rid, http_worker_ipc, [token_id, ...], dp_rank]``
+    (``http_worker_ipc`` is ``nil`` on the hint socket, where the frame is
+    decoded by a strict :class:`PrefetchReqInput`-only decoder; the tokenizer
+    socket uses the shared IPC codec). A DEALER peer sends just that frame; a
+    REQ peer's empty delimiter frame is mirrored back. The group leader pulls
+    it and broadcasts it to its ranks with the rest of the batch, so every
+    rank runs the handler. The reply is one :class:`PrefetchReqOutput`
+    frame, ``["PrefetchReqOutput", rid, http_worker_ipc, matched_tokens,
+    loaded_tokens, elapsed_ms, error]``, from the leader only: on the hint
+    socket to the sender's identity, else on the tokenizer output socket.
+
+    ``dp_rank`` names the KV cache the hint is for: the attention-DP rank
+    under DP attention, else the data-parallel replica (``None`` means 0).
+    Each such rank binds its own hint socket at the endpoint's port plus its
+    rank; a hint whose ``dp_rank`` does not match the receiving engine is
+    answered with ``error``.
+    """
+
+    rid: str
+    token_ids: List[int]
+    dp_rank: Optional[int] = None
+
+
+class PrefetchReqOutput(BaseReq, kw_only=True):
+    rid: str
+    # Page-aligned prefix resident on device after the prefetch: the device
+    # hit plus what the linker loaded.
+    matched_tokens: int = 0
+    # Tokens the linker loaded from the external store into the tree.
+    loaded_tokens: int = 0
+    # Wall-clock from scheduler dispatch to this reply: the loaded tail has
+    # joined the tree, or the hint was refused.
+    elapsed_ms: float = 0.0
+    # None on success; otherwise why nothing (more) was loaded.
+    error: Optional[str] = None
+
+
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None

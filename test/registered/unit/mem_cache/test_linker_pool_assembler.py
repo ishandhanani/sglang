@@ -74,6 +74,47 @@ class TestDevicePoolEntry(CustomTestCase):
         self.assertEqual(sizes, [[10], [22], [10], [22]])
         self.assertEqual(offsets, [[6], [14], [6], [14]])
 
+    def test_multi_layer_ranges_concatenate_per_row(self):
+        """One ranged get can carry several layers of a page: the ranges of
+        the requested layers follow each other per row, layers without a
+        mapping are skipped, and the single-layer form is the special case."""
+        k0 = torch.zeros((8, 3), dtype=torch.uint8)
+        k2 = torch.zeros((8, 5), dtype=torch.uint8)
+        v0 = torch.zeros((8, 7), dtype=torch.uint8)
+        v2 = torch.zeros((8, 11), dtype=torch.uint8)
+        pool = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[k0, k2], [v0, v2]],
+            layer_mapping={0: 0, 2: 1},
+            page_size=2,
+            rows_are_pages=False,
+        )
+        locations = pool.prepare_locations(torch.tensor([0, 1, 4, 5]))
+
+        self.assertIsNone(pool.get_prepared_layers_range_meta(locations, (1,)))
+        pointers, sizes, offsets = pool.get_prepared_layers_range_meta(
+            locations, range(3)
+        )
+        self.assertEqual(
+            pointers,
+            [
+                [
+                    k0[row].data_ptr(),
+                    v0[row].data_ptr(),
+                    k2[row].data_ptr(),
+                    v2[row].data_ptr(),
+                ]
+                for row in locations
+            ],
+        )
+        self.assertEqual(sizes, [[6, 14, 10, 22]] * 2)
+        self.assertEqual(offsets, [[0, 16, 6, 30]] * 2)
+        single = pool.get_prepared_layer_range_meta(locations, 2)
+        self.assertEqual(single, pool.get_prepared_layers_range_meta(locations, (2,)))
+        self.assertEqual(single[1], [[10, 22]] * 2)
+
     def test_rejects_invalid_pages_and_empty_buffers(self):
         with self.assertRaisesRegex(ValueError, "has no storage buffers"):
             DevicePoolEntry(

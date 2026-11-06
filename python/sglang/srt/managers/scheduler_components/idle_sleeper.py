@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import time
+from typing import TYPE_CHECKING, Optional
 
 import zmq
 
@@ -44,6 +45,11 @@ class IdleSleeper:
                 current_platform.empty_cache()
 
 
+# With a hint socket bound, the Rust-server park is cut into slices of this
+# length and the socket is polled between them (see RustServerIdleSleeper).
+HINT_POLL_MS = 20
+
+
 class RustServerIdleSleeper:
     """Idle sleeper for the embedded Rust server.
 
@@ -52,19 +58,52 @@ class RustServerIdleSleeper:
     a request is pushed — the request ring wakes the parked thread
     the instant a producer pushes, so there's no added latency for real
     requests — or the timeout elapses.
+
+    The --hint-zmq-endpoint socket is a zmq socket the ring's Rust-side
+    select cannot watch, and the scheduler thread owns the socket so no other
+    thread may poll it. With a hint socket bound the park is therefore cut
+    into ``hint_poll_ms`` slices of ``wait_request`` with a zero-timeout poll
+    of the socket between them: a request still wakes the park at once, and
+    a hint waits at most one slice (HINT_POLL_MS, 20 ms by default) instead
+    of the full ``timeout_ms``.
     """
 
     def __init__(
-        self, rust_server: RustServer, timeout_ms: int = 1000, can_empty_cache=None
+        self,
+        rust_server: RustServer,
+        timeout_ms: int = 1000,
+        can_empty_cache=None,
+        hint_socket: Optional[zmq.Socket] = None,
+        hint_poll_ms: int = HINT_POLL_MS,
     ):
         self.rust_server = rust_server
         self.timeout_ms = timeout_ms
         self.last_empty_time = real_time()
         self.can_empty_cache = can_empty_cache
         self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
+        self.hint_poll_ms = hint_poll_ms
+        self.hint_poller = None
+        if hint_socket is not None:
+            self.hint_poller = zmq.Poller()
+            self.hint_poller.register(hint_socket, zmq.POLLIN)
+
+    def park(self) -> bool:
+        """Block until the ring holds a request, the hint socket holds a
+        message, or ``timeout_ms`` elapse. True when woken for work."""
+        if self.hint_poller is None:
+            return bool(self.rust_server.wait_request(self.timeout_ms))
+        deadline = time.monotonic() + self.timeout_ms / 1000
+        while True:
+            if self.hint_poller.poll(0):
+                return True
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                return False
+            if self.rust_server.wait_request(min(self.hint_poll_ms, remaining_ms)):
+                return True
 
     def maybe_sleep(self):
-        self.rust_server.wait_request(self.timeout_ms)
+        self.park()
         if (
             self.empty_cache_interval > 0
             and real_time() - self.last_empty_time > self.empty_cache_interval

@@ -359,6 +359,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
+        # Last tree walk's wall-clock, read by the linker's L3 timing record.
+        self._l3_tree_walk_ms = 0.0
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
@@ -668,10 +670,14 @@ class UnifiedRadixCache(BasePrefixCache):
     def _match_tree(self, params: MatchPrefixParams) -> MatchResult:
         if self.disable:
             return self.tree_core.empty_match_result
+        walk_start = time.perf_counter()
         result = self.tree_core.match_prefix(params)
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)
+        if self.linker is not None:
+            # Read by the linker's match for its L3 timing record.
+            self._l3_tree_walk_ms = (time.perf_counter() - walk_start) * 1000.0
         return self._finalize_match_result(params, result)
 
     def _finalize_match_result(
@@ -1455,6 +1461,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # instead of forking it, and the tree frees what the request still held.
         is_finished = req.finished()
         token_ids = req.full_untruncated_fill_ids[:up_to]
+        if self.linker is not None:
+            self.linker.note_insert(req.rid)
 
         if self.disable:
             if is_finished:

@@ -696,6 +696,137 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             buckets=(1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
         )
+
+        # =================================================================
+        # Unified-cache external linker (direct L3 -> device loads)
+        # =================================================================
+        self.linker_load_bytes_total = Counter(
+            name="sglang:linker_load_bytes_total",
+            documentation="Bytes the external linker loaded from the store "
+            "into device KV, per rank.",
+            labelnames=labels.keys(),
+        )
+        self.linker_load_pages_total = Counter(
+            name="sglang:linker_load_pages_total",
+            documentation="KV pages the external linker loaded from the store.",
+            labelnames=labels.keys(),
+        )
+        self.linker_load_latency_seconds = Histogram(
+            name="sglang:linker_load_latency_seconds",
+            documentation="Histogram of external linker load batch wall-clock "
+            "in seconds, from the first store read to the last layer landing.",
+            labelnames=labels.keys(),
+            buckets=(
+                0.001,
+                0.002,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1,
+                2.5,
+                5,
+                10,
+            ),
+        )
+        self.prefetch_latency_seconds = Histogram(
+            name="sglang:prefetch_latency_seconds",
+            documentation="Histogram of prefetch hint handling time in seconds, "
+            "from scheduler dispatch to the loaded tail joining the radix tree.",
+            labelnames=labels.keys(),
+            buckets=(
+                0.001,
+                0.002,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1,
+                2.5,
+                5,
+                10,
+            ),
+        )
+        self.prefetch_loaded_tokens_total = Counter(
+            name="sglang:prefetch_loaded_tokens_total",
+            documentation="Tokens /prefetch loaded from the external store into "
+            "the radix tree.",
+            labelnames=labels.keys(),
+        )
+        self.prefetch_requests_total = Counter(
+            name="sglang:prefetch_requests_total",
+            documentation="Completed prefetch requests by outcome.",
+            labelnames=list(labels.keys()) + ["outcome"],
+        )
+        self.prefetch_join_held_total = Counter(
+            name="sglang:prefetch_join_held_total",
+            documentation="Waiting requests held back because an in-flight "
+            "prefetch was loading pages of their prefix.",
+            labelnames=labels.keys(),
+        )
+        self.prefetch_join_released_total = Counter(
+            name="sglang:prefetch_join_released_total",
+            documentation="Held requests released once the prefetch finished, "
+            "was aborted or exceeded the hold cap.",
+            labelnames=labels.keys(),
+        )
+        self.linker_phase_seconds = Histogram(
+            name="sglang:linker_phase_seconds",
+            documentation="Per store-hit phase wall-clock in seconds, by phase: "
+            "tree_walk (radix match), hash (page hashing), lookup "
+            "(batch_exists_v2 round trip), sync (cross-rank all-reduce), "
+            "load_back (slot allocation and queueing), queue_wait (queued to "
+            "first store read), load_total (all layers), complete_to_insert "
+            "(load landed to tree insert) and match_to_insert (end to end). "
+            "kind is prefetch or request.",
+            labelnames=list(labels.keys()) + ["kind", "phase"],
+            buckets=(
+                0.00005,
+                0.0001,
+                0.00025,
+                0.0005,
+                0.001,
+                0.002,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1,
+                2.5,
+                5,
+            ),
+        )
+        self.linker_load_get_seconds = Histogram(
+            name="sglang:linker_load_get_seconds",
+            documentation="External linker time per ranged store get in seconds "
+            "(one get carries load_layers_per_get layers of every page).",
+            labelnames=labels.keys(),
+            buckets=(
+                0.00005,
+                0.0001,
+                0.00025,
+                0.0005,
+                0.001,
+                0.002,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1,
+            ),
+        )
         self.kv_transfer_total_mb = Histogram(
             name="sglang:kv_transfer_total_mb",
             documentation="Histogram of KV cache transfer size in MB.",
@@ -1468,6 +1599,51 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_histogram(self.kv_transfer_latency_ms, latency_ms)
         self._log_histogram(self.kv_transfer_total_mb, total_mb)
         self._log_histogram(self.kv_transfer_speed_gb_s, speed_gb_s)
+
+    def observe_linker_load(
+        self, num_bytes: int, num_pages: int, latency_ms: float
+    ) -> None:
+        """One external-linker load batch; called from the linker's load thread."""
+        self.linker_load_bytes_total.labels(**self.labels).inc(num_bytes)
+        self.linker_load_pages_total.labels(**self.labels).inc(num_pages)
+        self._log_histogram(self.linker_load_latency_seconds, latency_ms / 1000.0)
+
+    def observe_linker_timing(self, timing) -> None:
+        """One closed L3Timing record (see unified_cache_linker.L3Timing)."""
+        phases = {
+            "tree_walk": timing.tree_walk_ms,
+            "hash": timing.hash_ms,
+            "lookup": timing.lookup_ms,
+            "sync": timing.sync_ms,
+            "load_back": timing.load_back_ms,
+            "queue_wait": timing.queue_wait_ms,
+            "load_total": timing.load_total_ms,
+            "complete_to_insert": timing.complete_to_insert_ms,
+            "match_to_insert": timing.match_to_insert_ms,
+        }
+        for phase, value in phases.items():
+            if value is not None:
+                self.linker_phase_seconds.labels(
+                    **self.labels, kind=timing.kind, phase=phase
+                ).observe(value / 1000.0)
+        for get_ms in timing.load_gets_ms:
+            self._log_histogram(self.linker_load_get_seconds, get_ms / 1000.0)
+
+    def observe_prefetch(
+        self, loaded_tokens: int, latency_ms: float, success: bool
+    ) -> None:
+        self._log_histogram(self.prefetch_latency_seconds, latency_ms / 1000.0)
+        if loaded_tokens:
+            self.prefetch_loaded_tokens_total.labels(**self.labels).inc(loaded_tokens)
+        self.prefetch_requests_total.labels(
+            **self.labels, outcome="landed" if success else "failed"
+        ).inc()
+
+    def observe_prefetch_join(self, *, held: int = 0, released: int = 0) -> None:
+        if held:
+            self.prefetch_join_held_total.labels(**self.labels).inc(held)
+        if released:
+            self.prefetch_join_released_total.labels(**self.labels).inc(released)
 
     def observe_kv_transfer_bootstrap(
         self,

@@ -1,0 +1,184 @@
+---
+title: "KV Cache Hints (Prefetch)"
+metatags:
+    description: "Let an external controller such as NVIDIA Dynamo pull a prefix from the external KV store into a worker's device cache ahead of the request, over a direct ZMQ socket."
+---
+
+A KV cache hint tells a worker to do cache work that no request has asked for
+yet. The one hint SGLang supports is **prefetch**: load the external-store
+(L3) hit for a token prefix into the device radix tree, without a forward pass,
+so that the request arriving next gets a device hit instead of paying for the
+store read on its critical path.
+
+Prefetch needs the unified radix cache with the direct external linker
+(`--enable-unified-cache-external-linker`, Mooncake backend). It takes the path
+a request takes up to its forward: tree walk, store lookup, slot allocation, the
+load thread filling the slots from the store, then the finished-request insert
+that publishes the pages in the tree. The scheduler loop keeps running while the
+load is in flight, and a hint that cannot be served is answered with `error` set
+rather than raising.
+
+A prefetch pays off when the request would otherwise wait in a queue (router
+admission, scheduler backlog) for at least as long as the store read takes: the
+prefetch overlaps the read with that wait. Without a wait, the request itself
+gets to the store first and the prefetch finds nothing left to do.
+
+## Sending a prefetch
+
+Two ingress paths deliver a `PrefetchReqInput` to the scheduler:
+
+- **In process**: `TokenizerManager.prefetch(token_ids, timeout_s=None)` sends
+  it over the tokenizer -> scheduler socket like `flush_cache` and awaits the
+  reply.
+- **Hint socket**: `--hint-zmq-endpoint tcp://127.0.0.1:5558` binds a ZMQ
+  ROUTER socket on each scheduler group leader. An external controller connects
+  a DEALER (or REQ) socket and sends hints directly, bypassing the HTTP server
+  and the tokenizer. This is the path NVIDIA Dynamo's hint controller uses.
+
+The group leader pulls the hint and broadcasts it to the other ranks of its KV
+cache with the rest of the batch, so every rank runs the handler; only the
+leader replies.
+
+The hint socket is independent of the request ingress. With the embedded Rust
+server as the ingress (`SGLANG_RUST_SERVER`, the gRPC deployment) the leader
+drains the request ring and then takes one hint per poll from the socket, as
+the ZMQ ingress does. While a hint socket is bound an idle scheduler parks on
+the ring in 20 ms slices and looks at the socket between them, so a hint waits
+at most 20 ms before it is read; a request still wakes the park at once.
+
+> **Security.** The hint socket is unauthenticated and its payload is decoded
+> by a strict `PrefetchReqInput`-only decoder (no pickle, no extension types).
+> A TCP endpoint other than loopback is refused at startup unless
+> `SGLANG_ZMQ_ALLOWED_PEERS` lists the controller's addresses (the same
+> allowlist the other ZMQ sockets use, CVE-2026-3060).
+
+### Data parallelism
+
+Each KV cache has its own hint socket: with DP attention every attention-DP
+rank, with pure DP every replica, binds the endpoint's port plus its rank
+(`tcp://host:5558` becomes `5558 + r`; an `ipc://` endpoint gets `-r`
+appended). The frame's `dp_rank` names the cache the hint is for (`null`
+means 0) and must match the receiving engine, otherwise the hint is answered
+with `error` and nothing is loaded.
+
+### Wire format
+
+Each message on the hint socket is one msgpack payload frame (the standard ZMQ
+ROUTER envelope precedes it: the peer identity, plus an empty delimiter frame
+for REQ peers, which is mirrored back). The payload is the tagged array the
+scheduler's `msgpack_encode` produces for any control request:
+
+```text
+["PrefetchReqInput", rid, http_worker_ipc, token_ids, dp_rank]
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `rid` | str | Caller-chosen id, echoed in the reply. A second hint with the rid of one still in flight is answered with `error` immediately. |
+| `http_worker_ipc` | nil | Unused on the hint socket; send `nil`. |
+| `token_ids` | [int] | The prefix to prefetch. Validated against the vocabulary and `--prefetch-max-tokens` (default: the context length). |
+| `dp_rank` | int or nil | The KV cache the hint is for; `nil` means 0. See Data parallelism. |
+
+The reply is one `PrefetchReqOutput` frame on the same socket, to the sender's
+identity:
+
+```text
+["PrefetchReqOutput", rid, http_worker_ipc, matched_tokens, loaded_tokens, elapsed_ms, error]
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `matched_tokens` | int | Page-aligned prefix resident on device after the prefetch: the device hit plus what was loaded. |
+| `loaded_tokens` | int | Tokens the linker loaded from the store into the tree. |
+| `elapsed_ms` | float | Wall-clock from scheduler dispatch to the reply. |
+| `error` | str or nil | `nil` on success; otherwise why nothing (more) was loaded. |
+
+One prefetch is in flight per scheduler at a time; a second one is answered
+with `error` immediately. The hit is loaded only up to the KV headroom the
+pool has after the running batch's decode reserve (the same estimate prefill
+admission uses), truncated at page granularity, and never more than
+`--prefetch-max-tokens`. Prefetch is not supported on hybrid Mamba or SWA
+trees. A flush or memory release waits for an in-flight prefetch to land
+(`release_memory_occupation` and shutdown abort it: the load is waited for
+and its slots are freed without an insert).
+
+The request a prefetch was sent for usually reaches the scheduler before the
+prefetch has landed. While a prefetch is in flight, the batch builder holds back
+a waiting request whose prefix shares pages with the prefetch beyond what the
+request already has on device (**join-in-flight**), instead of admitting it and
+loading the same pages from the store a second time. The request keeps its
+place in the queue and is admitted as soon as the prefetch lands, fails or is
+aborted, or after at most 2 s of holding; its next match then finds the pages
+on device. Holds are counted in `sglang:prefetch_join_held_total` and
+`sglang:prefetch_join_released_total` and logged at debug level with the pages
+the request reuses.
+
+```python
+import uuid, zmq
+from sglang.srt.managers.io_struct import PrefetchReqInput, msgpack_decode, msgpack_encode
+
+sock = zmq.Context.instance().socket(zmq.DEALER)
+sock.connect("tcp://worker:5558")
+sock.send(msgpack_encode(PrefetchReqInput(rid=uuid.uuid4().hex, token_ids=token_ids)))
+reply = msgpack_decode(sock.recv())
+print(reply.matched_tokens, reply.loaded_tokens, reply.elapsed_ms, reply.error)
+```
+
+## How the load runs
+
+The Mooncake direct linker stores one object per page, with every transfer
+layer of that page packed back to back. A request's load is **layer-wise**:
+one ranged get per layer, so the forward can start on layer 0 while later
+layers are still in flight. A prefetch has no forward waiting, so it is a
+**bulk load**: by default one ranged get carries every layer of every page,
+which turns `num_layers` round trips into one. Both are the same code path with
+a different layers-per-get setting.
+
+With `--enable-linker-mla-dedup` (replicated MLA/DSA KV), only attention-TP
+rank 0 reads the store and the other ranks receive the pages over an NVLink
+broadcast. For a request the broadcast is driven layer by layer by the forward's
+waits; for a prefetch it is driven by the completion poll once the whole load
+has landed, and the prefetch is published only after every rank's copy arrived.
+
+### Knobs
+
+Linker configuration (`--unified-cache-external-linker-config`, JSON):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `load_layers_per_get` | `1` | Transfer layers per ranged get on the request path. Raising it trades forward/load overlap for fewer round trips. |
+| `bulk_load_layers_per_get` | `0` (all) | Transfer layers per ranged get on the prefetch path. `0` fetches whole pages in one get; set a positive value to cap the fragments a single get carries. |
+
+Mooncake transfer-engine environment variables that bound the throughput of a
+load (each (page, layer) range is one transfer fragment, so a prefetch of 1000
+pages on an 80-layer model issues about 80k fragments per pool):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MC_WORKERS_PER_CTX` | `2` | Worker threads posting and completing RDMA work per device context (1-8). |
+| `MC_NUM_QP_PER_EP` | `2` | Queue pairs per endpoint; more QPs spread the fragments over more NIC queues. |
+| `MC_MAX_WR` | `256` | Work-request depth per queue pair. |
+| `MC_SLICE_SIZE` | `65536` | Largest single RDMA slice; fragments above it are split. |
+| `MC_PATH_ROUNDROBIN` | unset | Round-robin fragments across the NICs a rank was given instead of the preferred one. |
+
+Server arguments: `--hint-zmq-endpoint`, `--prefetch-max-tokens` (see
+[Server Arguments](./server_arguments)).
+
+## Metrics
+
+With `--enable-metrics` the scheduler exports, per rank:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `sglang:prefetch_requests_total{outcome}` | counter | Completed prefetches, `landed` or `failed`. |
+| `sglang:prefetch_loaded_tokens_total` | counter | Tokens prefetch loaded into the tree. |
+| `sglang:prefetch_latency_seconds` | histogram | Scheduler dispatch to the loaded tail joining the tree. |
+| `sglang:prefetch_join_held_total`, `sglang:prefetch_join_released_total` | counter | Waiting requests held because an in-flight prefetch was loading pages of their prefix, and holds released (prefetch landed, failed, aborted, or the 2 s cap). |
+| `sglang:linker_load_bytes_total`, `sglang:linker_load_pages_total` | counter | Bytes and pages the linker loaded from the store (requests and prefetches). |
+| `sglang:linker_load_latency_seconds` | histogram | Load batch wall-clock, first store read to last layer. |
+| `sglang:linker_load_get_seconds` | histogram | Time per ranged store get. |
+| `sglang:linker_phase_seconds{kind,phase}` | histogram | Per store hit: `tree_walk`, `hash`, `lookup`, `sync`, `load_back`, `queue_wait`, `load_total`, `complete_to_insert`, `match_to_insert`; `kind` is `request` or `prefetch`. |
+
+At debug log level each store hit also logs one `L3 timing rid=... kind=...`
+line with the same phases, which is the quickest way to see where a prefetch
+spends its time.

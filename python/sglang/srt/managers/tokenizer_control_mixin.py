@@ -59,6 +59,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
+    PrefetchReqInput,
+    PrefetchReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -129,6 +131,7 @@ _COMMUNICATOR_SPECS = [
     ("slow_down", SlowDownReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("prefetch", PrefetchReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -333,6 +336,42 @@ class TokenizerControlMixin:
         if result.success and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         return result
+
+    async def prefetch(
+        self: TokenizerManager,
+        token_ids: List[int],
+        dp_rank: Optional[int] = None,
+    ) -> PrefetchReqOutput:
+        """Load the external-linker hit for ``token_ids`` into the device radix
+        tree of KV cache ``dp_rank`` (``None``: 0) without a forward pass.
+
+        Sends a :class:`PrefetchReqInput` over the tokenizer -> scheduler zmq
+        socket, like ``flush_cache``, and awaits the :class:`PrefetchReqOutput`
+        the scheduler sends back once the load has landed or failed. The wait
+        is not bounded client-side: the communicator serialises calls, so a
+        reply must never be left behind for the next caller. Every engine
+        answers; the one serving ``dp_rank`` decides.
+        """
+        from sglang.srt.managers.scheduler_components.prefetch_wrapper import (
+            NOT_SERVED_ERROR,
+        )
+
+        self.auto_create_handle_loop()
+        obj = PrefetchReqInput(
+            rid=uuid.uuid4().hex, token_ids=list(token_ids), dp_rank=dp_rank
+        )
+        results = await self.prefetch_communicator(obj)
+        results = [r for r in results if r.rid == obj.rid]
+        served = [
+            r
+            for r in results
+            if r.error is None or not r.error.startswith(NOT_SERVED_ERROR)
+        ]
+        if served:
+            return served[0]
+        if results:
+            return results[0]
+        return PrefetchReqOutput(rid=obj.rid, error="No engine answered the prefetch.")
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

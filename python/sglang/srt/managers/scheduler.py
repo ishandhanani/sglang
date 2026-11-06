@@ -181,6 +181,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PrefetchReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ReleaseUocrDocReqInput,
@@ -294,6 +295,9 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
+)
+from sglang.srt.managers.scheduler_components.prefetch_wrapper import (
+    SchedulerPrefetchWrapper,
 )
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
@@ -874,6 +878,17 @@ class Scheduler(
         )
         self.metrics_collector = self.metrics_collector_context.collector
 
+    @property
+    def served_dp_rank(self) -> int:
+        """Index of the KV cache this scheduler serves: the attention-DP rank
+        under DP attention, else the pure-DP replica (0 without DP)."""
+        from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
+
+        parallel = get_parallel()
+        return select_kv_publisher_dp_rank(
+            parallel.attn_dp_size, parallel.attn_dp_rank, parallel.dp_rank
+        )
+
     def init_ipc_channels(self, port_args: PortArgs):
         is_rank_zero = is_scheduler_io_rank()
         self.ipc_channels = SchedulerIpcChannels.create(
@@ -889,6 +904,9 @@ class Scheduler(
                 or get_observability().enable_metrics_for_all_schedulers
             ),
             enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
+            hint_zmq_endpoint=get_observability().hint_zmq_endpoint,
+            hint_dp_rank=self.served_dp_rank,
+            num_dp_ranks=get_parallel().num_dp_ranks,
         )
 
         self.load_snapshot_writer = None
@@ -918,8 +936,13 @@ class Scheduler(
         ):
             self.idle_sleeper = IdleSleeper(
                 sockets=[
-                    self.ipc_channels.recv_from_tokenizer,
-                    self.ipc_channels.recv_from_rpc,
+                    socket
+                    for socket in (
+                        self.ipc_channels.recv_from_tokenizer,
+                        self.ipc_channels.recv_from_rpc,
+                        self.ipc_channels.hint_socket,
+                    )
+                    if socket is not None
                 ],
                 can_empty_cache=lambda: not self._engine_paused,
             )
@@ -1407,6 +1430,12 @@ class Scheduler(
             is_fully_idle=self.is_fully_idle,
             send_output=self.send_control_output,
         )
+        self.prefetch_wrapper = SchedulerPrefetchWrapper(
+            scheduler=self,
+            send_output=self.send_control_output,
+            served_dp_rank=self.served_dp_rank,
+        )
+        self._init_linker_load_observer()
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
@@ -1905,6 +1934,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
+                (PrefetchReqInput, self.prefetch_wrapper.handle),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -2034,6 +2064,7 @@ class Scheduler(
         return result_dict
 
     def release_host_resources(self) -> None:
+        self.prefetch_wrapper.abort()
         self.request_receiver.close()
         if self.uocr_runtime is not None:
             self.uocr_runtime.close()
@@ -2327,6 +2358,7 @@ class Scheduler(
                     self.send_control_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
+        self.prefetch_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
@@ -2349,6 +2381,9 @@ class Scheduler(
 
     def send_control_output(self, output, recv_req) -> None:
         """Answer a control request, at dispatch or later (a deferred flush)."""
+        if self.request_receiver.reply_hint(output):
+            # A hint that came in on --hint-zmq-endpoint is answered there.
+            return
         if self.rust_server is not None:
             # Embedded Rust server: every control-request response goes
             # back through the egress ring (the zmq tokenizer socket is
@@ -2455,6 +2490,19 @@ class Scheduler(
             get_forward_ct=lambda: self.forward_ct,
         )
 
+    def _init_linker_load_observer(self) -> None:
+        """Route per-load linker telemetry into the scheduler's metrics."""
+        if self.metrics_collector is None:
+            return
+        linker = getattr(self.tree_cache, "linker", None)
+        if linker is None:
+            return
+        linker.timing_observer = self.metrics_collector.observe_linker_timing
+        if hasattr(linker.cache_linker, "load_observer"):
+            linker.cache_linker.load_observer = (
+                self.metrics_collector.observe_linker_load
+            )
+
     def init_weight_updater(self) -> None:
         self.weight_updater = SchedulerWeightUpdaterManager(
             tp_worker=self.tp_worker,
@@ -2542,9 +2590,12 @@ class Scheduler(
         # The rust server *is* the ingress source: SchedulerRequestReceiver
         # drains its request ring (rust_server_mode) instead of a zmq socket.
         self.recv_from_tokenizer = rust_server
-        # Park the idle loop on the request ring within the rank-0 rust-server
+        # Park the idle loop on the request ring within the rank-0 rust-server;
+        # a bound --hint-zmq-endpoint socket is polled between ring waits.
         self.idle_sleeper = RustServerIdleSleeper(
-            rust_server, can_empty_cache=lambda: not self._engine_paused
+            rust_server,
+            can_empty_cache=lambda: not self._engine_paused,
+            hint_socket=self.ipc_channels.hint_socket,
         )
 
     def get_prefill_adder_class(self) -> type[PrefillAdder]:
@@ -2598,6 +2649,7 @@ class Scheduler(
         self.request_receiver = receiver_factory(
             recv_from_tokenizer=self.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
+            hint_socket=self.ipc_channels.hint_socket,
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
             mm_receiver=self.mm_receiver,
@@ -4486,6 +4538,12 @@ class Scheduler(
                 ):
                     break
 
+            if self.prefetch_wrapper.holds(req):
+                # An in-flight prefetch is landing pages of this prefix that
+                # are not in the tree yet; admitted now, the request would
+                # load them from the store a second time. It keeps its place.
+                continue
+
             if self.enable_hicache_storage or self.enable_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
@@ -5625,8 +5683,15 @@ class Scheduler(
             self.disaggregation_mode == DisaggregationMode.DECODE
             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
         )
+        # A prefetch load likewise holds request-private slots (and a request
+        # row) that no queued or running request accounts for until it lands.
+        prefetch_pending = self.prefetch_wrapper.has_pending()
         with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
-            if not self.enable_hisparse and not deferred_pending:
+            if (
+                not self.enable_hisparse
+                and not deferred_pending
+                and not prefetch_pending
+            ):
                 has_leak, messages = self.invariant_checker._check_all_pools(
                     self.pool_stats_observer.get_pool_stats(),
                 )
@@ -5662,9 +5727,10 @@ class Scheduler(
             self.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
 
-        if self.deferred_responses.has_pending():
-            # Held responses are released by polling, not by a socket event:
-            # keep polling, and yield the GIL to the completion's worker.
+        if self.deferred_responses.has_pending() or self.prefetch_wrapper.has_pending():
+            # Held responses and an in-flight prefetch are released by
+            # polling, not by a socket event: keep polling, and yield the GIL
+            # to the completion's worker.
             time.sleep(0)
         else:
             # sleep until next event
@@ -5727,6 +5793,8 @@ class Scheduler(
 
         if not for_health_check:
             idle &= not self.request_receiver.has_pending()
+            # A prefetch holds a request row and private KV slots until it lands.
+            idle &= not self.prefetch_wrapper.has_pending()
             if self.uocr_runtime is not None:
                 idle &= not self.uocr_runtime.blocks_flush(
                     ignore_waiting=ignore_waiting
