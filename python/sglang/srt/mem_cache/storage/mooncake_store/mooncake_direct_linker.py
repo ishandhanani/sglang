@@ -217,6 +217,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         self.register_buffers()
         self.mla_broadcaster = None
+        # (kind, KV pages, seconds, ok) per load batch; set with --enable-metrics.
+        self.load_observer = None
         self.tp_group = tp_group
         self.broadcast_loads = {}
         if (
@@ -314,7 +316,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return True
 
     def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
-        if self.load_mode != "prefetch" or not self.load_thread.is_alive():
+        if not self.load_thread.is_alive():
             return None
         expanded = self.pool_group.resolve_transfers(
             transfers, allow_partial=True, allow_missing_kv=True
@@ -435,12 +437,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 prefetch = isinstance(completion, Future)
                 if prefetch and not completion.set_running_or_notify_cancel():
                     continue
+                transfers = pending if prefetch else sum(pending.values(), [])
+                started, ok = time.perf_counter(), False
                 try:
                     if prefetch:
                         ready.synchronize()
-                        completion.set_result(self.load_all_layers(pending))
+                        ok = self.load_all_layers(pending)
+                        completion.set_result(ok)
                     else:
                         self.load_layer_wise(completion, list(pending.values()), ready)
+                        ok = True
                 except BaseException as error:
                     if prefetch:
                         completion.set_result(False)
@@ -450,6 +456,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         "Mooncake %s load batch failed",
                         "prefetch" if prefetch else "layer-wise",
                     )
+                if self.load_observer is not None:
+                    pages = sum(len(t.keys) for t in transfers if t.name == PoolName.KV)
+                    seconds = time.perf_counter() - started
+                    kind = "prefetch" if prefetch else "layer_wise"
+                    self.load_observer(kind, pages, seconds, ok)
             finally:
                 self.load_queue.task_done()
 

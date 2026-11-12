@@ -674,6 +674,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60),
         )
+        # External linker loads from its store (L3) into device KV: `layer_wise` is a
+        # request's hit at admission, `prefetch` a hint or prefetch-mode load.
+        self.linker_load_pages_total = Counter(
+            name="sglang:linker_load_pages_total",
+            documentation="KV pages the external linker loaded from its store.",
+            labelnames=list(labels.keys()) + ["kind"],
+        )
+        self.linker_load_failures_total = Counter(
+            name="sglang:linker_load_failures_total",
+            documentation="External linker load batches that failed.",
+            labelnames=list(labels.keys()) + ["kind"],
+        )
+        self.linker_load_seconds = Histogram(
+            name="sglang:linker_load_seconds",
+            documentation="Histogram of external linker load batch wall-clock seconds.",
+            labelnames=list(labels.keys()) + ["kind"],
+            buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
+        )
         self.decode_deferred_kv_release_total = Counter(
             name="sglang:decode_deferred_kv_release_total",
             documentation="Total deferred decode KV release resolution attempts.",
@@ -1491,6 +1509,16 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 labels = dict(self.labels)
                 labels["priority"] = str(priority)
                 gauge.labels(**labels).set(value)
+
+    def observe_linker_load(
+        self, kind: str, pages: int, seconds: float, ok: bool
+    ) -> None:
+        labels = {**self.labels, "kind": kind}
+        self.linker_load_seconds.labels(**labels).observe(seconds)
+        if ok:
+            self.linker_load_pages_total.labels(**labels).inc(pages)
+        else:
+            self.linker_load_failures_total.labels(**labels).inc(1)
 
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)

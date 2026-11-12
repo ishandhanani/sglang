@@ -219,6 +219,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqOutput,
     sock_send,
 )
+from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
 from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
@@ -391,6 +392,7 @@ from sglang.srt.rust_server.server import (
     drain_notify_name,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -685,6 +687,12 @@ class Scheduler(
                 cache_controller.write_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+        linker = getattr(self.tree_cache, "linker", None)
+        if self.metrics_collector is not None and linker is not None:
+            if hasattr(linker.cache_linker, "load_observer"):
+                linker.cache_linker.load_observer = (
+                    self.metrics_collector.observe_linker_load
+                )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -896,6 +904,11 @@ class Scheduler(
                 or get_observability().enable_metrics_for_all_schedulers
             ),
             enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
+            hint_endpoint=(
+                get_memory().hint_zmq_endpoint
+                if get_parallel().attn_dp_rank == 0
+                else None
+            ),
         )
 
         self.load_snapshot_writer = None
@@ -1928,6 +1941,7 @@ class Scheduler(
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
+                (KvHintsEnvelope, self.handle_kv_hints),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
                 (ReleaseUocrDocReqInput, self.release_uocr_doc),
@@ -2670,6 +2684,7 @@ class Scheduler(
             rust_server_mode=envs.SGLANG_RUST_SERVER.get(),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
+            recv_hints=self.ipc_channels.recv_hints,
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -3657,6 +3672,29 @@ class Scheduler(
         # Process each request in the batch
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
+
+    def handle_kv_hints(self, envelope: KvHintsEnvelope) -> None:
+        """Out-of-band hints from --hint-zmq-endpoint. A `kv.prefetch` action loads its
+        `token_ids` from the external linker's store into the device cache and the radix
+        tree of attention DP group `dp_rank` (default 0); other actions are ignored."""
+        linker = getattr(self.tree_cache, "linker", None)
+        for action in envelope.actions:
+            token_ids = action.payload.get("token_ids")
+            dp_rank = action.payload.get("dp_rank") or 0
+            if (
+                linker is None
+                or action.action_type != "kv.prefetch"
+                or not token_ids
+                or dp_rank != get_parallel().attn_dp_rank
+            ):
+                continue
+            req = Req(
+                f"kv-hint-{envelope.message_id}-{action.action_id}",
+                "",
+                array("q", token_ids),
+                SamplingParams(max_new_tokens=0),
+            )
+            linker.prefetch(req, hinted=True)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
         if self.enable_unified_cache_external_linker:

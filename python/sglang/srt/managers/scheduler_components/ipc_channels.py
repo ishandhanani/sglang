@@ -20,6 +20,8 @@ class SchedulerIpcChannels:
     send_to_tokenizer: SenderWrapper
     send_to_detokenizer: SenderWrapper
     send_metrics_from_scheduler: Optional[zmq.Socket]
+    # Out-of-band KV hints (--hint-zmq-endpoint), on the IO rank of DP group 0.
+    recv_hints: Optional[zmq.Socket] = None
 
     @classmethod
     def create(
@@ -30,6 +32,7 @@ class SchedulerIpcChannels:
         skip_tokenizer_init: bool,
         metrics_enabled: bool,
         enable_scripted_runtime: bool,
+        hint_endpoint: Optional[str] = None,
     ) -> "SchedulerIpcChannels":
         context = zmq.Context(2)
 
@@ -85,4 +88,9 @@ class SchedulerIpcChannels:
             send_to_tokenizer=send_to_tokenizer,
             send_to_detokenizer=send_to_detokenizer,
             send_metrics_from_scheduler=send_metrics_from_scheduler,
+            recv_hints=(
+                get_zmq_socket(context, zmq.PULL, hint_endpoint, True)
+                if is_rank_zero and hint_endpoint
+                else None
+            ),
         )
