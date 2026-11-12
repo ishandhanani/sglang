@@ -320,6 +320,8 @@ class UnifiedCacheLinkerWrapper:
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         self.prefetches: dict[CacheRequestHandle, _ExternalCachePrefetch] = {}
+        # Prefetches from KV hints: no request consumes their loaded-token count.
+        self.hinted_prefetches: set[CacheRequestHandle] = set()
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
@@ -400,9 +402,10 @@ class UnifiedCacheLinkerWrapper:
             ),
         )
 
-    def prefetch(self, req: Req) -> None:
-        """Stage a queued request; publish only after all ranks succeed."""
-        if self.load_mode != "prefetch":
+    def prefetch(self, req: Req, *, hinted: bool = False) -> None:
+        """Stage a queued request; publish only after all ranks succeed. A hinted
+        prefetch (an out-of-band KV hint, not a queued request) runs in any load mode."""
+        if self.load_mode != "prefetch" and not hinted:
             return
         request = req.cache_request_handle
         for previous in self.prefetches:
@@ -453,6 +456,8 @@ class UnifiedCacheLinkerWrapper:
             + len(hashes) * self.cache.prefetch_timeout_per_page,
         )
         self.prefetches[request] = state
+        if hinted:
+            self.hinted_prefetches.add(request)
         try:
             for component in self._components:
                 transfer = component.build_external_linker_transfer(
@@ -593,6 +598,9 @@ class UnifiedCacheLinkerWrapper:
             self.cache.prefetch_loaded_storage_start_by_reqid[request] = start
         finally:
             self.cache.dec_lock_ref(state.anchor_node_id, state.anchor_lock)
+            if request in self.hinted_prefetches:
+                self.hinted_prefetches.discard(request)
+                self.cache.pop_prefetch_loaded_tokens(request)
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int

@@ -13,6 +13,7 @@ from typing import (
     Union,
 )
 
+import msgspec
 import torch
 import zmq
 from torch.distributed import ReduceOp, all_reduce, barrier
@@ -29,6 +30,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     sock_recv,
 )
+from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.managers.mm_utils import (
     discard_shm_features,
     has_shm_features,
@@ -80,6 +82,7 @@ class SchedulerRequestReceiver:
     # listener's ring rather than received over zmq.
     rust_server_mode: bool
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
+    recv_hints: Optional[zmq.Socket] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
@@ -135,7 +138,7 @@ class SchedulerRequestReceiver:
     def _pull_raw_reqs(self) -> Optional[List]:
         if get_parallel().pp_rank == 0:
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
-                recv_reqs = []
+                recv_reqs = self._drain_hints()
 
                 # Rust ringbuffer backend: drain the in-process ring fed by the
                 # embedded Rust TokenizerManager instead of a zmq socket. Same
@@ -182,6 +185,21 @@ class SchedulerRequestReceiver:
             else:
                 recv_reqs = None
         return recv_reqs
+
+    def _drain_hints(self) -> List:
+        """Out-of-band KV hints, each a msgpack KvHintsEnvelope; malformed ones are
+        dropped. They ride the control broadcast to the other ranks."""
+        hints = []
+        while self.recv_hints is not None and not self.recv_limit_reached(len(hints)):
+            try:
+                frame = self.recv_hints.recv(zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
+            try:
+                hints.append(msgspec.msgpack.decode(frame, type=KvHintsEnvelope))
+            except msgspec.DecodeError as error:
+                logger.debug("Dropped a malformed KV hint: %s", error)
+        return hints
 
     def _broadcast_reqs_across_ranks(
         self, recv_reqs: Optional[List], local_reqs: Optional[List] = None

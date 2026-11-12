@@ -287,6 +287,13 @@ class Memory(msgspec.Struct):
             type_parser=json.loads,
         ),
     ] = None
+    hint_zmq_endpoint: A[
+        Optional[str],
+        "ZMQ endpoint (e.g. tcp://*:5558) on which the scheduler receives msgpack "
+        "KvHintsEnvelope hints out of band; a `kv.prefetch` action loads its token_ids "
+        "from the external linker's store into the device cache of attention DP "
+        "group dp_rank (default 0).",
+    ] = None
     enable_linker_mla_dedup: A[
         bool,
         "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",
